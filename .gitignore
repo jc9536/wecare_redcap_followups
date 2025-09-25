@@ -1,7 +1,18 @@
-.Rproj.user
+# secrets
+tokens.R
+
+# outputs / caches
+data/out/
+data/raw/
+data/checks/
+
+# RStudio / R junk
+.Rproj.user/
 .Rhistory
 .RData
 .Ruserdata
-tokens.R
-data/
-!data/.gitkeep
+
+# package managers (if any)
+renv/library/
+renv/staging/
+.packrat/

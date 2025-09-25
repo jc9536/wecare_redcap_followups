@@ -19,6 +19,7 @@ source("R/30_followups.R")
 source("R/35_export_followups.R")
 source("R/40_checks.R")
 source("R/50_merge.R")
+source("R/55_overlap_checks.R")
 
 # 2) Define follow-up events (edit here if needed)
 YOUTH_EVENTS     <- c("3_month_followup_arm_1","6_month_followup_arm_1")
@@ -73,6 +74,12 @@ chk1 <- build_followup_completion_summary(youth_fu_raw, cg_fu_raw)           # b
 chk2 <- build_attached_indicator_summary(youth_plus, cg_plus)                # from i_* columns
 write_csv_safe(chk1, "data/checks/followup_completion_summary.csv")
 write_csv_safe(chk2, "data/checks/attached_indicator_summary.csv")
+write_overlap_checks(
+  baseline_youth     = youth_base_clean,
+  baseline_caregiver = cg_base_clean,
+  youth_followup     = youth_fu_raw,
+  caregiver_followup = cg_fu_raw
+)
 
 # 7) Print quick dashboard to console
 print(chk1)
