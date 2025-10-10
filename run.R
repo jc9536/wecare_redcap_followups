@@ -142,7 +142,7 @@ message("📑 Merging Youth & Caregiver follow-ups ...")
 
 merged <- youth_caregiver_full_join(
   youth_plus, cg_plus,
-  out_file   = "data/out/dat_merged.csv",
+  out_file   = file.path(OUT_DIR, "dat_merged.csv"),
   checks_dir = "data/checks"
 )
 
