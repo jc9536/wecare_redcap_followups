@@ -1,5 +1,5 @@
 # secrets
-tokens.R
+config.user.R
 
 # outputs / caches
 data/out/
