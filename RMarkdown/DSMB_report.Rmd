@@ -987,7 +987,7 @@ mk_count_inq <- function(df, vars, count_nm, inq_nm) {
                                      .data[[count_nm]] == 0 ~ 0, TRUE ~ 1))
 }
 
-# Baseline blocks (examples; mirrors your STATA lists)
+# Baseline blocks (examples; mirrors STATA lists)
 z <- mk_count_inq(z, c("eligible_visited_ed","eligible_ed_today","eligible_hospitalized",
                        "eligible_ed_mental_reason","eligible_ed_mental_reason_other",
                        "eligible_taken_med","eligible_taking_med","eligible_received_therapy",
