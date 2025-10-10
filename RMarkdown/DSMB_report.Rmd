@@ -95,10 +95,99 @@ dat <- dat |>
 dat <- dat |>
   filter(!is.na(merged_date_chr) & merged_date_chr != "")
 
-# date_enroll
+# Helper: robust date parser that tries multiple formats + Excel serials
+parse_enroll_date <- function(x) {
+  # 1) already Date/POSIX?
+  if (inherits(x, "Date"))   return(x)
+  if (inherits(x, "POSIXt")) return(as_date(x))
+
+  # 2) character → try multiple orders
+  if (is.character(x)) {
+    out <- suppressWarnings(parse_date_time(
+      x,
+      orders = c(
+        "Ymd", "Y-m-d", "mdY", "m/d/Y", "dmY", "d/m/Y",   # common
+        "Ymd HMS", "Y-m-d H:M:S",                         # with time
+        "b d Y", "d b Y"                                  # "Jan 2 2025"
+      ),
+      tz = "UTC",
+      quiet = TRUE
+    ))
+    if (!all(is.na(out))) return(as_date(out))
+  }
+
+  # 3) numeric Excel serials (both 1900/1904 systems)
+  if (is.numeric(x)) {
+    # try 1900 system (Excel Windows)
+    d1 <- as.Date("1899-12-30") + suppressWarnings(as.numeric(x))
+    # try 1904 system (older Mac Excel)
+    d2 <- as.Date("1904-01-01") + suppressWarnings(as.numeric(x))
+    # pick the one that looks sane (>= 2019 & <= 2035, tweak as needed)
+    ok1 <- !is.na(d1) & d1 >= as.Date("2019-01-01") & d1 <= as.Date("2035-12-31")
+    ok2 <- !is.na(d2) & d2 >= as.Date("2019-01-01") & d2 <= as.Date("2035-12-31")
+    if (any(ok1 | ok2)) return(ifelse(ok1, d1, d2))
+  }
+
+  # 4) give up
+  as.Date(NA)
+}
+
+# Build the merged date string just like before, but do NOT filter after parsing
 dat <- dat |>
-  mutate(date_enroll = suppressWarnings(ymd(merged_date_chr))) |>
-  filter(!is.na(date_enroll))  # keep only valid dates
+  mutate(
+    merged_date_chr = coalesce(
+      as.character(ps_date),
+      as.character(p_ps_date),
+      as.character(screen_doe),
+      as.character(date_baseline),
+      as.character(p_date_baseline)
+    ),
+    # Keep both the original raw and parsed versions
+    date_enroll_raw = merged_date_chr,
+    date_enroll     = parse_enroll_date(merged_date_chr),
+    date_enroll_valid = !is.na(date_enroll)
+  )
+
+# DIAGNOSTIC: how many failed to parse?
+cat("Enrollment date parsed for", sum(dat$date_enroll_valid), "of", nrow(dat), "rows\n")
+if (any(!dat$date_enroll_valid)) {
+  cat("Heads-up: some rows have unparseable dates — not dropping them.\n")
+  # Show a small sample to help fix upstream mapping if needed
+  print(
+    dat |>
+      filter(!date_enroll_valid) |>
+      select(id_dyad, wecare_id_y, wecare_id_cg, site_id, treatment, date_enroll_raw) |>
+      head(15)
+  )
+}
+
+# --- Normalize treatment to 0/1 integers, keep original for reference ---
+dat0 <- dat
+
+# helper: coerce to integer safely (handles factor/character/"0"/"1"/blanks)
+to_int01 <- function(x) {
+  y <- suppressWarnings(as.integer(as.character(x)))
+  # also handle "0"/"1" stored as character
+  if (all(is.na(y)) && is.character(x)) {
+    y <- ifelse(x %in% c("0","1"), as.integer(x), NA_integer_)
+  }
+  y
+}
+
+dat0 <- dat0 |>
+  mutate(
+    treatment_raw = treatment,
+    treatment     = to_int01(treatment),
+    site_id       = as.character(site_id),
+    id_dyad       = coalesce(as.character(id_dyad),
+                             substr(coalesce(as.character(wecare_id_y),
+                                             as.character(wecare_id_cg),
+                                             as.character(p_participant_id)), 1, 7))
+  )
+
+cat("=== RANDOMIZATION SNAPSHOT (as loaded) ===\n")
+print(table(dat0$treatment, useNA = "ifany"))
+cat("Total randomized (non-missing treatment):", sum(!is.na(dat0$treatment)), "\n\n")
 ```
 
 ### 1.1 Duplicate checks
@@ -126,6 +215,34 @@ if (all(c("first_name", "last_name") %in% names(dat))) {
 ```{r pre-lock, message=FALSE, warning=FALSE}
 dat_locked <- dat |>
   filter(date_enroll < DATA_LOCK)
+
+# --- Normalize treatment to 0/1 integers, keep original for reference ---
+dat0 <- dat_locked
+
+# helper: coerce to integer safely (handles factor/character/"0"/"1"/blanks)
+to_int01 <- function(x) {
+  y <- suppressWarnings(as.integer(as.character(x)))
+  # also handle "0"/"1" stored as character
+  if (all(is.na(y)) && is.character(x)) {
+    y <- ifelse(x %in% c("0","1"), as.integer(x), NA_integer_)
+  }
+  y
+}
+
+dat0 <- dat0 |>
+  mutate(
+    treatment_raw = treatment,
+    treatment     = to_int01(treatment),
+    site_id       = as.character(site_id),
+    id_dyad       = coalesce(as.character(id_dyad),
+                             substr(coalesce(as.character(wecare_id_y),
+                                             as.character(wecare_id_cg),
+                                             as.character(p_participant_id)), 1, 7))
+  )
+
+cat("=== RANDOMIZATION SNAPSHOT (as loaded) ===\n")
+print(table(dat0$treatment, useNA = "ifany"))
+cat("Total randomized (non-missing treatment):", sum(!is.na(dat0$treatment)), "\n\n")
 
 print(
   gt(dat_locked |>
