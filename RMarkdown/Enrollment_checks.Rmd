@@ -1,0 +1,406 @@
+---
+title: "WeCare Enrollment Checks"
+author: "Generated from STATA do-file"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup-helpers, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(janitor); library(lubridate)
+  library(gt); library(knitr); library(rlang); library(tidyr)
+})
+
+# Helper to show a 2-way table nicely in HTML or Console
+show_tab2 <- function(df, row, col, title = NULL, totals = TRUE) {
+  if (!all(c(row, col) %in% names(df))) {
+    cat("Skipping:", title %||% paste(row, "x", col), "— missing columns.\n")
+    return(invisible(NULL))
+  }
+  tab <- df %>% janitor::tabyl(!!sym(row), !!sym(col))
+  if (isTRUE(totals)) tab <- tab %>% janitor::adorn_totals(c("row","col"))
+  if (knitr::is_html_output()) {
+    print(gt::gt(tab) %>% gt::tab_header(title = title %||% paste(row, "by", col)))
+  } else {
+    cat("\n", title %||% paste(row, "by", col), "\n", sep = "")
+    print(addmargins(table(df[[row]], df[[col]], useNA = "ifany")))
+  }
+}
+
+# STATA-like row helpers
+rowtotal   <- function(...) rowSums(cbind(...), na.rm = TRUE)
+rownonmiss <- function(...) rowSums(!is.na(cbind(...)))
+anymatch1  <- function(...) {
+  m <- cbind(...); if (!is.matrix(m)) m <- matrix(m, ncol = 1)
+  has1 <- rowSums(m == 1, na.rm = TRUE) > 0
+  hasobs <- rowSums(!is.na(m)) > 0
+  as.integer(ifelse(!hasobs, NA, ifelse(has1, 1L, 0L)))
+}
+
+# Optional (uncomment to enable a cut date)
+DATA_LOCK <- as.Date("2025-09-16")
+```
+
+---
+
+### 1) Import, “destring”, NA cleanup, IDs, enrollment date
+
+```{r import-clean, message=FALSE, warning=FALSE}
+# Read as all character first, clean literal "NA"/"" only in character cols, then type-convert
+dat <- read_csv(merged_path, col_types = cols(.default = col_character())) %>%
+  clean_names() %>%
+  mutate(across(where(is.character), ~ na_if(.x, "NA"))) %>%
+  mutate(across(where(is.character), ~ ifelse(.x == "", NA, .x))) %>%
+  type_convert(na = c("", "NA", "NaN", "null"))
+
+# Master ID (youth preferred, fallback to caregiver)
+dat <- dat %>%
+  mutate(
+    id_dyad = substr(coalesce(as.character(wecare_id_y), as.character(wecare_id_cg)), 1, 7)
+  )
+
+# Enrollment date (youth → caregiver → screen → baseline → p_baseline)
+dat <- dat %>%
+  mutate(
+    merged_date_chr = coalesce(
+      as.character(ps_date),
+      as.character(p_ps_date),
+      as.character(screen_doe),
+      as.character(date_baseline),
+      as.character(p_date_baseline)
+    )
+  ) %>%
+  filter(!is.na(merged_date_chr) & merged_date_chr != "") %>%
+  mutate(date_enroll = suppressWarnings(parse_date_time(merged_date_chr, orders = c("Ymd","mdy","dmy"))),
+         date_enroll = as.Date(date_enroll)) %>%
+  filter(!is.na(date_enroll))
+
+# (Optional) apply data lock if you've set DATA_LOCK above
+if (exists("DATA_LOCK")) dat <- dat %>% filter(date_enroll < DATA_LOCK)
+
+# Quick sanity
+if (knitr::is_html_output()) {
+  print(gt(dat %>% select(id_dyad, wecare_id_y, wecare_id_cg, merged_date_chr, date_enroll) %>% head(10)) %>%
+          tab_header(title = "Import & merged date (peek)"))
+} else {
+  cat("Imported rows:", nrow(dat), "\n")
+}
+```
+
+---
+
+### 2) Duplicates (by id_dyad and by name)
+
+```{r duplicates, message=FALSE, warning=FALSE}
+# Duplicates by id_dyad
+dup_by_dyad <- dat %>% add_count(id_dyad, name = "dup_n") %>% filter(dup_n > 1)
+if (nrow(dup_by_dyad)) {
+  if (knitr::is_html_output()) {
+    print(gt(dup_by_dyad %>% arrange(id_dyad) %>% select(id_dyad, wecare_id, p_wecare_id, dup_n)) %>%
+            tab_header(title = "Potential duplicates by id_dyad"))
+  } else {
+    cat("\nPotential duplicates by id_dyad\n"); print(dplyr::distinct(dup_by_dyad, id_dyad, .keep_all = TRUE))
+  }
+}
+
+# Duplicates by (first_name, last_name)
+if (all(c("first_name","last_name") %in% names(dat))) {
+  dup_by_name <- dat %>% add_count(first_name, last_name, name = "dup_n") %>% filter(dup_n > 1)
+  if (nrow(dup_by_name)) {
+    if (knitr::is_html_output()) {
+      print(gt(dup_by_name %>% arrange(desc(dup_n)) %>% select(first_name, last_name, dup_n)) %>%
+              tab_header(title = "Potential duplicates by name"))
+    } else {
+      cat("\nPotential duplicates by name\n"); print(dplyr::distinct(dup_by_name, first_name, last_name, .keep_all = TRUE))
+    }
+  }
+}
+```
+
+---
+
+### 3) Bi-Weekly Recruitment Tables
+
+```{r biweekly-recruitment, message=FALSE, warning=FALSE}
+# Total approached by site
+show_tab2(dat, "id_dyad", "site_id", title = "Total approached (unique ids) by site")  # Note: counts rows; de-dupify if needed
+
+# Enrollment by treatment x site
+show_tab2(dat, "treatment", "site_id", title = "Enrollment by treatment x site")
+
+# CASSY+ among treatment==1
+if (all(c("cassy_result","treatment","site_id") %in% names(dat))) {
+  cas <- dat %>% mutate(in_tx = suppressWarnings(as.numeric(treatment)) == 1)
+  show_tab2(cas %>% filter(in_tx), "cassy_result", "site_id", title = "CASSY+ by site (treatment==1)")
+}
+
+# Weekly windows (edit dates as needed)
+windows <- tribble(
+  ~start,        ~end,
+  as.Date("2025-09-15"), as.Date("2025-09-21"),
+  as.Date("2025-09-22"), as.Date("2025-09-28")
+)
+for (i in seq_len(nrow(windows))) {
+  w <- windows[i,]
+  subt <- dat %>% filter(date_enroll >= w$start & date_enroll <= w$end)
+  ttl  <- sprintf("Treatment x site (%s to %s)", format(w$start, "%Y-%m-%d"), format(w$end, "%Y-%m-%d"))
+  if (nrow(subt)) show_tab2(subt, "treatment", "site_id", title = ttl) else cat(ttl, ": no rows\n")
+}
+```
+
+---
+
+### 4) (Optional) Outreach/Retention summaries 
+
+```{r outreach-retention-internal, message=FALSE, warning=FALSE}
+# 3m outreach summary (Completed/Scheduled/Active/Withdrawal/Missed)
+if ("follow_visitstatus_3m" %in% names(dat)) {
+  dat <- dat %>%
+    mutate(
+      outreach_3m = case_when(
+        follow_visitstatus_3m == 1 ~ 1L,                         # Completed
+        follow_visitstatus_3m == 2 ~ 2L,                         # Scheduled
+        follow_visitstatus_3m %in% 3:5 ~ 3L,                     # Active
+        follow_visitstatus_3m == 6 ~ 4L,                         # Withdrawal
+        follow_visitstatus_3m == 7 ~ 5L,                         # Missed
+        TRUE ~ NA_integer_
+      )
+    )
+  # Treat uncontacted-but-scheduled-before-cutoff as Active (if schedule col exists)
+  if ("follow_sch_min_3m" %in% names(dat)) {
+    cutoff3m <- as.POSIXct("2025-09-30 23:59:59", tz = "UTC")
+    dat <- dat %>%
+      mutate(outreach_3m = if_else(is.na(follow_visitstatus_3m) & !is.na(follow_sch_min_3m) & follow_sch_min_3m < cutoff3m,
+                                   3L, outreach_3m))
+  }
+  show_tab2(dat, "outreach_3m", "follow_visitstatus_3m", title = "3m: outreach summary vs visit status", totals = FALSE)
+  show_tab2(dat, "outreach_3m", "site_id", title = "3m: outreach summary by site")
+} else {
+  cat("No follow_visitstatus_3m in merged data; skipping 3m outreach summary.\n")
+}
+
+# 6m outreach summary
+if ("follow_visitstatus_6m" %in% names(dat)) {
+  dat <- dat %>%
+    mutate(
+      outreach_6m = case_when(
+        follow_visitstatus_6m == 1 ~ 1L,
+        follow_visitstatus_6m == 2 ~ 2L,
+        follow_visitstatus_6m %in% 3:5 ~ 3L,
+        follow_visitstatus_6m == 6 ~ 4L,
+        follow_visitstatus_6m == 7 ~ 5L,
+        TRUE ~ NA_integer_
+      )
+    )
+  if ("follow_sch_min_6m" %in% names(dat)) {
+    cutoff6m <- as.POSIXct("2025-09-30 23:59:59", tz = "UTC")
+    dat <- dat %>%
+      mutate(outreach_6m = if_else(is.na(follow_visitstatus_6m) & !is.na(follow_sch_min_6m) & follow_sch_min_6m < cutoff6m,
+                                   3L, outreach_6m))
+  }
+  show_tab2(dat, "outreach_6m", "site_id", title = "6m: outreach summary by site")
+} else {
+  cat("No follow_visitstatus_6m in merged data; skipping 6m outreach summary.\n")
+}
+```
+---
+
+### 5) Eligibility Screen: `eligible_screen` flag (STATA logic)
+```{r eligible-screen, message=FALSE, warning=FALSE}
+# Build merge_black if needed
+race_vars <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(dat))
+if ("merge_black" %in% names(dat)) {
+  dat <- dat
+} else if (length(race_vars)) {
+  dat <- dat %>% mutate(merge_black = anymatch1(!!!syms(race_vars)))
+} else {
+  dat <- dat %>% mutate(merge_black = NA_integer_)
+}
+
+# Age 12-19
+dat <- dat %>%
+  mutate(
+    elg_age = case_when(
+      !is.na(screen_age) & screen_age >= 12 & screen_age < 20 ~ 1L,
+      !is.na(screen_age) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    eligibility_screen_complete = coalesce(as.integer(eligibility_screen_complete), 0L),
+    eligible_screen = if_else(eligibility_screen_complete == 2L, 1L, NA_integer_),
+    eligible_screen = replace(eligible_screen, merge_black == 0, 0L),
+    eligible_screen = replace(eligible_screen, elg_age != 1, 0L),
+    eligible_screen = replace(eligible_screen, screen_speak_read_english == 0, 0L),
+    eligible_screen = replace(eligible_screen, screen_seek_therapy == 1, 0L),
+    eligible_screen = replace(eligible_screen, screen_self_repeat == 1, 0L),
+    eligible_screen = replace(eligible_screen, screen_sibling_repeat == 1, 0L),
+    eligible_screen = replace(eligible_screen, screen_has_cell_phone == 0, 0L),
+    eligible_screen = if_else(eligibility_screen_complete == 0, NA_integer_, eligible_screen)
+  )
+
+show_tab2(dat, "eligible_screen", "site_id", title = "Eligibility Screen: Eligible by site")
+```
+---
+
+### 6) Demographics & quick descriptives
+
+```{r demographics, message=FALSE, warning=FALSE}
+# Restrict to randomized for some summaries
+d_tx <- dat %>% filter(!is.na(treatment))
+
+# Sex
+show_tab2(d_tx, "screen_sex", "site_id", title = "Sex by site (randomized)")
+
+# Age (summary + by site)
+if ("screen_age" %in% names(d_tx)) {
+  for (s in sort(unique(na.omit(d_tx$site_id)))) {
+    subt <- d_tx %>% filter(site_id == s)
+    if (nrow(subt)) {
+      summ <- subt %>% summarise(n = sum(!is.na(screen_age)),
+                                 mean = mean(screen_age, na.rm = TRUE),
+                                 sd = sd(screen_age, na.rm = TRUE),
+                                 min = min(screen_age, na.rm = TRUE),
+                                 max = max(screen_age, na.rm = TRUE))
+      if (knitr::is_html_output()) {
+        print(gt(summ) %>% tab_header(title = paste("Age summary (site", s, ")")))
+      } else {
+        cat(sprintf("\nAge summary (site %s)\n", s)); print(summ)
+      }
+    }
+  }
+}
+
+# Treatment x site
+show_tab2(dat, "treatment", "site_id", title = "Treatment by site")
+
+# CASSY Positive
+if ("cassy_result" %in% names(d_tx)) {
+  show_tab2(d_tx, "cassy_result", "site_id", title = "CASSY result by site (randomized only)")
+}
+```
+---
+
+### 7) Handpicked 3m/6m flags (uses your explicit id lists; optional)
+
+```{r handpicked-flags, message=FALSE, warning=FALSE}
+# Create in_3m flag from your explicit list
+ids_3m <- c("H-F0060","H-F0038","K-F0179","K-F0099","K-F0080","K-F0055","K-F0053",
+            "K-F0043","K-F0036","K-F0013","K-F0010","K-F0006","K-F0004","K-F0001","K-F0002")
+dat <- dat %>% mutate(in_3m = if_else(id_dyad %in% ids_3m, 1L, 0L, missing = 0L))
+show_tab2(dat, "in_3m", "treatment", title = "Handpicked in_3m by treatment")
+
+# in_6m example list
+ids_6m <- c("K-F0205","K-F0179","K-F0010","K-F0001","K-F0002")
+dat <- dat %>% mutate(in_6m = if_else(id_dyad %in% ids_6m, 1L, 0L, missing = 0L))
+show_tab2(dat, "in_6m", "treatment", title = "Handpicked in_6m by treatment")
+```
+---
+
+### 8) Month of arrival
+```{r month-of-arrival, message=FALSE, warning=FALSE}
+dat <- dat %>%
+  mutate(month_arrive = lubridate::month(date_enroll, label = FALSE))
+show_tab2(dat, "month_arrive", "site_id", title = "Month of arrival by site")
+```
+---
+
+### 9) Ethnicity tables for RMR/DSMB style pulls
+```{r ethnicity-rmr, message=FALSE, warning=FALSE}
+show_tab2(dat %>% filter(!is.na(treatment)), "screen_ethnicity", "site_id",
+          title = "Ethnicity by site (randomized)")
+```
+---
+
+### 10) Gender/SOGI (incl. composite LGBTQ flag)
+
+```{r sogi, message=FALSE, warning=FALSE}
+# Queer orientation flag (1 if not straight & not self-describe==88 condition per your note)
+dat <- dat %>%
+  mutate(
+    giso_sex_orient_queer = case_when(
+      giso_sex_orient_b == 1 ~ 0L,
+      !is.na(giso_sex_orient_b) & giso_sex_orient_b >= 2 & giso_sex_orient_b <= 66 ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    giso_lgbtq = case_when(
+      giso_sex_orient_queer == 1 ~ 1L,
+      giso_gender_identity_b %in% c(3:66) ~ 1L,
+      !is.na(giso_trans_b) & giso_trans_b >= 1 & giso_trans_b <= 66 ~ 1L,
+      giso_gender_identity_b %in% c(1,2) ~ 0L,
+      giso_sex_orient_queer == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+show_tab2(dat %>% filter(!is.na(treatment)), "giso_gender_identity_b", "site_id",
+          title = "Gender identity by site (randomized)")
+show_tab2(dat %>% filter(!is.na(treatment)), "giso_trans_b", "site_id",
+          title = "Trans identity by site (randomized)")
+show_tab2(dat %>% filter(!is.na(treatment)), "giso_sex_orient_b", "site_id",
+          title = "Sexual orientation by site (randomized)")
+show_tab2(dat %>% filter(!is.na(treatment)), "giso_lgbtq", "site_id",
+          title = "LGBTQ composite by site (randomized)")
+```
+---
+
+### 11) Race construction (single race bucket with Black+X categories)
+
+```{r race-construction, message=FALSE, warning=FALSE}
+# Build single race categories as in your DSMB approach
+dat <- dat %>%
+  mutate(
+    merge_black = if ("merge_black" %in% names(.)) merge_black else {
+      rv <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(.))
+      if (length(rv)) anymatch1(!!!syms(rv)) else NA_integer_
+    },
+    race_black_aian    = ifelse(merge_black == 1 & screen_race_5  == 1, 1L,
+                           ifelse(!is.na(screen_race_5)  & screen_race_5  == 0, 0L, NA)),
+    race_black_asian   = ifelse(merge_black == 1 & screen_race_6  == 1, 1L,
+                           ifelse(!is.na(screen_race_6)  & screen_race_6  == 0, 0L, NA)),
+    race_black_nhpi    = ifelse(merge_black == 1 & screen_race_7  == 1, 1L,
+                           ifelse(!is.na(screen_race_7)  & screen_race_7  == 0, 0L, NA)),
+    race_black_white   = ifelse(merge_black == 1 & screen_race_8  == 1, 1L,
+                           ifelse(!is.na(screen_race_8)  & screen_race_8  == 0, 0L, NA)),
+    race_black_unknown = ifelse(merge_black == 1 & screen_race_99 == 1, 1L,
+                           ifelse(!is.na(screen_race_99) & screen_race_99 == 0, 0L, NA)),
+    race_youth = case_when(
+      merge_black == 1 &
+        coalesce(race_black_aian,0)    == 0 &
+        coalesce(race_black_asian,0)   == 0 &
+        coalesce(race_black_nhpi,0)    == 0 &
+        coalesce(race_black_white,0)   == 0 &
+        coalesce(race_black_unknown,0) == 0 ~ 1L,  # Black only
+      race_black_aian    == 1 ~ 2L,
+      race_black_asian   == 1 ~ 3L,
+      race_black_nhpi    == 1 ~ 4L,
+      race_black_white   == 1 ~ 5L,
+      race_black_unknown == 1 ~ 6L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+show_tab2(dat, "race_youth", "site_id", title = "Race (single bucket) by site")
+```
+---
+
+### 12) Weekly pulls (quick templates)
+
+```{r weekly-pulls, message=FALSE, warning=FALSE}
+# Total approached
+show_tab2(dat, "id_dyad", "site_id", title = "Approached by site")
+
+# Enrollment & WeCare
+show_tab2(dat, "treatment", "site_id", title = "Enrollment by site")
+
+# CASSY+
+if ("cassy_result" %in% names(dat)) show_tab2(dat, "cassy_result", "site_id", title = "CASSY+ by site")
+
+# Last week (edit the date below)
+last_week_start <- as.Date("2025-05-15")
+show_tab2(dat %>% filter(date_enroll >= last_week_start), "id_dyad", "site_id",
+          title = sprintf("Approached since %s", format(last_week_start, "%Y-%m-%d")))
+```
+
+

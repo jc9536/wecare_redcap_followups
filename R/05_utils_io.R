@@ -13,6 +13,41 @@
 # Infix "or" (first non-NULL)
 `%||%` <- function(x, y) if (!is.null(x)) x else y
 
+# Returns a single vector of length nrow(data).
+# Matches columns by paste0("^", regex, ".*", keyword, "$").
+# Flattens df/list columns, unlabels, normalizes, and coalesces.
+coalesce_columns <- function(data,
+                             regex = "ps[0-9]{2}_",  # use "ps[0-9]{2}y_" for youth
+                             keyword,
+                             treat_zero_as_missing = TRUE) {
+  # Allow site prefixes like "harlem_" / "kings_" before the pattern
+  # e.g., match "harlem_ps12_hear_more", "kings_ps08y_hear_more"
+  pat  <- paste0(regex, ".*", keyword, "$")     # <-- no ^ anchor at start
+  cols <- grep(pat, names(data), value = TRUE, perl = TRUE)
+  
+  n <- nrow(data)
+  if (length(cols) == 0L) return(rep(NA_character_, n))
+  
+  vals <- data[, cols, drop = FALSE]
+  
+  vals[] <- lapply(vals, function(x) {
+    # unwrap df-columns if any slipped in
+    if (is.data.frame(x)) x <- if (ncol(x) == 1L) x[[1]] else x[[1]]
+    if (inherits(x, "haven_labelled")) {
+      if (requireNamespace("haven", quietly = TRUE)) x <- haven::zap_labels(x) else x <- as.vector(x)
+    }
+    if (is.factor(x)) x <- as.character(x)
+    
+    if (isTRUE(treat_zero_as_missing)) {
+      if (is.numeric(x))       x[x == 0] <- NA_real_
+      else if (is.character(x)) x[x %in% c("0", "")] <- NA_character_
+    }
+    x
+  })
+  
+  dplyr::coalesce(!!!as.list(vals))
+}
+
 # Safe CSV writer (readr if present; falls back to utils)
 write_csv_safe <- function(df, path) {
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)

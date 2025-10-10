@@ -175,17 +175,38 @@ default_clean_caregiver <- function(dat_raw) {
 # --- Public wrappers (support legacy overrides) -------------------------------
 clean_baseline_youth_main <- function(dat_raw) {
   if (file.exists("R/legacy_cleaning.R")) source("R/legacy_cleaning.R")
+  
+  run_clean <- function() {
+    if (exists("clean_youth", mode = "function")) clean_youth(dat_raw) else default_clean_youth(dat_raw)
+  }
+  
   out <- tryCatch(
-    { if (exists("clean_youth")) clean_youth(dat_raw) else default_clean_youth(dat_raw) },
-    error = function(e) { message("⚠️ clean_youth failed: ", e$message); dat_raw }
+    run_clean(),
+    error = function(e) {
+      # Log more detail
+      message("❌ clean_youth failed\n",
+              "• Class: ", paste(class(e), collapse = "/"), "\n",
+              "• Message: ", conditionMessage(e), "\n",
+              "• Call: ", deparse(conditionCall(e), width.cutoff = 200))
+      
+      # Optional: show an approximate call stack
+      calls <- utils::capture.output(print(sys.calls()))
+      message("• Calls:\n", paste(calls, collapse = "\n"))
+      
+      # Rethrow so you see the full error/traceback at the calling site
+      stop(e)
+    }
   )
+  
   finalize_youth_baseline(out)
 }
 
 clean_baseline_caregiver_main <- function(dat_raw) {
-  if (file.exists("R/legacy_cleaning.R")) source("R/legacy_cleaning.R")
+  if (file.exists("R/legacy_cleaning.R")) source("R/legacy_cleaning.R")  # defines clean_caregiver()
   out <- tryCatch(
-    { if (exists("clean_caregiver")) clean_caregiver(dat_raw) else default_clean_caregiver(dat_raw) },
+    {
+      if (exists("clean_caregiver", mode = "function")) clean_caregiver(dat_raw) else default_clean_caregiver(dat_raw)
+    },
     error = function(e) { message("⚠️ clean_caregiver failed: ", e$message); dat_raw }
   )
   finalize_caregiver_baseline(out)

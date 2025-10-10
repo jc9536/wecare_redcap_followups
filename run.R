@@ -19,64 +19,62 @@
 #   data/checks/ : audits, summaries, overlap maps, unmatched IDs
 # =============================================================================
 
-
 # --- 0) Load secrets ----------------------------------------------------------
 # Expect a file tokens.R defining:
 #   - SHARED_URL: REDCap base URL (string)
 #   - tokens: named vector/list with elements:
 #       "youth_baseline", "caregiver_baseline", "youth_followup", "caregiver_followup"
 
-if (!file.exists("tokens.R")) {
-  stop("Missing tokens.R. Copy tokens.example.R → tokens.R and fill in credentials.")
+# --- 0) Load user config (URL, tokens, output dirs) --------------------------
+cfg_file <- Sys.getenv("WECARE_CONFIG_FILE", unset = "config.user.R")
+if (!file.exists(cfg_file)) {
+  stop(sprintf(
+    "Missing %s. Copy config.user.example.R → config.user.R and fill in values.",
+    cfg_file
+  ))
 }
-source("tokens.R")
+source(cfg_file)
 
-# Back-compat: allow SHARED_URL but prefer SHARED_URL
-if (!exists("SHARED_URL") || !nzchar(SHARED_URL)) {
-  if (exists("SHARED_URL") && nzchar(SHARED_URL)) {
-    SHARED_URL <- SHARED_URL
-    message("ℹ Using SHARED_URL as SHARED_URL for backward compatibility.")
-  } else {
-    stop("SHARED_URL missing in tokens.R")
-  }
+# Validate required objects
+if (!exists("SHARED_URL") || !is.character(SHARED_URL) || !nzchar(SHARED_URL)) {
+  stop("SHARED_URL missing or empty in config.user.R")
 }
-
-# Validate token labels
 required_labels <- c("youth_baseline","caregiver_baseline","youth_followup","caregiver_followup")
-if (!exists("tokens")) stop("`tokens` object not found in tokens.R")
+if (!exists("tokens")) stop("`tokens` not found in config.user.R")
 miss <- setdiff(required_labels, names(tokens))
 if (length(miss)) stop("`tokens` is missing labels: ", paste(miss, collapse = ", "))
 
+# Default output dirs if user didn’t set them
+if (!exists("RAW_DIR"))    RAW_DIR    <- "data/raw"
+if (!exists("OUT_DIR"))    OUT_DIR    <- "data/out"
+if (!exists("CHECKS_DIR")) CHECKS_DIR <- "data/checks"
 
-# --- 1) Source step files -----------------------------------------------------
-# Prefer new filenames; fall back to old ones for compatibility.
+# Ensure output directories exist
+dir.create(RAW_DIR,    recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_DIR,    recursive = TRUE, showWarnings = FALSE)
+dir.create(CHECKS_DIR, recursive = TRUE, showWarnings = FALSE)
 
-source_first <- function(paths) {
-  for (p in paths) if (file.exists(p)) { source(p); return(invisible(p)) }
-  stop("None of these files exist: ", paste(paths, collapse = ", "))
-}
+# --- 1) Source step files -----------------------------------
 
-# Core bootstrap & packages
-source_first(c("R/00_bootstrap.R",                "R/00_setup.R"))
-ensure_pkgs(c("REDCapR","dplyr","janitor","readr"))  # janitor used in fetch; readr used by write_csv_safe
+# Core bootstrap & utils
+source("R/00_bootstrap.R")
+source("R/05_utils_io.R")
+ensure_pkgs(c("REDCapR","dplyr","janitor","readr"))
 
-# Shared utils + pipeline steps
-source_first(c("R/05_utils_io.R",                 "R/05_utils.R"))
-source_first(c("R/10_fetch_redcap.R",             "R/10_fetch.R"))
-source_first(c("R/20_baseline_cleaning.R",        "R/20_clean_baseline.R"))
-source_first(c("R/30_followups_attach.R",         "R/30_followups.R"))
-source_first(c("R/35_followups_export_audits.R",  "R/35_export_followups.R"))
-source_first(c("R/40_qc_checks.R",                "R/40_checks.R"))
+# Pipeline steps
+source("R/10_fetch_redcap.R")
+source("R/20_baseline_cleaning.R")
+source("R/30_followups_attach.R")
+source("R/35_followups_export_audits.R")
+source("R/40_qc_checks.R")
 
-# Merge helpers (numbered before merge in the new layout)
-source_first(c("R/48_overlap_label_columns.R",    "R/56_overlap_label_columns.R", "R/56_label_overlaps.R"))
-source_first(c("R/49_baseline_coalesce_overlaps.R","R/58_baseline_coalesce_overlaps.R","R/58_coalesce_baseline.R"))
+# Merge helpers & merge
+source("R/48_overlap_label_columns.R")
+source("R/49_baseline_coalesce_overlaps.R")
+source("R/50_merge_youth_caregiver.R")
 
-# Merge step
-source_first(c("R/50_merge_youth_caregiver.R",    "R/50_merge.R"))
-
-# Optional post-merge schema overlap report
-source_first(c("R/60_schema_overlap_report.R",    "R/55_schema_overlap_report.R", "R/55_overlap_checks.R"))
+# Post-merge schema overlap report
+source("R/60_schema_overlap_report.R")
 
 
 # --- 2) Configure follow-up events -------------------------------------------
@@ -98,14 +96,18 @@ cg_base_raw    <- pull_redcap("caregiver_baseline", tokens["caregiver_baseline"]
 youth_fu_raw   <- pull_redcap("youth_followup",     tokens["youth_followup"],     events = YOUTH_EVENTS)
 cg_fu_raw      <- pull_redcap("caregiver_followup", tokens["caregiver_followup"], events = CAREGIVER_EVENTS)
 
-# Persist raw pulls for reproducibility/debugging
-write_csv_safe(youth_base_raw, "data/raw/youth_baseline.csv")
-write_csv_safe(cg_base_raw,    "data/raw/caregiver_baseline.csv")
-write_csv_safe(youth_fu_raw,   "data/raw/youth_followup.csv")
-write_csv_safe(cg_fu_raw,      "data/raw/caregiver_followup.csv")
+# Persist raw pulls
+write_csv_safe(youth_base_raw, file.path(RAW_DIR, "youth_baseline.csv"))
+write_csv_safe(cg_base_raw,    file.path(RAW_DIR, "caregiver_baseline.csv"))
+write_csv_safe(youth_fu_raw,   file.path(RAW_DIR, "youth_followup.csv"))
+write_csv_safe(cg_fu_raw,      file.path(RAW_DIR, "caregiver_followup.csv"))
 
-# Small per-wave exports/audits (dups, missing IDs, columns, etc.)
-export_followup_csvs(youth_fu_raw, cg_fu_raw, outdir = "data/checks/followups")
+
+# Per-wave follow-up exports/audits
+export_followup_csvs(
+  youth_fu_raw, cg_fu_raw,
+  outdir = file.path(CHECKS_DIR, "followups")
+)
 
 
 # --- 4) Clean baselines (one row per ID; canonical keys) ---------------------
@@ -113,8 +115,8 @@ export_followup_csvs(youth_fu_raw, cg_fu_raw, outdir = "data/checks/followups")
 youth_base_clean <- clean_baseline_youth_main(youth_base_raw)   # ensures participant_id & p_participant_id
 cg_base_clean    <- clean_baseline_caregiver_main(cg_base_raw)  # ensures caregiver_id  & p_participant_id
 
-write_csv_safe(youth_base_clean, "data/out/youth_baseline_clean.csv")
-write_csv_safe(cg_base_clean,    "data/out/caregiver_baseline_clean.csv")
+write_csv_safe(youth_base_clean, file.path(OUT_DIR, "youth_baseline_clean.csv"))
+write_csv_safe(cg_base_clean,    file.path(OUT_DIR, "caregiver_baseline_clean.csv"))
 
 # Quick ID sanity check: p_participant_id vs wecare roots
 id_align <- check_id_alignment(youth_base_clean, cg_base_clean, out_path = "data/checks/id_alignment.csv")
@@ -131,8 +133,8 @@ message("🖇️ Attaching follow-ups ...")
 youth_plus <- attach_youth_followups(youth_base_clean, youth_fu_raw)  # adds i_youth_3m / i_youth_6m
 cg_plus    <- attach_caregiver_followups(cg_base_clean, cg_fu_raw)    # adds i_caregiver_3m / i_caregiver_6m
 
-write_csv_safe(youth_plus, "data/out/youth_baseline_plus.csv")
-write_csv_safe(cg_plus,    "data/out/caregiver_baseline_plus.csv")
+write_csv_safe(youth_plus, file.path(OUT_DIR, "youth_baseline_plus.csv"))
+write_csv_safe(cg_plus,    file.path(OUT_DIR, "caregiver_baseline_plus.csv"))
 
 
 # --- 5.5) Merge (full outer) -------------------------------------------------
@@ -154,8 +156,8 @@ chk1 <- build_followup_completion_summary(youth_fu_raw, cg_fu_raw)
 # (b) Attached indicators summary (from i_* columns on the plus tables)
 chk2 <- build_attached_indicator_summary(youth_plus, cg_plus)
 
-write_csv_safe(chk1, "data/checks/followup_completion_summary.csv")
-write_csv_safe(chk2, "data/checks/attached_indicator_summary.csv")
+write_csv_safe(chk1, file.path(CHECKS_DIR, "followup_completion_summary.csv"))
+write_csv_safe(chk2, file.path(CHECKS_DIR, "attached_indicator_summary.csv"))
 
 # (c) Column-overlap (schema) reports across source datasets
 write_overlap_checks(

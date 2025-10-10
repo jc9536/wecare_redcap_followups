@@ -48,42 +48,155 @@ lc_prepare_baseline <- function(df, id_col) {
 
 # ---------- public cleaners the pipeline calls ----------
 
-# Must return a data.frame with a column named 'participant_id'
 clean_youth <- function(dat_youth_raw) {
-  df <- dat_youth_raw
   
-  # Ensure the join key exists; fall back to common fields if needed
-  if (!"participant_id" %in% names(df)) {
-    if ("wecare_id" %in% names(df)) {
-      df$participant_id <- df$wecare_id
-    } else if ("youth_wecare_id" %in% names(df)) {
-      df$participant_id <- df$youth_wecare_id
-    } else {
-      stop("clean_youth(): missing 'participant_id' and no fallback id found.", call. = FALSE)
-    }
-  }
+  dat_youth_cleaned <- dat_youth_raw |>
+    janitor::clean_names() |>
+    dplyr::filter(!is.na(site_id)) |>
+    dplyr::ungroup()
   
-  df <- lc_prepare_baseline(df, "participant_id")
-  df <- lc_pick_most_complete_by(df, "participant_id")
-  df
+  # coalesce pre-ICF variables
+  dat_youth_cleaned <- dat_youth_cleaned %>%
+    dplyr::mutate(
+      ps_hear_more          = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}y_", "hear_more"),
+      ps_willing_to_contact = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}y_", "willing_to_contact"),
+      ps_decline_reason     = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}y_", "decline_reason"),
+      ps_youth_name         = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}y_", "youth_name"),
+      ps_signature          = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}y_", "signature"),
+      ps_date               = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}y_", "date"),
+      .after = initial_questions_complete
+    ) |>
+    # remove the original un-coalesced variables
+    dplyr::select(-dplyr::matches("^(harlem|kings)_ps\\d{2}y.*")) |>
+    # coalesce prescreening contact form completion indicators
+    dplyr::mutate(
+      contact_form_youth_complete = coalesce_columns(dplyr::cur_data_all(), ".*prescreening_contact_form.*", "complete"),
+      .before = first_name
+    ) |>
+    # remove the original un-coalesced variables
+    dplyr::select(-dplyr::matches("prescreening_contact_form"))
+  
+  # coalesce ICF variables
+  dat_youth_cleaned <- dat_youth_cleaned |>
+    dplyr::mutate(
+      icf_name_1          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "name_1"),
+      icf_name_2          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "name_2"),
+      icf_nih_share       = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "nih_share"),
+      icf_name_3          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "name_3"),
+      icf_nih_first_name  = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "first_name"),
+      icf_nih_middle_name = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "middle_name"),
+      icf_nih_last_name   = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "last_name"),
+      icf_nih_dob         = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "dob"),
+      icf_nih_sex         = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "sex"),
+      icf_nih_city        = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}y_", "city"),
+      .after = eligibility_survey_complete
+    ) |>
+    dplyr::select(-dplyr::matches("^(harlem|kings)_icf\\d{2}y.*")) |>
+    dplyr::mutate(
+      informed_consent_form_youth_complete = coalesce_columns(dplyr::cur_data_all(), ".*subject_information_and_informed.*", "complete"),
+      .before = sw_pause_id
+    ) |>
+    dplyr::select(-dplyr::matches("subject_information_and_informed")) |>
+    tibble::as_tibble()
+  
+  dat_youth_cleaned
 }
 
-# Must return a data.frame with a column named 'caregiver_id'
-clean_caregiver <- function(dat_caregiver_raw) {
-  df <- dat_caregiver_raw
+# Function to clean caregiver data
+# Function to clean caregiver data (drop-in)
+clean_caregiver <- function(dat_caregiver_raw){
   
-  # Ensure the join key exists; fall back to common fields if needed
-  if (!"caregiver_id" %in% names(df)) {
-    if ("p_wecare_id" %in% names(df)) {
-      df$caregiver_id <- df$p_wecare_id
-    } else if ("caregiver_id_3m" %in% names(df)) {
-      df$caregiver_id <- df$caregiver_id_3m
-    } else {
-      stop("clean_caregiver(): missing 'caregiver_id' and no fallback id found.", call. = FALSE)
-    }
-  }
+  # auto-clean variable names, drop empty preloads, and ungroup to avoid grouped mutate issues
+  dat_caregiver_cleaned <- dat_caregiver_raw |>
+    janitor::clean_names() |>
+    dplyr::ungroup()
   
-  df <- lc_prepare_baseline(df, "caregiver_id")
-  df <- lc_pick_most_complete_by(df, "caregiver_id")
-  df
+  # --- coalesce pre-ICF variables ---
+  dat_caregiver_cleaned <- dat_caregiver_cleaned |>
+    # coalesce the form language variables across sites
+    dplyr::mutate(
+      p_screen_language = dplyr::coalesce(p_screen_language_harlem, p_screen_language_kings),
+      .after = p_screen_language_kings
+    ) |>
+    # remove the original un-coalesced variables
+    dplyr::select(-dplyr::any_of(c("p_screen_language_harlem", "p_screen_language_kings"))) |>
+    
+    # prescreen contact form fields (vector-returning helper; no pull())
+    dplyr::mutate(
+      p_ps_hear_more          = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "hear_more"),
+      p_ps_willing_to_contact = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "willing_to_contact"),
+      p_ps_decline_reason     = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "decline_reason"),
+      p_ps_caregiver_name     = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "caregiver_name"),
+      p_ps_youth_name         = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "youth_name"),
+      p_ps_signature          = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "signature"),
+      p_ps_date               = coalesce_columns(dplyr::cur_data_all(), "ps[0-9]{2}_", "date"),
+      .after = initial_questions_complete
+    ) |>
+    # remove originals
+    dplyr::select(-dplyr::matches("^(harlem|kings)_ps\\d{2}.*")) |>
+    
+    # prescreening contact form completion indicator
+    dplyr::mutate(
+      contact_form_parent_complete =
+        coalesce_columns(dplyr::cur_data_all(), ".*prescreening_contact_form.*", "complete"),
+      .before = p_first_name
+    ) |>
+    dplyr::select(-dplyr::matches("prescreening_contact_form"))
+  
+  # --- rename ICF18 participant name fields so suffixes align ---
+  dat_caregiver_cleaned <- dat_caregiver_cleaned |>
+    dplyr::rename(
+      harlem_icf18_name_5     = harlem_icf18_name_3,
+      harlem_icf18_name_4     = harlem_icf18_name_2,
+      kings_icf18_name_5      = kings_icf18_name_3,
+      kings_icf18_name_4      = kings_icf18_name_2,
+      
+      harlem_icf18_name_5_spa = harlem_icf18_name_3_spa,
+      harlem_icf18_name_4_spa = harlem_icf18_name_2_spa,
+      kings_icf18_name_5_spa  = kings_icf18_name_3_spa,
+      kings_icf18_name_4_spa  = kings_icf18_name_2_spa,
+      
+      harlem_icf18_name_5_fre = harlem_icf18_name_3_fre,
+      harlem_icf18_name_4_fre = harlem_icf18_name_2_fre,
+      kings_icf18_name_5_hai  = kings_icf18_name_3_hai,
+      kings_icf18_name_4_hai  = kings_icf18_name_2_hai
+    )
+  
+  # --- coalesce ICF variables ---
+  dat_caregiver_cleaned <- dat_caregiver_cleaned |>
+    dplyr::mutate(
+      p_icf_name_1          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_1"),
+      p_icf_name_2          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_2"),
+      p_icf_name_3          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_3"),
+      p_icf_name_4          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_4"),
+      p_icf_nih_share       = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "nih_share"),
+      p_icf_name_5          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_5"),
+      p_icf_nih_first_name  = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "first_name"),
+      p_icf_nih_middle_name = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "middle_name"),
+      p_icf_nih_last_name   = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "last_name"),
+      p_icf_nih_dob         = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "dob"),
+      p_icf_nih_sex         = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "sex"),
+      p_icf_nih_city        = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "city"),
+      .after = eligibility_screen_complete
+    ) |>
+    # remove originals
+    dplyr::select(-dplyr::matches("^(harlem|kings)_icf\\d{2}.*")) |>
+    # ICF completion indicator
+    dplyr::mutate(
+      informed_consent_form_parent_complete =
+        coalesce_columns(dplyr::cur_data_all(), ".*subject_information_and_informed.*", "complete"),
+      .before = p_sw_pause_id
+    ) |>
+    dplyr::select(-dplyr::matches("subject_information_and_informed")) |>
+    
+    # rename completion indicators with p_ prefix
+    dplyr::rename_with(~ paste0("p_", .x), dplyr::ends_with("_complete") | dplyr::starts_with("gf_")) |>
+    dplyr::rename(
+      p_wecare_id = wecare_id,
+      p_over_18   = over_18,
+      p_over_12   = over_12
+    ) |>
+    tibble::as_tibble()
+  
+  dat_caregiver_cleaned
 }
