@@ -128,8 +128,8 @@ source("R/60_schema_overlap_report.R")
 
 Render R Markdown files:  
 ```
-rmarkdown::render("RMarkdown/wecare_dsmb_report.Rmd")
-rmarkdown::render("RMarkdown/wecare_biweekly.Rmd")
+rmarkdown::render("RMarkdown/DSMB_report.Rmd")
+rmarkdown::render("RMarkdown/Enrollment_checks.Rmd")
 ```
 - Outputs formatted `gt` tables in HTML or simple text tables in the console  
 
@@ -151,8 +151,8 @@ rmarkdown::render("RMarkdown/wecare_biweekly.Rmd")
 | `50_merge_youth_caregiver.R` | Merges youth + caregiver datasets |
 | `60_schema_overlap_report.R` | Summarizes schema and label overlaps |
 | `run.R` | Orchestrates entire pipeline |
-| `wecare_dsmb_report.Rmd` | DSMB report (enrollment, CONSORT, demographics) |
-| `wecare_biweekly.Rmd` | Bi-weekly recruitment + eligibility tables |
+| `DSMB_report.Rmd` | DSMB report (enrollment, CONSORT, demographics) |
+| `Enrollment_checks.Rmd` | Bi-weekly recruitment + eligibility tables |
 
 ---
 
@@ -163,7 +163,7 @@ When REDCap rotates shared URLs or tokens:
 1. Edit `config.user.R`  
 2. Update:  
    ```
-   SHARED_URL <- "https://redcap.server.edu/redcap_v15.0.39/DataExport/?shared=NEWCODE"
+   SHARED_URL <- "https://redcap.XXX.edu/redcap_vXX.0.XX"
    tokens["youth_baseline"] <- "NEW_TOKEN"
    ```
 3. Save and rerun the pipeline.

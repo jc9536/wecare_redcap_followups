@@ -2,7 +2,7 @@
 # NOTE: Keep `config.user.R` out of git.
 
 # —— REDCap connection ——
-SHARED_URL <- "https://<your-redcap-host>/api/"   # changes when REDCap updates
+SHARED_URL <- "https://redcap.XXX.edu/redcap_vXX.X.XX"   # changes when REDCap updates
 tokens <- c(
   youth_baseline     = "<PASTE_TOKEN>",
   caregiver_baseline = "<PASTE_TOKEN>",
