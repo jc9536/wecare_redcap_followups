@@ -35,6 +35,7 @@ install.packages(c(
 Your repository should look like this:
 ```
 WeCare/
+│
 ├── config.user.example.R            ← See Step 4 in this README.md
 ├── config.user.R                    ← Your personal config file
 │
@@ -54,8 +55,8 @@ WeCare/
 │   └── run.R
 │
 ├── RMarkdown/
-│   ├── wecare_dsmb_report.Rmd
-│   └── wecare_biweekly.Rmd
+│   ├── DSMB_report.Rmd
+│   └── Enrollment_checks.Rmd
 │
 ├── data/
 ├── output/
@@ -238,8 +239,8 @@ file.copy("config.user.example.R","config.user.R")
 source("R/run.R")
 
 # 5. Render reports
-rmarkdown::render("RMarkdown/wecare_dsmb_report.Rmd")
-rmarkdown::render("RMarkdown/wecare_biweekly.Rmd")
+rmarkdown::render("RMarkdown/DSMB_report.Rmd")
+rmarkdown::render("RMarkdown/Enrollment_checks.Rmd")
 ```
 
 **Outputs** appear in `OUT_DIR`, and reports in `RMarkdown/`.  
