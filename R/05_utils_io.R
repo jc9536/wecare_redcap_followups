@@ -49,13 +49,56 @@ coalesce_columns <- function(data,
 }
 
 # Safe CSV writer (readr if present; falls back to utils)
-write_csv_safe <- function(df, path) {
+# - Flattens embedded newlines in character fields so one record == one CSV row
+# - Uses CRLF line endings and double-quote escaping (Stata-friendly)
+# - Leaves NA as "" (empty)
+write_csv_safe <- function(df, path, na = "", keep_breaks = FALSE) {
+  stopifnot(is.data.frame(df))
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
-  if (requireNamespace("readr", quietly = TRUE)) {
-    readr::write_csv(df, path, na = "")
-  } else {
-    utils::write.csv(df, path, row.names = FALSE, na = "")
+  
+  # sanitize: remove/encode hard returns and normalize to UTF-8
+  repl <- if (isTRUE(keep_breaks)) " \\n " else " "
+  df2  <- df
+  for (nm in names(df2)) {
+    if (is.character(df2[[nm]])) {
+      # replace any embedded CR/LF with a placeholder (or space)
+      df2[[nm]] <- gsub("\r\n|\n|\r", repl, df2[[nm]], perl = TRUE)
+      # normalize encoding to UTF-8
+      df2[[nm]] <- enc2utf8(df2[[nm]])
+    }
   }
+  
+  if (requireNamespace("readr", quietly = TRUE)) {
+    readr::write_csv(
+      df2, path,
+      na = na,
+      quote_escape = "double",  # escape internal quotes as ""
+      eol = "\r\n"              # Windows-style line endings
+    )
+  } else {
+    # base R path: write.table lets us control eol + quote method
+    utils::write.table(
+      df2, file = path,
+      sep = ",", row.names = FALSE, col.names = TRUE,
+      na = na, qmethod = "double", fileEncoding = "UTF-8",
+      eol = "\r\n"
+    )
+  }
+}
+
+# ---- CSV text sanitizer ------------------------------------------------------
+sanitize_for_csv <- function(df, keep_breaks = FALSE) {
+  stopifnot(is.data.frame(df))
+  repl <- if (isTRUE(keep_breaks)) " \\n " else " "
+  df |>
+    dplyr::mutate(across(
+      where(is.character),
+      ~ .x |>
+        # escape any internal double-quotes for CSV
+        stringr::str_replace_all('"', '""') |>
+        # flatten embedded newlines so CSV stays one row per record
+        stringr::str_replace_all("\\r\\n|\\n|\\r", repl)
+    ))
 }
 
 # Completion checker (treats common encodings as "complete")
@@ -76,6 +119,91 @@ parse_date_relaxed <- function(x) {
     d[miss] <- as.Date(p)
   }
   d
+}
+
+# ---- site_id backfill -> H / K only -----------------------------------------
+derive_site_id <- function(df) {
+  stopifnot(is.data.frame(df))
+  has <- function(nm) nm %in% names(df)
+  
+  # Normalize any hint to a single-letter site code
+  norm_code <- function(x) {
+    x <- tolower(trimws(as.character(x)))
+    dplyr::case_when(
+      is.na(x) | x == ""                         ~ NA_character_,
+      x %in% c("h", "harlem", "harlem hospital",
+               "harlem hosp")                    ~ "H",
+      x %in% c("k", "kings", "kings county")     ~ "K",
+      grepl("^h-", x)                            ~ "H",
+      grepl("^k-", x)                            ~ "K",
+      TRUE                                       ~ NA_character_
+    )
+  }
+  
+  # Safely pull candidate sources, converting blanks ("") to NA
+  as_chr_or_na <- function(v) dplyr::na_if(as.character(v), "")
+  
+  df |>
+    dplyr::mutate(
+      site_id = {
+        # Existing site_id
+        s_existing <- if (has("site_id")) as_chr_or_na(site_id) else NA_character_
+        
+        # REDCap DAG
+        s_dag <- if (has("redcap_data_access_group"))
+          as_chr_or_na(redcap_data_access_group) else NA_character_
+        
+        # Site flags that might be character or logical
+        s_harlem <- if (has("site_harlem")) {
+          if (is.logical(site_harlem)) ifelse(site_harlem, "H", NA_character_) else as_chr_or_na(site_harlem)
+        } else NA_character_
+        
+        s_kings <- if (has("site_kings")) {
+          if (is.logical(site_kings)) ifelse(site_kings, "K", NA_character_) else as_chr_or_na(site_kings)
+        } else NA_character_
+        
+        # ID-based inference (prefixes H-/K-)
+        s_ppid   <- if (has("p_participant_id"))  as_chr_or_na(p_participant_id) else NA_character_
+        s_wecare_y <- if (has("wecare_id_y"))           as_chr_or_na(wecare_id_y)         else NA_character_
+        s_wecare_cg <- if (has("wecare_id_cg"))         as_chr_or_na(wecare_id_cg)         else NA_character_
+        
+        # First coalesce to one raw hint, then normalize strictly to H/K
+        raw_hint <- dplyr::coalesce(s_existing, s_dag, s_harlem, s_kings,
+                                    s_ppid, s_wecare_y, s_wecare_cg)
+        norm_code(raw_hint)
+      }
+    )
+}
+
+# ---- family_id backfill (from p_participant_id) ------------------------------
+# Extracts trailing digits and converts to integer (drops leading zeros)
+derive_family_id <- function(df, prefer_existing = TRUE, fallback_from_other_ids = TRUE) {
+  stopifnot(is.data.frame(df))
+  
+  get_family_num <- function(x) {
+    if (is.null(x)) return(rep(NA_integer_, length = nrow(df)))
+    digs <- stringr::str_extract(as.character(x), "(\\d+)\\s*$")
+    suppressWarnings(as.integer(digs))  # drops leading zeros by design
+  }
+  
+  has_col <- function(nm) nm %in% names(df)
+  
+  fam_from_ppid  <- if (has_col("p_participant_id")) get_family_num(df$p_participant_id) else rep(NA_integer_, nrow(df))
+  fam_from_wecare<- if (fallback_from_other_ids && has_col("wecare_id_y")) get_family_num(df$wecare_id_y) else rep(NA_integer_, nrow(df))
+  fam_from_record<- if (fallback_from_other_ids && has_col("wecare_id_cg")) get_family_num(df$record_id_cg) else rep(NA_integer_, nrow(df))
+  
+  family_id_calc <- dplyr::coalesce(fam_from_ppid, fam_from_wecare, fam_from_record)
+  
+  # --- FIX: harmonize types before coalescing
+  if (prefer_existing && has_col("family_id")) {
+    # Safely coerce existing to integer (keeps NA where non-numeric/blank)
+    existing_family_int <- suppressWarnings(as.integer(df$family_id))
+    df$family_id <- dplyr::coalesce(existing_family_int, family_id_calc)
+  } else {
+    df$family_id <- family_id_calc
+  }
+  
+  df
 }
 
 # Row-level "any data?" excluding id/event/label columns

@@ -303,6 +303,7 @@ print(gt(tabyl(dat_locked$merged_hear_more, show_na = TRUE)) |>
 cat("\nDropping not interested...\n")
 dat_locked <- dat_locked |> filter(merged_hear_more == 1)
 ```
+
 ### 4.1. Eligibility Screen completeness
 ```{r eligibility-screen}
 dat_locked <- dat_locked |>
@@ -655,19 +656,19 @@ for (i in seq_along(cutoffs)) {
 # Reason 1: under 18, no legal guardian
 r1 <- dat_locked |> filter(over_18 == 0, p_screen_legal_guardian == 0)
 print(gt(r1 |> select(p_participant_id, site_id, id_dyad)) |> tab_header(title = "Reason 1: Under 18, no legal guardian"))
-dot_locked <- anti_join(dot_locked, r1, by = names(dot_locked))
+dat_locked <- anti_join(dat_locked, r1, by = names(dat_locked))
 
 # Reason 2: caregiver language none of the above (coded 5)
 # Fix one id per STATA
-dot_locked <- dot_locked |>
+dat_locked <- dat_locked |>
   mutate(p_screen_language = if_else(id_dyad == "H-F0115", 1, p_screen_language))
-r2 <- dot_locked |> filter(p_screen_language == 5)
+r2 <- dat_locked |> filter(p_screen_language == 5)
 print(gt(r2 |> select(p_participant_id, site_id, id_dyad)) |> tab_header(title = "Reason 2: Language excluded"))
-dot_locked <- anti_join(dot_locked, r2, by = names(dot_locked))
+dat_locked <- anti_join(dat_locked, r2, by = names(dat_locked))
 
 # merged_hear_more (drop if !=1)
 # Ensure merged_hear_more exists & is numeric (carry over manual fixes)
-dot_locked <- dot_locked %>%
+dat_locked <- dat_locked %>%
   mutate(
     merged_hear_more = coalesce(ps_hear_more, p_ps_hear_more),
     merged_hear_more = if_else(id_dyad %in% c("K-F0006","H-F0115","K-F0250"), 1, merged_hear_more),
@@ -676,7 +677,7 @@ dot_locked <- dot_locked %>%
   )
 
 # Two-way tabyl: data first, then unquoted columns
-tab_hm <- dot_locked %>%
+tab_hm <- dat_locked %>%
   janitor::tabyl(merged_hear_more, site_id) %>%
   janitor::adorn_totals(c("row","col"))
 
@@ -684,14 +685,14 @@ if (knitr::is_html_output()) {
   print(gt::gt(tab_hm) %>% gt::tab_header(title = "Merged hear more by site"))
 } else {
   cat("\nMerged hear more by site\n")
-  print(addmargins(table(dot_locked$merged_hear_more, dot_locked$site_id, useNA = "ifany")))
+  print(addmargins(table(dat_locked$merged_hear_more, dat_locked$site_id, useNA = "ifany")))
 }
 
 # Now apply filter
-dot_locked <- dot_locked %>% dplyr::filter(merged_hear_more == 1)
+dat_locked <- dat_locked %>% dplyr::filter(merged_hear_more == 1)
 
 # ---- Eligibility screen completeness (Table 3.6) ----
-dot_locked <- dot_locked %>%
+dat_locked <- dat_locked %>%
   mutate(
     # coerce to integer and treat NA as 0 (Incomplete) to match  STATA logic
     eligibility_screen_complete = suppressWarnings(as.integer(eligibility_screen_complete)),
@@ -704,7 +705,7 @@ dot_locked <- dot_locked %>%
   )
 
 # Correct two-way tabyl usage: data first, then unquoted columns
-tab_esc <- dot_locked %>%
+tab_esc <- dat_locked %>%
   janitor::tabyl(esc_label, site_id) %>%
   janitor::adorn_totals(c("row","col"))
 
@@ -714,15 +715,15 @@ if (knitr::is_html_output()) {
   )
 } else {
   cat("\nEligibility screen complete (Table 3.6)\n")
-  print(addmargins(table(dot_locked$esc_label, dot_locked$site_id, useNA = "ifany")))
+  print(addmargins(table(dat_locked$esc_label, dat_locked$site_id, useNA = "ifany")))
 }
 
 # Keep only complete screens (2) for downstream steps
-dot_locked <- dot_locked %>% dplyr::filter(eligibility_screen_complete == 2L)
+dat_locked <- dat_locked %>% dplyr::filter(eligibility_screen_complete == 2L)
 
 # Eligibility criteria again for Table 3.6
-rv <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(dot_locked))
-dot_locked <- dot_locked |>
+rv <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(dat_locked))
+dat_locked <- dat_locked |>
   mutate(
     merge_black = if (length(rv)) anymatch1(!!!syms(rv)) else NA_integer_,
     elg_age = case_when(
@@ -741,19 +742,19 @@ dot_locked <- dot_locked |>
     eligible_screen = replace(eligible_screen, screen_has_cell_phone == 0, 0L)
   )
 
-print(gt(tabyl(dot_locked$merge_black, dot_locked$site_id, show_na = TRUE)) |>
+print(gt(tabyl(dat_locked$merge_black, dat_locked$site_id, show_na = TRUE)) |>
         tab_header(title = "Reason 3: youth not Black (Table 3.6)"))
 
-print(gt(tabyl(dot_locked$screen_speak_read_english, dot_locked$site_id, show_na = TRUE)) |>
+print(gt(tabyl(dat_locked$screen_speak_read_english, dat_locked$site_id, show_na = TRUE)) |>
         tab_header(title = "Reason 4: speak/read English (Table 3.6)"))
-dot_locked <- dot_locked |> filter(screen_speak_read_english != 0)
+dat_locked <- dat_locked |> filter(screen_speak_read_english != 0)
 
-print(gt(tabyl(dot_locked$screen_seek_therapy, dot_locked$site_id, show_na = TRUE)) |>
+print(gt(tabyl(dat_locked$screen_seek_therapy, dat_locked$site_id, show_na = TRUE)) |>
         tab_header(title = "Reason 5: sought therapy past week (Table 3.6)"))
-dot_locked <- dot_locked |> filter(screen_seek_therapy != 1)
+dat_locked <- dat_locked |> filter(screen_seek_therapy != 1)
 
 # Minimal risk (eligibility survey) – reuse the same construction as earlier
-dot_locked <- dot_locked |>
+dat_locked <- dat_locked |>
   mutate(
     eligible_anxiety = rowtotal(eligible_anxiety_1, eligible_anxiety_2),
     eligible_anxious = case_when(is.na(eligible_anxiety) ~ NA_integer_, eligible_anxiety >= 4 ~ 1L, TRUE ~ 0L),
@@ -770,9 +771,9 @@ elig2 <- intersect(c("eligible_visited_ed","eligible_hospitalized","eligible_tak
                      "eligible_received_therapy","eligible_sought_counseling",
                      "eligible_anxious","eligible_depression",
                      "eligible_sch_close","eligible_sch_part",
-                     "eligible_self_harm_y","eligible_sleep_problem_y"), names(dot_locked))
+                     "eligible_self_harm_y","eligible_sleep_problem_y"), names(dat_locked))
 
-dot_locked <- dot_locked |>
+dat_locked <- dat_locked |>
   mutate(
     eligible_survey_count = if (length(elig2)) rownonmiss(!!!syms(elig2)) else NA_real_,
     eligible_survey = if (length(elig2)) anymatch1(!!!syms(elig2)) else NA_integer_,
@@ -781,11 +782,11 @@ dot_locked <- dot_locked |>
     eligible_survey = if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
   )
 
-print(gt(tabyl(dot_locked$eligible_survey, dot_locked$site_id, show_na = TRUE)) |>
+print(gt(tabyl(dat_locked$eligible_survey, dat_locked$site_id, show_na = TRUE)) |>
         tab_header(title = "Reason 7: minimal risk criteria (Table 3.6)"))
 
 # Consent for Table 3.6 views
-dot_locked <- dot_locked |>
+dat_locked <- dat_locked |>
   mutate(
     consent = case_when(
       p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
@@ -794,15 +795,15 @@ dot_locked <- dot_locked |>
       TRUE ~ 0L
     )
   )
-if (all(c("consent","site_id") %in% names(dot_locked))) {
-  dot_locked <- dot_locked %>%
+if (all(c("consent","site_id") %in% names(dat_locked))) {
+  dat_locked <- dat_locked %>%
     mutate(
       consent = suppressWarnings(as.integer(consent)),
       consent_lab = factor(consent, levels = c(0L, 1L),
                            labels = c("No consent", "Consented"))
     )
 
-  tab_consent <- dot_locked %>%
+  tab_consent <- dat_locked %>%
     tabyl(consent_lab, site_id) %>%
     adorn_totals(c("row","col"))
 
@@ -810,15 +811,15 @@ if (all(c("consent","site_id") %in% names(dot_locked))) {
     print(gt(tab_consent) %>% tab_header(title = "Consent by site (Table 3.6)"))
   } else {
     cat("\nConsent by site (Table 3.6)\n")
-    print(addmargins(table(dot_locked$consent_lab, dot_locked$site_id, useNA = "ifany")))
+    print(addmargins(table(dat_locked$consent_lab, dat_locked$site_id, useNA = "ifany")))
   }
 } else {
   cat("Skipping 'Consent by site' — required columns missing.\n")
 }
 
 # ---- Treatment by site (post-consent) ----
-if (all(c("treatment","site_id") %in% names(dot_locked))) {
-  tab_tx <- dot_locked %>%
+if (all(c("treatment","site_id") %in% names(dat_locked))) {
+  tab_tx <- dat_locked %>%
     tabyl(treatment, site_id) %>%
     adorn_totals(c("row","col"))
 
@@ -826,7 +827,7 @@ if (all(c("treatment","site_id") %in% names(dot_locked))) {
     print(gt(tab_tx) %>% tab_header(title = "Treatment by site (post-consent)"))
   } else {
     cat("\nTreatment by site (post-consent)\n")
-    print(addmargins(table(dot_locked$treatment, dot_locked$site_id, useNA = "ifany")))
+    print(addmargins(table(dat_locked$treatment, dat_locked$site_id, useNA = "ifany")))
   }
 } else {
   cat("Skipping 'Treatment by site (post-consent)' — required columns missing.\n")

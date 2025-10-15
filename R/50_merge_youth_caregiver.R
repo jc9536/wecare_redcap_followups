@@ -226,6 +226,13 @@ youth_caregiver_full_join <- function(
              front, drop = FALSE ]
   } else merged[0, , drop = FALSE]
   
+  # Backfill site_id and family_id from p_participant_id
+  merged <- merged |> derive_site_id()
+  merged <- merged |> derive_family_id()
+  
+  # Sanitize for STATA imports 
+  merged <- sanitize_for_csv(merged, keep_breaks = FALSE)
+  
   # Writes
   write_csv_safe(merged,                       out_file)
   write_csv_safe(unmatched_youth,             file.path(checks_dir, "unmatched_youth.csv"))
