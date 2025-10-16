@@ -214,6 +214,22 @@ row_any_data <- function(df, id_col) {
   apply(df[, data_cols, drop = FALSE], 1, function(row) any(row != "" & !is.na(row)))
 }
 
+# Helper for 0/1 reading
+to01 <- function(x) {
+  ch <- trimws(tolower(as.character(x)))
+  out <- dplyr::case_when(
+    ch %in% c("1","yes","y","true","t") ~ 1L,
+    ch %in% c("0","no","n","false","f") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+  if (all(is.na(out))) {
+    suppressWarnings(out <- as.integer(as.character(x)))
+    out[!out %in% c(0L,1L)] <- NA_integer_
+  }
+  out
+}
+
+
 # --- Private aliases used by some modules (so they no longer need local copies)
 # Dot-prefixed versions keep old call-sites working without re-declaring them.
 
@@ -232,4 +248,50 @@ row_any_data <- function(df, id_col) {
 # soft alias for blank checker (actual implementation is in 00_bootstrap.R)
 if (!exists(".is_blank", mode = "function") && exists("is_blank", mode = "function")) {
   .is_blank <- function(x) is_blank(x)
+}
+
+# ---- Helpers to detect binary conflicts across duplicate columns ----
+
+# Normalize mixed encodings to 0/1/NA (character "yes"/"no", TRUE/FALSE, 1/0, etc.)
+to_bin01 <- function(x) {
+  if (is.logical(x)) return(ifelse(x, 1, 0))
+  if (is.numeric(x)) return(ifelse(is.na(x), NA_real_, ifelse(x == 1, 1, ifelse(x == 0, 0, NA_real_))))
+  if (is.character(x)) {
+    xc <- stringr::str_trim(stringr::str_to_lower(x))
+    xc <- dplyr::na_if(xc, "")
+    return(dplyr::case_when(
+      xc %in% c("1", "y", "yes", "true", "t")  ~ 1,
+      xc %in% c("0", "n", "no", "false", "f") ~ 0,
+      TRUE ~ NA_real_
+    ))
+  }
+  # anything else (factor/POSIX/etc.)
+  xch <- as.character(x)
+  return(to_bin01(xch))
+}
+
+# Find columns that match a prescreen stem and the "hear_more" keyword.
+# Example: stem_regex = "ps[0-9]{2}y_" (youth) or "ps[0-9]{2}_" (caregiver)
+matching_hear_more_cols <- function(df, stem_regex) {
+  patt <- paste0("^(harlem_|kings_)?", stem_regex, ".*hear_more$")
+  names(df)[grepl(patt, names(df))]
+}
+
+# Given a data.frame and a set of "hear_more" source columns, return a logical vector
+# TRUE when the row has at least one 0 and at least one 1 across those columns (ignoring NA).
+flag_binary_conflict <- function(df, cols) {
+  if (length(cols) == 0) return(rep(FALSE, nrow(df)))
+  mm <- lapply(df[cols], to_bin01)
+  mm <- as.data.frame(mm, stringsAsFactors = FALSE)
+  if (ncol(mm) == 0) return(rep(FALSE, nrow(df)))
+  has0 <- apply(mm, 1, function(v) any(v == 0, na.rm = TRUE))
+  has1 <- apply(mm, 1, function(v) any(v == 1, na.rm = TRUE))
+  has0 & has1
+}
+
+# Convenience to pick a participant id column for reports
+pick_participant_id <- function(df) {
+  cand <- c("p_participant_id","wecare_id_y","wecare_id_cg","participant_id","youth_id","caregiver_id")
+  hit <- cand[cand %in% names(df)]
+  if (length(hit)) hit[[1]] else NULL
 }

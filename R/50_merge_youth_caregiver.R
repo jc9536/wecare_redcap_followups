@@ -42,6 +42,38 @@ rows_with_dup_id <- function(df, id_col) {
   df[df[[id_col]] %in% dup_ids, , drop = FALSE]
 }
 
+# helper to normalize 0/1 from messy values
+to01 <- function(x) {
+  ch <- trimws(tolower(as.character(x)))
+  mapped <- dplyr::case_when(
+    ch %in% c("1","true","t","yes","y","adult",">=18","over 18","over_18") ~ 1L,
+    ch %in% c("0","false","f","no","n","minor","<18","under 18","under_18") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+  if (all(is.na(mapped))) {
+    suppressWarnings(mapped <- as.integer(as.character(x)))
+    mapped[!mapped %in% c(0L,1L)] <- NA_integer_
+  }
+  mapped
+}
+
+derive_over18 <- function(age, age_group) {
+  age_i <- suppressWarnings(as.numeric(age))
+  # Your convention from STATA: screen_age_group == 1 → adult; 0 → minor
+  grp <- suppressWarnings(as.integer(as.character(age_group)))
+  grp_mapped <- dplyr::case_when(
+    grp == 1 ~ 1L,   # adult
+    grp == 0 ~ 0L,   # minor
+    TRUE     ~ NA_integer_
+  )
+  out <- dplyr::case_when(
+    !is.na(age_i) & age_i >= 18 ~ 1L,
+    !is.na(age_i) & age_i <  18 ~ 0L,
+    TRUE                        ~ NA_integer_
+  )
+  ifelse(is.na(out), grp_mapped, out)
+}
+
 # --- Pre-merge sanitation -----------------------------------------------------
 
 # Ensure a plain 'wecare_id' column exists prior to merge so suffixes are produced,
@@ -229,6 +261,38 @@ youth_caregiver_full_join <- function(
   # Backfill site_id and family_id from p_participant_id
   merged <- merged |> derive_site_id()
   merged <- merged |> derive_family_id()
+  
+  # Backfill over_18
+  
+  merged <- merged %>%
+    dplyr::mutate(
+      over_18 = {
+        # 1) start from youth over_18 (normalized)
+        o <- to01(.data$over_18)
+        
+        # 2) fallback to caregiver p_over_18 if youth missing
+        p <- if ("p_over_18" %in% names(.)) to01(.data$p_over_18) else NA_integer_
+        o <- dplyr::coalesce(o, p)
+        
+        # 3) **OVERRIDE using screen_age wherever available** (ignores existing o)
+        age <- if ("screen_age" %in% names(.))
+          suppressWarnings(as.numeric(.data$screen_age))
+        else NA_real_
+        o <- dplyr::case_when(
+          !is.na(age) & age >= 18 ~ 1L,
+          !is.na(age) & age <  18 ~ 0L,
+          TRUE                    ~ o         # keep prior value when age is missing
+        )
+        
+        # 4) still missing? derive from screen_age_group (assumed 1 = adult, 0 = minor)
+        grp <- if ("screen_age_group" %in% names(.))
+          suppressWarnings(as.integer(as.character(.data$screen_age_group)))
+        else NA_integer_
+        grp <- dplyr::case_when(grp == 1 ~ 1L, grp == 0 ~ 0L, TRUE ~ NA_integer_)
+        
+        dplyr::coalesce(o, grp)
+      }
+    )
   
   # Sanitize for STATA imports 
   merged <- sanitize_for_csv(merged, keep_breaks = FALSE)

@@ -67,6 +67,7 @@ source("R/20_baseline_cleaning.R")
 source("R/30_followups_attach.R")
 source("R/35_followups_export_audits.R")
 source("R/40_qc_checks.R")
+source("R/45_id_alignment_by_name.R")
 
 # Merge helpers & merge
 source("R/48_overlap_label_columns.R")
@@ -117,6 +118,30 @@ cg_base_clean    <- clean_baseline_caregiver_main(cg_base_raw)  # ensures caregi
 
 write_csv_safe(youth_base_clean, file.path(OUT_DIR, "youth_baseline_clean.csv"))
 write_csv_safe(cg_base_clean,    file.path(OUT_DIR, "caregiver_baseline_clean.csv"))
+
+
+# Example object names; replace with yours
+# clean_youth_baseline: has wecare_id_y, first_name, last_name
+# clean_caregiver_baseline: has wecare_id_cg, p_ps_youth_name
+message("❗ Fixing mismatched caregiver IDs by youth name")
+
+# 1) Build crosswalk from your cleaned baselines
+xwalk <- build_id_crosswalk_by_name(
+  youth_df     = youth_base_clean,
+  caregiver_df = cg_base_clean
+  # optionally: set explicit names if your columns are unusual
+  # youth_pid_col = "p_participant_id",
+  # youth_first   = "p_youth_firstname",
+  # youth_last    = "p_youth_lastname",
+  # cg_pid_col    = "p_participant_id",
+  # cg_youthname  = "p_ps_youth_name"
+)
+
+# Review files in data/checks/:
+# - id_namekey_confident.csv
+# - id_namekey_ambiguous.csv
+# - id_namekey_all_matches.csv
+# - id_namekey_flags.csv   <-- new, with your date-based flags
 
 # Quick ID sanity check: p_participant_id vs wecare roots
 id_align <- check_id_alignment(youth_base_clean, cg_base_clean, out_path = "data/checks/id_alignment.csv")
