@@ -1,1018 +1,563 @@
 ---
-title: "WeCare DSMB Report"
-author: "Generated from STATA do-file"
+title: "WeCare — Section 3: Enrollment (CONSORT Diagram)"
+author: "Auto-generated"
 output:
   html_document:
     toc: true
-    toc_depth: 3
-    number_sections: true
+    toc_depth: 2
+    df_print: paged
 ---
-```{r setup, include=FALSE}
-# ---- packages ----
-library(tidyverse)
-library(readr)
-library(lubridate)
-library(janitor)
-library(gt)
-library(rprojroot)
 
-# ---- load user config ----
-# Define the root as “the directory that contains config.user.R”
-root <- rprojroot::find_root(rprojroot::has_file("config.user.R"))
-knitr::opts_knit$set(root.dir = root)
+```{r setup, message=FALSE, warning=FALSE}
+# Packages
+pkgs <- c(
+  "tidyverse","lubridate","janitor","readr","glue","gt",
+  "DiagrammeR"
+)
+for(p in pkgs) if(!requireNamespace(p, quietly = TRUE)) install.packages(p)
+invisible(lapply(pkgs, library, character.only = TRUE))
 
-cfg_file <- Sys.getenv("WECARE_CONFIG_FILE", unset = file.path(root, "config.user.R"))
-source(cfg_file)
+# (Optional) nicer tables
+theme_set(theme_minimal(base_size = 13))
 
-#STATA-like helpers
-# STATA-like helpers
-anymatch1 <- function(...) {
-  # returns 1 if any of the inputs equal 1, 0 if all 0, NA if all NA
-  m <- cbind(...)
-  if (!is.matrix(m)) m <- matrix(m, ncol = 1)
-  has1 <- rowSums(m == 1, na.rm = TRUE) > 0
-  has0 <- rowSums(!is.na(m)) > 0
-  out <- ifelse(!has0, NA_integer_, ifelse(has1, 1L, 0L))
-  as.integer(out)
-}
-rownonmiss <- function(...) rowSums(!is.na(cbind(...)))
-rowtotal   <- function(...) rowSums(cbind(...), na.rm = TRUE)
+# ---------- USER INPUTS ----------
+OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
+csv_path  <- file.path(OUT_DIR, "dat_merged.csv")
+DATA_LOCK <- as.Date("2025-08-01")  # used in some filters; update as needed
 
-# Data lock date used in the STATA scripts (update as needed)
-DATA_LOCK <- as.Date("2025-08-01")
+# ---------- HELPERS ----------
+na_empty <- function(x) replace(x, is.na(x) | x %in% c("NA",""), NA)
 
-# 3) Normalize project-relative dirs from config to absolute paths
-to_abs <- function(p) if (!grepl("^(/|[A-Za-z]:\\\\)", p)) file.path(root, p) else p
-if (exists("RAW_DIR"))    RAW_DIR    <- to_abs(RAW_DIR)    else RAW_DIR    <- file.path(root, "data/raw")
-if (exists("OUT_DIR"))    OUT_DIR    <- to_abs(OUT_DIR)    else OUT_DIR    <- file.path(root, "data/out")
-if (exists("CHECKS_DIR")) CHECKS_DIR <- to_abs(CHECKS_DIR) else CHECKS_DIR <- file.path(root, "data/checks")
+# Robust parser: handles Y-m-d, Y-m-d H:M[:S], m/d/Y variants, and Excel serials
+parse_any_datetime <- function(x) {
+  if (inherits(x, "POSIXct")) return(x)
+  if (inherits(x, "Date"))    return(as.POSIXct(x))
+  x <- na_empty(as.character(x))
 
-dir.create(RAW_DIR,    showWarnings = FALSE, recursive = TRUE)
-dir.create(OUT_DIR,    showWarnings = FALSE, recursive = TRUE)
-dir.create(CHECKS_DIR, showWarnings = FALSE, recursive = TRUE)
+  # Excel serials (1899-12-30 origin); only apply to reasonable ranges
+  maybe_excel <- suppressWarnings(as.numeric(x))
+  is_excel <- !is.na(maybe_excel) & maybe_excel > 20000 & maybe_excel < 90000
+  res <- rep(NA_real_, length(x))
 
-# Where the merged CSV lives (produced by pipeline)
-merged_path <- file.path(OUT_DIR, "dat_merged.csv")
-stopifnot(file.exists(merged_path))
-```
-## 1. Destring + “NA” cleaning + IDs + merged_date
-
-```{r import-clean, message=FALSE, warning=FALSE}
-# Read merged CSV produced by pipeline
-dat_raw <- read_csv(merged_path, show_col_types = FALSE)
-
-# Destring like STATA (treat the literal "NA" string as missing, then normalize types)
-dat <- dat_raw |>
-  mutate(across(everything(),
-                ~ dplyr::case_when(.x %in% c("NA") ~ NA, TRUE ~ .x))) |>
-  clean_names()
-
-# Convert numeric-like columns (STATA destring)
-dat <- type_convert(dat, na = c("", "NA", "NaN", "null"))
-
-# id_dyad
-dat <- dat |>
-  mutate(
-    id_dyad = substr(coalesce(as.character(wecare_id_y), ""), 1, 7),
-    id_dyad = if_else(is.na(id_dyad) | id_dyad == "",
-                      substr(coalesce(as.character(wecare_id_cg), ""), 1, 7),
-                      id_dyad)
-  )
-
-# merged_date (youth → caregiver → screen → baseline → p_baseline), then enforce non-missing
-dat <- dat |>
-  mutate(
-    merged_date_chr = coalesce(
-      as.character(ps_date),
-      as.character(p_ps_date),
-      as.character(screen_doe),
-      as.character(date_baseline),
-      as.character(p_date_baseline)
+  # Parse ISO / common text dates first
+  res_txt <- suppressWarnings(
+    lubridate::parse_date_time(
+      x,
+      orders = c("Ymd HMS","Ymd HM","Ymd",
+                 "Y-m-d H:M:S","Y-m-d H:M","Y-m-d",
+                 "mdY HMS","mdY HM","mdY"),
+      tz = "UTC",
+      truncated = 3
     )
   )
 
-# Drop rows with empty merged_date like STATA
-dat <- dat |>
-  filter(!is.na(merged_date_chr) & merged_date_chr != "")
+  res[!is.na(res_txt)] <- as.numeric(res_txt[!is.na(res_txt)])
 
-# Helper: robust date parser that tries multiple formats + Excel serials
-parse_enroll_date <- function(x) {
-  # 1) already Date/POSIX?
-  if (inherits(x, "Date"))   return(x)
-  if (inherits(x, "POSIXt")) return(as_date(x))
-
-  # 2) character → try multiple orders
-  if (is.character(x)) {
-    out <- suppressWarnings(parse_date_time(
-      x,
-      orders = c(
-        "Ymd", "Y-m-d", "mdY", "m/d/Y", "dmY", "d/m/Y",   # common
-        "Ymd HMS", "Y-m-d H:M:S",                         # with time
-        "b d Y", "d b Y"                                  # "Jan 2 2025"
-      ),
-      tz = "UTC",
-      quiet = TRUE
-    ))
-    if (!all(is.na(out))) return(as_date(out))
+  # Fill remaining with Excel-serial interpretation
+  if (any(is_excel, na.rm = TRUE)) {
+    res_excel <- as.POSIXct(as.Date("1899-12-30") + maybe_excel[is_excel], tz = "UTC")
+    res[is_excel] <- as.numeric(res_excel)
   }
 
-  # 3) numeric Excel serials (both 1900/1904 systems)
-  if (is.numeric(x)) {
-    # try 1900 system (Excel Windows)
-    d1 <- as.Date("1899-12-30") + suppressWarnings(as.numeric(x))
-    # try 1904 system (older Mac Excel)
-    d2 <- as.Date("1904-01-01") + suppressWarnings(as.numeric(x))
-    # pick the one that looks sane (>= 2019 & <= 2035, tweak as needed)
-    ok1 <- !is.na(d1) & d1 >= as.Date("2019-01-01") & d1 <= as.Date("2035-12-31")
-    ok2 <- !is.na(d2) & d2 >= as.Date("2019-01-01") & d2 <= as.Date("2035-12-31")
-    if (any(ok1 | ok2)) return(ifelse(ok1, d1, d2))
-  }
-
-  # 4) give up
-  as.Date(NA)
+  as.POSIXct(res, origin = "1970-01-01", tz = "UTC")
 }
 
-# Build the merged date string just like before, but do NOT filter after parsing
+coalesce_chr <- function(...) {
+  args <- list(...)
+  args <- lapply(args, na_empty)
+  out <- args[[1]]
+  for(i in seq_along(args)[-1]) out <- dplyr::coalesce(out, args[[i]])
+  out
+}
+n_distinct_na <- function(x) dplyr::n_distinct(na.omit(x))
+
+# Attempt to load 'consort' if available for a pretty diagram;
+# otherwise we will generate DOT with DiagrammeR.
+has_consort <- requireNamespace("consort", quietly = TRUE)
+```
+
+#1) Load & Normalize 
+```{r warning=FALSE, message=FALSE}
+raw <- read_csv(csv_path, show_col_types = FALSE) |>
+  mutate(across(everything(), \(x) if(is.character(x)) na_empty(x) else x)) |>
+  clean_names()
+dim(raw)
+
+#--------------Destring "numbers with NA" & blank-ify literal "NA"-------------#
+dat <- raw |>
+  mutate(across(where(is.character), na_empty)) |>
+  mutate(across(where(is.logical), as.integer)) |>
+  mutate(across(where(is.character), \(x) type.convert(x, as.is = TRUE)))
+```
+# 2) Merge Dates & Initial Checks 
+```{r warning=FALSE, message=FALSE}
+# --- Merge dates & initial checks (robust) ---
 dat <- dat |>
   mutate(
-    merged_date_chr = coalesce(
-      as.character(ps_date),
-      as.character(p_ps_date),
-      as.character(screen_doe),
-      as.character(date_baseline),
-      as.character(p_date_baseline)
+    ps_date_dt          = parse_any_datetime(ps_date),
+    p_ps_date_dt        = parse_any_datetime(p_ps_date),
+    screen_doe_dt       = parse_any_datetime(screen_doe),
+    date_baseline_dt    = parse_any_datetime(date_baseline),
+    p_date_baseline_dt  = parse_any_datetime(p_date_baseline),
+
+    merged_datetime = coalesce(
+      ps_date_dt, p_ps_date_dt, screen_doe_dt, date_baseline_dt, p_date_baseline_dt
     ),
-    # Keep both the original raw and parsed versions
-    date_enroll_raw = merged_date_chr,
-    date_enroll     = parse_enroll_date(merged_date_chr),
-    date_enroll_valid = !is.na(date_enroll)
+    merged_date = as.Date(merged_datetime)
   )
 
-# DIAGNOSTIC: how many failed to parse?
-cat("Enrollment date parsed for", sum(dat$date_enroll_valid), "of", nrow(dat), "rows\n")
-if (any(!dat$date_enroll_valid)) {
-  cat("Heads-up: some rows have unparseable dates — not dropping them.\n")
-  # Show a small sample to help fix upstream mapping if needed
-  print(
-    dat |>
-      filter(!date_enroll_valid) |>
-      select(id_dyad, wecare_id_y, wecare_id_cg, site_id, treatment, date_enroll_raw) |>
-      head(15)
-  )
-}
+# Quick spot check row(s) you showed
+dat |>
+  select(merged_date, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline) |>
+  head(10) |>
+  gt::gt() |>
+  gt::tab_header(title = "Post-fix: merged_date now populated when any source has a timestamp")
 
-# --- Normalize treatment to 0/1 integers, keep original for reference ---
-dat0 <- dat
+# Check: any missing merged dates?
+miss_merged_date <- dat |>
+  filter(is.na(merged_date)) |>
+  select(p_participant_id, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline)
 
-# helper: coerce to integer safely (handles factor/character/"0"/"1"/blanks)
-to_int01 <- function(x) {
-  y <- suppressWarnings(as.integer(as.character(x)))
-  # also handle "0"/"1" stored as character
-  if (all(is.na(y)) && is.character(x)) {
-    y <- ifelse(x %in% c("0","1"), as.integer(x), NA_integer_)
-  }
-  y
-}
-
-dat0 <- dat0 |>
-  mutate(
-    treatment_raw = treatment,
-    treatment     = to_int01(treatment),
-    site_id       = as.character(site_id),
-    id_dyad       = coalesce(as.character(id_dyad),
-                             substr(coalesce(as.character(wecare_id_y),
-                                             as.character(wecare_id_cg),
-                                             as.character(p_participant_id)), 1, 7))
-  )
-
-cat("=== RANDOMIZATION SNAPSHOT (as loaded) ===\n")
-print(table(dat0$treatment, useNA = "ifany"))
-cat("Total randomized (non-missing treatment):", sum(!is.na(dat0$treatment)), "\n\n")
+gt::gt(miss_merged_date) |>
+  gt::tab_header(title = "Check: Remaining missing merged_date (should be few/none)")
 ```
 
-### 1.1 Duplicate checks
+# 3) Preeligibility Counts & Data Issues 
+```{r warning=FALSE, message=FALSE}
+youth_approached_n <- n_distinct_na(dat$p_participant_id)
 
-```{r duplicates, message=FALSE, warning=FALSE}
-# duplicates by id_dyad
-dup_by_dyad <- dat |>
-  count(id_dyad, name = "n") |>
-  filter(n > 1)
+no_legal_guardian <- dat |>
+  filter(over_18 == 0, p_screen_legal_guardian == 0) |>
+  select(p_participant_id)
+no_legal_guardian_n <- nrow(no_legal_guardian)
 
-gt(dup_by_dyad) |>
-  tab_header(title = "Potential Duplicates by id_dyad")
+no_english <- dat |>
+  filter(p_screen_understand_eng == 0) |>
+  select(p_participant_id)
+no_english_n <- nrow(no_english)
 
-# (Optional) duplicates by name
-if (all(c("first_name", "last_name") %in% names(dat))) {
-  dup_by_name <- dat |>
-    count(first_name, last_name, name = "n") |>
-    filter(n > 1)
-  gt(dup_by_name) |>
-    tab_header(title = "Potential Duplicates by Name")
-}
-```
-
-## 2. Restrict to pre–data-lock + treatment tabck
-```{r pre-lock, message=FALSE, warning=FALSE}
-dat_locked <- dat |>
-  filter(date_enroll < DATA_LOCK)
-
-# --- Normalize treatment to 0/1 integers, keep original for reference ---
-dat0 <- dat_locked
-
-# helper: coerce to integer safely (handles factor/character/"0"/"1"/blanks)
-to_int01 <- function(x) {
-  y <- suppressWarnings(as.integer(as.character(x)))
-  # also handle "0"/"1" stored as character
-  if (all(is.na(y)) && is.character(x)) {
-    y <- ifelse(x %in% c("0","1"), as.integer(x), NA_integer_)
-  }
-  y
-}
-
-dat0 <- dat0 |>
-  mutate(
-    treatment_raw = treatment,
-    treatment     = to_int01(treatment),
-    site_id       = as.character(site_id),
-    id_dyad       = coalesce(as.character(id_dyad),
-                             substr(coalesce(as.character(wecare_id_y),
-                                             as.character(wecare_id_cg),
-                                             as.character(p_participant_id)), 1, 7))
-  )
-
-cat("=== RANDOMIZATION SNAPSHOT (as loaded) ===\n")
-print(table(dat0$treatment, useNA = "ifany"))
-cat("Total randomized (non-missing treatment):", sum(!is.na(dat0$treatment)), "\n\n")
-
-print(
-  gt(dat_locked |>
-       mutate(treatment_chr = as.character(treatment)) |>
-       count(treatment_chr, name = "n") |>
-       arrange(desc(n))) |>
-    tab_header(title = "Treatment distribution (pre data-lock)")
+list(
+  youth_approached_n = youth_approached_n,
+  under_18_no_guardian_n = no_legal_guardian_n,
+  no_english_n = no_english_n
 )
 ```
 
-## 3. Study update: CASSY (treatment==1)
-
-```{r cassy, message=FALSE, warning=FALSE}
-needed <- c("cassy_result","site_id","treatment")
-missing <- setdiff(needed, names(dat_locked))
-
-if (length(missing)) {
-  cat("**CASSY not shown** — missing:", paste(missing, collapse = ", "), "\n")
-} else {
-  dat_cassy <- dat_locked |>
-    mutate(tx_num = suppressWarnings(as.numeric(as.character(treatment))),
-           in_tx  = !is.na(tx_num) & tx_num == 1)
-
-  if (sum(dat_cassy$in_tx, na.rm = TRUE) == 0) {
-    cat("**No rows where treatment == 1**\n")
-  } else {
-    tab <- dat_cassy |>
-      filter(in_tx) |>
-      tabyl(site_id, cassy_result, show_na = TRUE) |>
-      adorn_totals("row") |>
-      adorn_totals("col")
-    print(gt(tab) |> tab_header(title = "CASSY result by site (treatment == 1)"))
-
-    not_tx_ids <- dat_cassy |>
-      filter(!is.na(cassy_result), !in_tx) |>
-      distinct(id_dyad, site_id, treatment)
-    if (nrow(not_tx_ids)) {
-      print(gt(not_tx_ids) |> tab_header(title = "Non-missing CASSY outside treatment==1"))
-    }
-  }
-}
-```
-
-## 4. CONSORT: Eligibility (screen + survey) & drops
-
-### 4.0. Families "interested to hear more" (merged_hear_more)
-```{r merged-hear-more}
-dat_locked <- dat_locked |>
+# 4) Composite "hear_more" + trim to interested 
+```{r warning=FALSE, message=FALSE}
+dat <- dat |>
   mutate(
-    merged_hear_more = coalesce(ps_hear_more, p_ps_hear_more),
-    # Manual fixes
-    merged_hear_more = if_else(id_dyad %in% c("K-F0006","H-F0115","K-F0250"), 1, merged_hear_more),
-    merged_hear_more = coalesce(merged_hear_more, 0)
+    merged_hear_more = coalesce(ps_hear_more, p_ps_hear_more)
   )
 
-print(gt(tabyl(dat_locked$merged_hear_more, show_na = TRUE)) |>
-        tab_header(title = "Interest in hearing more (merged)"))
-cat("\nDropping not interested...\n")
-dat_locked <- dat_locked |> filter(merged_hear_more == 1)
-```
-
-### 4.1. Eligibility Screen completeness
-```{r eligibility-screen}
-dat_locked <- dat_locked |>
-  mutate(eligibility_screen_complete = coalesce(eligibility_screen_complete, 0L))
-
-print(gt(tabyl(dat_locked$eligibility_screen_complete, show_na = TRUE)) |>
-        tab_header(title = "Eligibility screen completion"))
-cat("\nDropping incomplete screens...\n")
-dat_locked <- dat_locked |> filter(eligibility_screen_complete == 2)
-```
-
-### 4.2. Eligibility Criteria
-```{r eligibility-criteria}
-# Composite Black
-race_vars <- c("screen_race_1","screen_race_2","screen_race_3","screen_race_4")
-race_vars <- intersect(race_vars, names(dat_locked))
-dat_locked <- dat_locked |>
-  mutate(merge_black = if (length(race_vars)) anymatch1(!!!syms(race_vars)) else NA_integer_())
-
-# Age 12–19 (inclusive of 12, <20); with manual fix
-dat_locked <- dat_locked |>
+# Manual fixes
+dat <- dat |>
   mutate(
+    merged_hear_more = if_else(p_participant_id %in% c("K-F0006","H-F0115","K-F0250"),
+                               1L, merged_hear_more),
+    merged_hear_more = replace_na(merged_hear_more, 0L)
+  )
+
+consented_to_hear_more_n    <- sum(dat$merged_hear_more == 1, na.rm = TRUE)
+did_not_consent_hear_more_n <- sum(dat$merged_hear_more == 0, na.rm = TRUE)
+
+# Check: anyone with treatment assigned but not interested in hearing more?
+chk_treat_but_no_interest <- dat |>
+  filter(!is.na(treatment), merged_hear_more == 0) |>
+  select(p_participant_id, treatment)
+gt::gt(chk_treat_but_no_interest) |>
+  gt::tab_header(title = "Check: Treatment present but 'hear more' == 0")
+
+# Keep only those interested
+dat <- dat |>
+  filter(merged_hear_more == 1)
+```
+
+# 5) Eligibility Screen Completion 
+```{r warning=FALSE, message=FALSE}
+dat <- dat |>
+  mutate(
+    eligibility_screen_complete = replace_na(eligibility_screen_complete, 0L),
+    eligibility_screen_complete = if_else(eligibility_screen_complete == 2, 2L, 0L)
+  )
+
+did_not_wish_participate_n <- sum(dat$eligibility_screen_complete == 0, na.rm = TRUE)
+completed_elg_screen_n     <- sum(dat$eligibility_screen_complete == 2, na.rm = TRUE)
+
+# Trim to completed screens
+dat <- dat |>
+  filter(eligibility_screen_complete == 2)
+```
+
+#6) Eligibility Criteria (Screen) 
+```{r warning=FALSE, message=FALSE}
+# 6a) Black (any race flags == 1)
+dat <- dat |>
+  mutate(
+    merge_black = pmax(screen_race_1, screen_race_2, screen_race_3, screen_race_4, na.rm = TRUE),
     elg_age = case_when(
-      !is.na(screen_age) & screen_age >= 12 & screen_age < 20 ~ 1L,
-      !is.na(screen_age) & (screen_age < 12 | screen_age >= 20) ~ 0L,
+      screen_age >= 12 & screen_age < 20 ~ 1L,
+      screen_age < 12 ~ 0L,
+      screen_age >= 20 ~ 0L,
       TRUE ~ NA_integer_
     ),
-    elg_age = if_else(id_dyad == "H-F0023", 1L, elg_age)
+    # Manual override
+    elg_age = if_else(p_participant_id == "H-F0023", 1L, elg_age)
   )
 
-# Eligible at screen (start from complete==2, then zero out failing criteria)
-dat_locked <- dat_locked |>
+# 6b) Compose overall screen eligibility
+dat <- dat |>
   mutate(
-    eligible_screen = if_else(eligibility_screen_complete == 2L, 1L, NA_integer_),
-    eligible_screen = replace(eligible_screen, merge_black == 0, 0L),
-    eligible_screen = replace(eligible_screen, elg_age != 1, 0L),
-    eligible_screen = replace(eligible_screen, screen_speak_read_english == 0, 0L),
-    eligible_screen = replace(eligible_screen, screen_seek_therapy == 1, 0L),
-    eligible_screen = replace(eligible_screen, screen_self_repeat == 1, 0L),
-    eligible_screen = replace(eligible_screen, p_screen_sibling_repeat == 1, 0L),
-    eligible_screen = replace(eligible_screen,
-                              screen_has_cell_phone == 0 & date_enroll < as.Date("2025-01-01"), 0L),
-    eligible_screen = if_else(eligibility_screen_complete %in% c(0, NA), NA_integer_, eligible_screen),
-    # manual fixes
-    eligible_screen = if_else(p_participant_id == "H-F0269", 1L, eligible_screen)
-  )
-
-print(gt(tabyl(dat_locked$eligible_screen, show_na = TRUE)) |>
-        tab_header(title = "Eligibility at screen"))
-```
-
-### 4.3. Keep Only elegible_screen == 1
-```{r elegible-screen-filter}
-dat_locked <- dat_locked |> filter(eligible_screen == 1)
-```
-
-### 4.4. Eligibility Survey cleaning and composite
-```{r eligibility-screen-clean-composite}
-# Anxiety (sum 2 items, then dichotomize >=4)
-dat_locked <- dat_locked |>
-  mutate(
-    eligible_anxiety = rowtotal(eligible_anxiety_1, eligible_anxiety_2),
-    eligible_anxious = case_when(
-      is.na(eligible_anxiety) ~ NA_integer_,
-      eligible_anxiety >= 4 ~ 1L,
-      eligible_anxiety < 4 ~ 0L
-    )
-  )
-
-# Depression (sum 2 items, then dichotomize >=4)
-dat_locked <- dat_locked |>
-  mutate(
-    eligible_depress     = rowtotal(eligible_depress_1, eligible_depress_2),
-    eligible_depression  = case_when(
-      is.na(eligible_depress) ~ NA_integer_,
-      eligible_depress >= 4 ~ 1L,
-      eligible_depress < 4 ~ 0L
-    ),
-    eligible_sch_close   = case_when(is.na(eligible_sch_connect_1) ~ NA_integer_,
-                                     eligible_sch_connect_1 < 3 ~ 1L, TRUE ~ 0L),
-    eligible_sch_part    = case_when(is.na(eligible_sch_connect_2) ~ NA_integer_,
-                                     eligible_sch_connect_2 < 3 ~ 1L, TRUE ~ 0L),
-    eligible_self_harm_y = case_when(is.na(eligible_self_harm) ~ NA_integer_,
-                                     eligible_self_harm >= 1 ~ 1L,
-                                     eligible_self_harm == 0 ~ 0L),
-    eligible_sleep_problem_y = case_when(is.na(eligible_sleep_problem_1) ~ NA_integer_,
-                                         eligible_sleep_problem_1 > 1 ~ 1L,
-                                         eligible_sleep_problem_1 <= 1 ~ 0L)
-  )
-
-elig_cols <- c("eligible_visited_ed","eligible_hospitalized","eligible_taken_med",
-               "eligible_received_therapy","eligible_sought_counseling",
-               "eligible_anxious","eligible_depression",
-               "eligible_sch_close","eligible_sch_part",
-               "eligible_self_harm_y","eligible_sleep_problem_y")
-elig_cols <- intersect(elig_cols, names(dat_locked))
-
-dat_locked <- dat_locked |>
-  mutate(
-    eligible_survey_count = if (length(elig_cols)) rownonmiss(!!!syms(elig_cols)) else NA_real_,
-    eligible_survey = if (length(elig_cols)) anymatch1(!!!syms(elig_cols)) else NA_integer_,
-    eligible_survey = if_else(eligible_survey_count <= 8, NA_integer_, eligible_survey),
-    eligible_survey = if_else(date_enroll > as.Date("2024-12-04"), 1L, eligible_survey),
-    eligible_survey = if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
-  )
-
-print(gt(tabyl(dat_locked$eligible_survey, show_na = TRUE)) |>
-        tab_header(title = "Eligibility survey: eligible"))
-
-# Keep eligible_survey == 1
-dat_locked <- dat_locked |> filter(eligible_survey == 1)
-```
-### 4.5. Consent Cleaning
-```{r consent-cleaning}
-dat_locked <- dat_locked |>
-  mutate(
-    consent = case_when(
-      p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
-      informed_consent_form_youth_complete == 2 & screen_age_group == 1 ~ 1L,
-      id_dyad %in% c("H-F0115","H-F0085") ~ 1L,  # verbal consent fixes
-      TRUE ~ 0L
-    )
-  )
-
-print(gt(tabyl(dat_locked$consent, show_na = TRUE)) |>
-        tab_header(title = "Consent status"))
-
-# Drop not consented, then drop missing treatment (randomization)
-dat_locked <- dat_locked |> filter(consent == 1)
-print(gt(tabyl(dat_locked$treatment, show_na = TRUE)) |>
-        tab_header(title = "Treatment (post-consent)"))
-dat_locked <- dat_locked |> filter(!is.na(treatment))
-```
----
-
-# 5) 3-Month retention merge + CONSORT status
-
-```{r retention-3m, message=FALSE, warning=FALSE}
-dat_src <- dat_locked
-
-if (!("follow_visitstatus_3m" %in% names(dat_src))) {
-  cat("No `follow_visitstatus_3m` column found. Skipping 3m console tables.\n")
-} else {
-  # Map to 4-category CONSORT as in STATA
-  dat_src$consort_status_3m <- with(dat_src, ifelse(follow_visitstatus_3m == 1, 1L,
-                             ifelse(follow_visitstatus_3m %in% 2:5, 2L,
-                             ifelse(follow_visitstatus_3m == 6, 3L,
-                             ifelse(follow_visitstatus_3m == 7, 4L, NA_integer_)))))
-
-  cat("\n=== 3-MONTH: CONSORT STATUS (1=Completed, 2=Still active, 3=Withdrawal, 4=Missed) ===\n")
-  print(addmargins(table(dat_src$consort_status_3m, useNA = "ifany")))
-
-  cat("\n=== 3-MONTH: VISIT STATUS vs CONSORT ===\n")
-  print(addmargins(table(dat_src$follow_visitstatus_3m, dat_src$consort_status_3m, useNA = "ifany")))
-
-  if ("treatment" %in% names(dat_src)) {
-    cat("\n=== 3-MONTH: CONSORT by TREATMENT ===\n")
-    print(addmargins(table(dat_src$consort_status_3m, dat_src$treatment, useNA = "ifany")))
-  } else {
-    cat("\n(treatment column not found; skipping CONSORT by treatment.)\n")
-  }
-
-  if ("follow_visitdate_3m" %in% names(dat_src)) {
-    cat("\nIDs with completed 3m (consort_status_3m==1):\n")
-    print(utils::head(dat_src[which(dat_src$consort_status_3m == 1), c("id_dyad","follow_visitdate_3m")], 20))
-  }
-}
-```
-
----
-
-# 6) 6-Month retention merge + CONSORT status (+ exited flag)
-
-```{r retention-6m, message=FALSE, warning=FALSE}
-dat_src6 <- if (exists("dat6")) dat6 else dat_locked
-
-if (!("follow_visitstatus_6m" %in% names(dat_src6))) {
-  cat("No `follow_visitstatus_6m` column found. Skipping 6m console tables.\n")
-} else {
-  # Map to 4-category CONSORT as in STATA
-  dat_src6$consort_status_6m <- with(dat_src6, ifelse(follow_visitstatus_6m == 1, 1L,
-                               ifelse(follow_visitstatus_6m %in% 2:5, 2L,
-                               ifelse(follow_visitstatus_6m == 6, 3L,
-                               ifelse(follow_visitstatus_6m == 7, 4L, NA_integer_)))))
-
-  # Carry forward 3m withdrawals if available (STATA: replace consort_status_6m = 3 if consort_status_3m == 3)
-  if ("consort_status_3m" %in% names(dat_src6)) {
-    idx <- which(!is.na(dat_src6$consort_status_3m) & dat_src6$consort_status_3m == 3)
-    dat_src6$consort_status_6m[idx] <- 3L
-  }
-
-  # Exited flag
-  dat_src6$consort_exited_6m <- with(dat_src6, ifelse(consort_status_6m %in% c(3,4), 1L,
-                                          ifelse(consort_status_6m %in% c(1,2), 0L, NA_integer_)))
-
-  cat("\n=== 6-MONTH: VISIT STATUS vs CONSORT ===\n")
-  print(addmargins(table(dat_src6$follow_visitstatus_6m, dat_src6$consort_status_6m, useNA = "ifany")))
-
-  if ("treatment" %in% names(dat_src6)) {
-    cat("\n=== 6-MONTH: CONSORT by TREATMENT ===\n")
-    print(addmargins(table(dat_src6$consort_status_6m, dat_src6$treatment, useNA = "ifany")))
-  } else {
-    cat("\n(treatment column not found; skipping CONSORT by treatment.)\n")
-  }
-
-  if ("site_id" %in% names(dat_src6)) {
-    cat("\n=== 6-MONTH: CONSORT by SITE ===\n")
-    print(addmargins(table(dat_src6$consort_status_6m, dat_src6$site_id, useNA = "ifany")))
-  }
-}
-```
-
----
-
-# 7) Enrollment by site & demographics (race construction, ethnicity)
-
-```{r demo-race-ethnicity, message=FALSE, warning=FALSE}
-suppressPackageStartupMessages({
-  library(dplyr); library(janitor); library(gt)
-})
-
-# Build single race category like STATA
-dat_demo <- dat_locked
-
-# If merge_black absent (should exist), rebuild quickly
-if (!"merge_black" %in% names(dat_demo)) {
-  rvars <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(dat_demo))
-  anymatch1 <- function(...) {
-    m <- cbind(...); if (!is.matrix(m)) m <- matrix(m, ncol=1)
-    has_any <- rowSums(m == 1, na.rm = TRUE) > 0
-    has_obs <- rowSums(!is.na(m)) > 0
-    as.integer(ifelse(!has_obs, NA, ifelse(has_any, 1L, 0L)))
-  }
-  dat_demo <- dat_demo %>%
-    mutate(merge_black = if (length(rvars)) anymatch1(!!!rlang::syms(rvars)) else NA_integer_)
-}
-
-# Construct detailed race buckets -> race_youth
-dat_demo <- dat_demo %>%
-  mutate(
-    race_black_aian    = ifelse(merge_black == 1 & screen_race_5  == 1, 1L,
-                           ifelse(!is.na(screen_race_5)  & screen_race_5  == 0, 0L, NA)),
-    race_black_asian   = ifelse(merge_black == 1 & screen_race_6  == 1, 1L,
-                           ifelse(!is.na(screen_race_6)  & screen_race_6  == 0, 0L, NA)),
-    race_black_nhpi    = ifelse(merge_black == 1 & screen_race_7  == 1, 1L,
-                           ifelse(!is.na(screen_race_7)  & screen_race_7  == 0, 0L, NA)),
-    race_black_white   = ifelse(merge_black == 1 & screen_race_8  == 1, 1L,
-                           ifelse(!is.na(screen_race_8)  & screen_race_8  == 0, 0L, NA)),
-    race_black_unknown = ifelse(merge_black == 1 & screen_race_99 == 1, 1L,
-                           ifelse(!is.na(screen_race_99) & screen_race_99 == 0, 0L, NA)),
-    race_youth = dplyr::case_when(
-      merge_black == 1 &
-        dplyr::coalesce(race_black_aian,0)    == 0 &
-        dplyr::coalesce(race_black_asian,0)   == 0 &
-        dplyr::coalesce(race_black_nhpi,0)    == 0 &
-        dplyr::coalesce(race_black_white,0)   == 0 &
-        dplyr::coalesce(race_black_unknown,0) == 0 ~ 1L,  # Black only
-      race_black_aian    == 1 ~ 2L,
-      race_black_asian   == 1 ~ 3L,
-      race_black_nhpi    == 1 ~ 4L,
-      race_black_white   == 1 ~ 5L,
-      race_black_unknown == 1 ~ 6L,
-      TRUE ~ NA_integer_
-    )
-  )
-
-# ✅ Correct two-way tabyl usage: tabyl(data, var1, var2) or data %>% tabyl(var1, var2)
-if (all(c("race_youth","site_id") %in% names(dat_demo))) {
-  race_site <- dat_demo %>%
-    tabyl(race_youth, site_id) %>%
-    adorn_totals(c("row","col"))
-  print(gt(race_site) %>% tab_header(title = "Race (entered) by site_id"))
-} else {
-  cat("Missing columns for race/site table.\n")
-}
-
-# Completed at 6m (if dat6 exists and has the column)
-if (exists("dat6") && all(c("race_youth","site_id","follow_visitstatus_6m") %in% names(dat6))) {
-  comp6 <- dat6 %>% filter(follow_visitstatus_6m == 1)
-  if (nrow(comp6)) {
-    race_completed <- comp6 %>% tabyl(race_youth, site_id) %>% adorn_totals(c("row","col"))
-    print(gt(race_completed) %>% tab_header(title = "Race (completed at 6m) by site_id"))
-  }
-  if ("screen_ethnicity" %in% names(comp6)) {
-    eth_completed <- comp6 %>% tabyl(screen_ethnicity, site_id) %>% adorn_totals(c("row","col"))
-    print(gt(eth_completed) %>% tab_header(title = "Ethnicity (completed at 6m) by site_id"))
-  }
-}
-
-# Exited at 6m (if dat6 exists and has the flag)
-if (exists("dat6") && all(c("race_youth","site_id","consort_exited_6m") %in% names(dat6))) {
-  exited <- dat6 %>% filter(consort_exited_6m == 1)
-  if (nrow(exited)) {
-    race_exited <- exited %>% tabyl(race_youth, site_id) %>% adorn_totals(c("row","col"))
-    print(gt(race_exited) %>% tab_header(title = "Race (exited at 6m) by site_id"))
-    if ("screen_ethnicity" %in% names(exited)) {
-      eth_exited <- exited %>% tabyl(screen_ethnicity, site_id) %>% adorn_totals(c("row","col"))
-      print(gt(eth_exited) %>% tab_header(title = "Ethnicity (exited at 6m) by site_id"))
-    }
-  }
-}
-```
-
----
-
-# 8) Enrollment table over monthly cutoffs
-
-```{r enrollment-by-month, message=FALSE, warning=FALSE}
-suppressPackageStartupMessages({ library(dplyr); library(janitor); library(gt); library(knitr) })
-
-# Monthly cutoffs as Dates
-cutoffs <- as.Date(c(
-  "2024-04-01","2024-05-01","2024-06-01","2024-07-01","2024-08-01",
-  "2024-09-01","2024-10-01","2024-11-01","2024-12-01",
-  "2025-01-01","2025-02-01","2025-03-01","2025-04-01","2025-05-01",
-  "2025-06-01","2025-07-01","2025-08-01"
-))
-
-for (i in seq_along(cutoffs)) {
-  co <- as.Date(cutoffs[i])  # force Date class each loop
-  subt <- dat_locked %>% filter(date_enroll < co)
-  ttl  <- sprintf("Treatment by site (date_enroll < %s)", format(co, "%Y-%m-%d"))
-
-  if (nrow(subt) > 0) {
-    # ---- two-way tabyl: data first, then unquoted columns ----
-    tab2 <- subt %>%
-      tabyl(treatment, site_id) %>%
-      adorn_totals(c("row","col"))
-
-    if (knitr::is_html_output()) {
-      # Pretty table when knitting to HTML
-      print(gt(tab2) %>% tab_header(title = ttl))
-    } else {
-      # Clean console table when running interactively / non-HTML
-      cat("\n", ttl, "\n", sep = "")
-      print(addmargins(table(subt$treatment, subt$site_id, useNA = "ifany")))
-    }
-  } else {
-    cat("_No rows for_ ", format(co, "%Y-%m-%d"), "\n", sep = "")
-  }
-}
-```
-
----
-
-# 9) Section 3.6: Ineligibility & Withdrawal (fresh reload like STATA)
-
-```{r ineligibility-withdrawal, message=FALSE, warning=FALSE}
-
-# Reason 1: under 18, no legal guardian
-r1 <- dat_locked |> filter(over_18 == 0, p_screen_legal_guardian == 0)
-print(gt(r1 |> select(p_participant_id, site_id, id_dyad)) |> tab_header(title = "Reason 1: Under 18, no legal guardian"))
-dat_locked <- anti_join(dat_locked, r1, by = names(dat_locked))
-
-# Reason 2: caregiver language none of the above (coded 5)
-# Fix one id per STATA
-dat_locked <- dat_locked |>
-  mutate(p_screen_language = if_else(id_dyad == "H-F0115", 1, p_screen_language))
-r2 <- dat_locked |> filter(p_screen_language == 5)
-print(gt(r2 |> select(p_participant_id, site_id, id_dyad)) |> tab_header(title = "Reason 2: Language excluded"))
-dat_locked <- anti_join(dat_locked, r2, by = names(dat_locked))
-
-# merged_hear_more (drop if !=1)
-# Ensure merged_hear_more exists & is numeric (carry over manual fixes)
-dat_locked <- dat_locked %>%
-  mutate(
-    merged_hear_more = coalesce(ps_hear_more, p_ps_hear_more),
-    merged_hear_more = if_else(id_dyad %in% c("K-F0006","H-F0115","K-F0250"), 1, merged_hear_more),
-    merged_hear_more = coalesce(merged_hear_more, 0),
-    merged_hear_more = as.integer(merged_hear_more)
-  )
-
-# Two-way tabyl: data first, then unquoted columns
-tab_hm <- dat_locked %>%
-  janitor::tabyl(merged_hear_more, site_id) %>%
-  janitor::adorn_totals(c("row","col"))
-
-if (knitr::is_html_output()) {
-  print(gt::gt(tab_hm) %>% gt::tab_header(title = "Merged hear more by site"))
-} else {
-  cat("\nMerged hear more by site\n")
-  print(addmargins(table(dat_locked$merged_hear_more, dat_locked$site_id, useNA = "ifany")))
-}
-
-# Now apply filter
-dat_locked <- dat_locked %>% dplyr::filter(merged_hear_more == 1)
-
-# ---- Eligibility screen completeness (Table 3.6) ----
-dat_locked <- dat_locked %>%
-  mutate(
-    # coerce to integer and treat NA as 0 (Incomplete) to match  STATA logic
-    eligibility_screen_complete = suppressWarnings(as.integer(eligibility_screen_complete)),
-    eligibility_screen_complete = dplyr::coalesce(eligibility_screen_complete, 0L),
-    esc_label = factor(
-      eligibility_screen_complete,
-      levels = c(0L, 2L),
-      labels = c("Incomplete", "Complete")
-    )
-  )
-
-# Correct two-way tabyl usage: data first, then unquoted columns
-tab_esc <- dat_locked %>%
-  janitor::tabyl(esc_label, site_id) %>%
-  janitor::adorn_totals(c("row","col"))
-
-if (knitr::is_html_output()) {
-  print(
-    gt::gt(tab_esc) %>% gt::tab_header(title = "Eligibility screen complete (Table 3.6)")
-  )
-} else {
-  cat("\nEligibility screen complete (Table 3.6)\n")
-  print(addmargins(table(dat_locked$esc_label, dat_locked$site_id, useNA = "ifany")))
-}
-
-# Keep only complete screens (2) for downstream steps
-dat_locked <- dat_locked %>% dplyr::filter(eligibility_screen_complete == 2L)
-
-# Eligibility criteria again for Table 3.6
-rv <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(dat_locked))
-dat_locked <- dat_locked |>
-  mutate(
-    merge_black = if (length(rv)) anymatch1(!!!syms(rv)) else NA_integer_,
-    elg_age = case_when(
-      !is.na(screen_age) & screen_age >= 12 & screen_age < 20 ~ 1L,
-      !is.na(screen_age) & (screen_age < 12 | screen_age >= 20) ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    elg_age = if_else(id_dyad == "H-F0023", 1L, elg_age),
     eligible_screen = 1L,
-    eligible_screen = replace(eligible_screen, merge_black == 0, 0L),
-    eligible_screen = replace(eligible_screen, elg_age != 1, 0L),
-    eligible_screen = replace(eligible_screen, screen_speak_read_english == 0, 0L),
-    eligible_screen = replace(eligible_screen, screen_seek_therapy == 1, 0L),
-    eligible_screen = replace(eligible_screen, screen_self_repeat == 1, 0L),
-    eligible_screen = replace(eligible_screen, p_screen_sibling_repeat == 1, 0L),
-    eligible_screen = replace(eligible_screen, screen_has_cell_phone == 0, 0L)
+    eligible_screen = if_else(merge_black == 0, 0L, eligible_screen),
+    eligible_screen = if_else(elg_age != 1, 0L, eligible_screen),
+    eligible_screen = if_else(screen_speak_read_english == 0, 0L, eligible_screen),#Ask Ashleigh what this means bc it's confusing 
+    eligible_screen = if_else(screen_seek_therapy == 1, 0L, eligible_screen),
+    eligible_screen = if_else(screen_self_repeat == 1, 0L, eligible_screen),
+    eligible_screen = if_else(screen_sibling_repeat == 1, 0L, eligible_screen),
+    eligible_screen = if_else(p_screen_sibling_repeat == 1, 0L, eligible_screen),
+    eligible_screen = if_else(screen_has_cell_phone == 0 & merged_date < ymd("2025-01-01"), 0L, eligible_screen),
+    eligible_screen = replace_na(eligible_screen, 0L)
   )
 
-print(gt(tabyl(dat_locked$merge_black, dat_locked$site_id, show_na = TRUE)) |>
-        tab_header(title = "Reason 3: youth not Black (Table 3.6)"))
+# Manual fix
+dat <- dat |>
+  mutate(eligible_screen = if_else(p_participant_id == "H-F0269", 1L, eligible_screen))
 
-print(gt(tabyl(dat_locked$screen_speak_read_english, dat_locked$site_id, show_na = TRUE)) |>
-        tab_header(title = "Reason 4: speak/read English (Table 3.6)"))
-dat_locked <- dat_locked |> filter(screen_speak_read_english != 0)
+# Check: ineligible but has treatment?
+gt::gt(
+  dat |>
+    filter(eligible_screen == 0, !is.na(treatment)) |>
+    select(p_participant_id, treatment)
+) |> gt::tab_header(title = "Check: eligible_screen==0 but treatment assigned")
 
-print(gt(tabyl(dat_locked$screen_seek_therapy, dat_locked$site_id, show_na = TRUE)) |>
-        tab_header(title = "Reason 5: sought therapy past week (Table 3.6)"))
-dat_locked <- dat_locked |> filter(screen_seek_therapy != 1)
+# Check: cell phone exclusion before cutoff
+gt::gt(
+  dat |>
+    filter(screen_has_cell_phone == 0) |>
+    select(p_participant_id, merged_date, treatment)
+) |> gt::tab_header(title = "Info: screen_has_cell_phone == 0")
 
-# Minimal risk (eligibility survey) – reuse the same construction as earlier
-dat_locked <- dat_locked |>
+# Keep eligible only
+dat <- dat |>
+  filter(eligible_screen == 1)
+
+eligibility_screen_eligible_n <- nrow(dat)
+```
+
+# 7) Eligibility Survey Rules
+```{r warning=FALSE, message=FALSE}
+# Anxiety (sum of dichotomous items)
+dat <- dat |>
   mutate(
-    eligible_anxiety = rowtotal(eligible_anxiety_1, eligible_anxiety_2),
-    eligible_anxious = case_when(is.na(eligible_anxiety) ~ NA_integer_, eligible_anxiety >= 4 ~ 1L, TRUE ~ 0L),
-    eligible_depress = rowtotal(eligible_depress_1, eligible_depress_2),
-    eligible_depression = case_when(is.na(eligible_depress) ~ NA_integer_, eligible_depress >= 4 ~ 1L, TRUE ~ 0L),
-    eligible_sch_close = case_when(is.na(eligible_sch_connect_1) ~ NA_integer_, eligible_sch_connect_1 < 3 ~ 1L, TRUE ~ 0L),
-    eligible_sch_part  = case_when(is.na(eligible_sch_connect_2) ~ NA_integer_, eligible_sch_connect_2 < 3 ~ 1L, TRUE ~ 0L),
-    eligible_self_harm_y = case_when(is.na(eligible_self_harm) ~ NA_integer_, eligible_self_harm >= 1 ~ 1L, TRUE ~ 0L),
-    eligible_sleep_problem_y = case_when(is.na(eligible_sleep_problem_1) ~ NA_integer_,
-                                         eligible_sleep_problem_1 > 1 ~ 1L, TRUE ~ 0L)
+    eligible_anxiety = rowSums(across(c(eligible_anxiety_1, eligible_anxiety_2)), na.rm = FALSE),
+    eligible_anxious = case_when(
+      !is.na(eligible_anxiety) & eligible_anxiety >= 4 ~ 1L,
+      !is.na(eligible_anxiety) & eligible_anxiety <  4 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    eligible_depress = rowSums(across(c(eligible_depress_1, eligible_depress_2)), na.rm = FALSE),
+    eligible_depression = case_when(
+      !is.na(eligible_depress) & eligible_depress >= 4 ~ 1L,
+      !is.na(eligible_depress) & eligible_depress <  4 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    eligible_sch_close = case_when(
+      eligible_sch_connect_1 < 3 ~ 1L,
+      eligible_sch_connect_1 >=3 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    eligible_sch_part = case_when(
+      eligible_sch_connect_2 < 3 ~ 1L,
+      eligible_sch_connect_2 >=3 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    eligible_self_harm_y = case_when(
+      eligible_self_harm >= 1 ~ 1L,
+      eligible_self_harm == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    eligible_sleep_problem_y = case_when(
+      eligible_sleep_problem_1 > 1 ~ 1L,
+      eligible_sleep_problem_1 <=1 ~ 0L,
+      TRUE ~ NA_integer_
+    )
   )
 
-elig2 <- intersect(c("eligible_visited_ed","eligible_hospitalized","eligible_taken_med",
-                     "eligible_received_therapy","eligible_sought_counseling",
-                     "eligible_anxious","eligible_depression",
-                     "eligible_sch_close","eligible_sch_part",
-                     "eligible_self_harm_y","eligible_sleep_problem_y"), names(dat_locked))
-
-dat_locked <- dat_locked |>
+# How many survey items answered?
+dat <- dat |>
   mutate(
-    eligible_survey_count = if (length(elig2)) rownonmiss(!!!syms(elig2)) else NA_real_,
-    eligible_survey = if (length(elig2)) anymatch1(!!!syms(elig2)) else NA_integer_,
-    eligible_survey = if_else(eligible_survey_count <= 8, NA_integer_, eligible_survey),
-    eligible_survey = if_else(date_enroll > as.Date("2024-12-04"), 1L, eligible_survey),
+    eligible_survey_count = rowSums(across(c(
+      eligible_visited_ed,
+      eligible_hospitalized,
+      eligible_taken_med,
+      eligible_received_therapy,
+      eligible_sought_counseling,
+      eligible_anxious,
+      eligible_depression,
+      eligible_sch_close,
+      eligible_sch_part,
+      eligible_self_harm_y,
+      eligible_sleep_problem_y
+    ), ~!is.na(.x)))
+  )
+
+# Overall survey eligibility (any positive), with date rule + manual inclusions
+dat <- dat |>
+  mutate(
+    eligible_survey = case_when(
+      eligible_survey_count <= 8 ~ NA_integer_,
+      TRUE ~ if_else(rowSums(across(c(
+        eligible_visited_ed,
+        eligible_hospitalized,
+        eligible_taken_med,
+        eligible_received_therapy,
+        eligible_sought_counseling,
+        eligible_anxious,
+        eligible_depression,
+        eligible_sch_close,
+        eligible_sch_part,
+        eligible_self_harm_y,
+        eligible_sleep_problem_y
+      ), \(x) replace_na(x,0))) >= 1, 1L, 0L)
+    ),
+    eligible_survey = if_else(merged_date > ymd("2024-12-04"), 1L, eligible_survey),
     eligible_survey = if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
   )
 
-print(gt(tabyl(dat_locked$eligible_survey, dat_locked$site_id, show_na = TRUE)) |>
-        tab_header(title = "Reason 7: minimal risk criteria (Table 3.6)"))
+completed_eligibility_survey_n <- sum(!is.na(dat$eligible_survey))
+eligibility_survey_eligible_n  <- sum(dat$eligible_survey == 1, na.rm = TRUE)
+eligibility_survey_ineligible_n<- sum(dat$eligible_survey == 0, na.rm = TRUE)
+did_not_wish_after_screen_n    <- eligibility_screen_eligible_n - completed_eligibility_survey_n
 
-# Consent for Table 3.6 views
-dat_locked <- dat_locked |>
+# Keep only survey-eligible
+dat <- dat |>
+  filter(eligible_survey == 1)
+```
+
+# 8) Consent + Randomization 
+```{r warning=FALSE, message=FALSE}
+dat <- dat |>
   mutate(
     consent = case_when(
       p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
-      informed_consent_form_youth_complete == 2 & screen_age_group == 1 ~ 1L,
-      id_dyad %in% c("H-F0115","H-F0085") ~ 1L,
+      informed_consent_form_youth_complete  == 2 & screen_age_group == 1 ~ 1L,
+      p_participant_id %in% c("H-F0115","H-F0085") ~ 1L,  # verbal / form issues
       TRUE ~ 0L
     )
   )
-if (all(c("consent","site_id") %in% names(dat_locked))) {
-  dat_locked <- dat_locked %>%
-    mutate(
-      consent = suppressWarnings(as.integer(consent)),
-      consent_lab = factor(consent, levels = c(0L, 1L),
-                           labels = c("No consent", "Consented"))
-    )
 
-  tab_consent <- dat_locked %>%
-    tabyl(consent_lab, site_id) %>%
-    adorn_totals(c("row","col"))
+consented_n <- sum(dat$consent == 1, na.rm = TRUE)
+did_not_consent_n <- sum(dat$consent == 0, na.rm = TRUE)
 
-  if (knitr::is_html_output()) {
-    print(gt(tab_consent) %>% tab_header(title = "Consent by site (Table 3.6)"))
-  } else {
-    cat("\nConsent by site (Table 3.6)\n")
-    print(addmargins(table(dat_locked$consent_lab, dat_locked$site_id, useNA = "ifany")))
-  }
-} else {
-  cat("Skipping 'Consent by site' — required columns missing.\n")
+# Checks
+gt::gt(
+  dat |> filter(!is.na(treatment) & consent != 1) |>
+    select(p_participant_id, treatment, consent)
+) |> gt::tab_header(title = "Check: Has treatment but consent != 1")
+
+gt::gt(
+  dat |> filter(is.na(treatment) & consent == 1) |>
+    select(p_participant_id)
+) |> gt::tab_header(title = "Check: Consented but no treatment")
+
+# CONSORT counters
+did_not_complete_baseline_n <- sum(is.na(dat$treatment) & dat$consent == 1)
+randomized_n <- sum(!is.na(dat$treatment))
+
+treatment_n <- sum(dat$treatment == 1, na.rm = TRUE)
+control_n   <- sum(dat$treatment == 0, na.rm = TRUE)
+
+# Keep only randomized for follow-up splits
+rand <- dat |> filter(!is.na(treatment))
+```
+
+# 9) Follow-ups: 3-Month & 6-Month
+```{r warning=FALSE, message=FALSE}
+# Map to 4 categories
+map_status <- function(v){
+  dplyr::case_when(
+    v == 1 ~ "Completed",
+    v %in% 2:5 ~ "Active",
+    v == 6 ~ "Withdrawal",
+    v == 7 ~ "Missed",
+    TRUE   ~ NA_character_
+  )
 }
 
-# ---- Treatment by site (post-consent) ----
-if (all(c("treatment","site_id") %in% names(dat_locked))) {
-  tab_tx <- dat_locked %>%
-    tabyl(treatment, site_id) %>%
-    adorn_totals(c("row","col"))
+rand <- rand |>
+  mutate(
+    consort_status_3m = map_status(follow_visitstatus_3m),
+    consort_status_6m = map_status(follow_visitstatus_6m)
+  ) |>
+  # Rule: if exited at 3m, keep exited in 6m
+  mutate(
+    consort_status_6m = if_else(consort_status_3m == "Withdrawal", "Withdrawal", consort_status_6m)
+  )
 
-  if (knitr::is_html_output()) {
-    print(gt(tab_tx) %>% tab_header(title = "Treatment by site (post-consent)"))
-  } else {
-    cat("\nTreatment by site (post-consent)\n")
-    print(addmargins(table(dat_locked$treatment, dat_locked$site_id, useNA = "ifany")))
+# Count helper
+count_by_arm <- function(status_col, arm){
+  sum(rand[[status_col]] == "Completed" & rand$treatment == arm, na.rm = TRUE) %>% 
+    list(
+      completed = .,
+      active    = sum(rand[[status_col]] == "Active"    & rand$treatment == arm, na.rm = TRUE),
+      missed    = sum(rand[[status_col]] == "Missed"    & rand$treatment == arm, na.rm = TRUE),
+      exited    = sum(rand[[status_col]] == "Withdrawal"& rand$treatment == arm, na.rm = TRUE)
+    )
+}
+
+n3_t <- count_by_arm("consort_status_3m", 1)
+n3_c <- count_by_arm("consort_status_3m", 0)
+
+n6_t <- count_by_arm("consort_status_6m", 1)
+n6_c <- count_by_arm("consort_status_6m", 0)
+
+# Totals shown under each 3m/6m box
+n3_t_total <- sum(rand$treatment==1 & !is.na(rand$consort_status_3m))
+n3_c_total <- sum(rand$treatment==0 & !is.na(rand$consort_status_3m))
+n6_t_total <- sum(rand$treatment==1 & !is.na(rand$consort_status_6m))
+n6_c_total <- sum(rand$treatment==0 & !is.na(rand$consort_status_6m))
+```
+
+# 10) CONSORT Diagram 
+```{r warning=FALSE, message=FALSE}
+# 10) CONSORT Diagram (robust)
+{
+  # Labels already computed above in `lbl`
+
+  try_consort <- requireNamespace("consort", quietly = TRUE) &&
+                 !identical(Sys.getenv("WECARE_DISABLE_CONSORT"), "1")
+
+  if (try_consort) {
+    ok <- TRUE
+    g <- try({
+      library(consort)
+      add_box() |>
+        add_box("top", txt = lbl$top) |>
+        add_box("hear_more_y", parent = "top", txt = lbl$hear_more_y) |>
+        add_side_box("hear_more_n", "hear_more_y", txt = lbl$hear_more_n) |>
+        add_box("elg_screen_cmpl", parent = "hear_more_y", txt = lbl$elg_screen_cmpl) |>
+        add_side_box("elg_screen_incmp", "elg_screen_cmpl", txt = lbl$elg_screen_incmp) |>
+        add_box("elg_screen_elig", parent = "elg_screen_cmpl", txt = lbl$elg_screen_elig) |>
+        add_box("elg_svy_total", parent = "elg_screen_elig", txt = lbl$elg_svy_total) |>
+        add_side_box("elg_svy_inelig", "elg_svy_total", txt = lbl$elg_svy_inelig) |>
+        add_box("elg_svy_elig", parent = "elg_svy_total", txt = lbl$elg_svy_elig) |>
+        add_box("consented", parent = "elg_svy_elig", txt = lbl$consented) |>
+        add_side_box("did_not_consent", "consented", txt = lbl$did_not_consent) |>
+        add_box("randomized", parent = "consented", txt = lbl$randomized) |>
+        add_side_box("did_not_baseline", "randomized", txt = lbl$did_not_baseline) |>
+        add_box("arm_t", parent = "randomized", txt = lbl$arm_t, just = "left") |>
+        add_box("arm_c", parent = "randomized", txt = lbl$arm_c, just = "right") |>
+        add_box("m3_t", parent = "arm_t", txt = lbl$m3_t) |>
+        add_box("m3_c", parent = "arm_c", txt = lbl$m3_c) |>
+        add_box("m3_t_breakdown", parent = "m3_t", txt = lbl$m3_t_breakdown, just = "left") |>
+        add_box("m3_c_breakdown", parent = "m3_c", txt = lbl$m3_c_breakdown, just = "right") |>
+        add_box("m6_t", parent = "m3_t", txt = lbl$m6_t) |>
+        add_box("m6_c", parent = "m3_c", txt = lbl$m6_c) |>
+        add_box("m6_t_breakdown", parent = "m6_t", txt = lbl$m6_t_breakdown, just = "left") |>
+        add_box("m6_c_breakdown", parent = "m6_c", txt = lbl$m6_c_breakdown, just = "right")
+    }, silent = TRUE)
+
+    if (inherits(g, "try-error")) {
+      ok <- FALSE
+    } else {
+      # Explicit wrap width avoids `stri_wrap` error
+      ok <- !inherits(try(consort::plot(g, text_width = 64), silent = TRUE), "try-error")
+    }
+
+    if (ok) {
+      invisible(NULL)  # already plotted
+    } else {
+      message("CONSORT package plot failed; falling back to DiagrammeR.")
+      try_consort <- FALSE
+    }
   }
-} else {
-  cat("Skipping 'Treatment by site (post-consent)' — required columns missing.\n")
+
+  if (!try_consort) {
+    dot <- glue::glue('
+    digraph consort {{
+      graph [rankdir=TB, splines=ortho, nodesep="0.3", ranksep="0.35"];
+      node [shape=box, style="rounded,filled", fillcolor="white", color="black", fontname="Helvetica", fontsize=10];
+      edge [arrowhead=normal];
+
+      top    [label="{lbl$top}"];
+      hm_y   [label="{lbl$hear_more_y}"];
+      hm_n   [label="{lbl$hear_more_n}"];
+      elg_c  [label="{lbl$elg_screen_cmpl}"];
+      elg_dn [label="{lbl$elg_screen_incmp}"];
+      elg_e  [label="{lbl$elg_screen_elig}"];
+      svy_t  [label="{lbl$elg_svy_total}"];
+      svy_i  [label="{lbl$elg_svy_inelig}"];
+      svy_e  [label="{lbl$elg_svy_elig}"];
+      cons   [label="{lbl$consented}"];
+      ncons  [label="{lbl$did_not_consent}"];
+      rand   [label="{lbl$randomized}"];
+      nbase  [label="{lbl$did_not_baseline}"];
+      arm_t  [label="{lbl$arm_t}"];
+      arm_c  [label="{lbl$arm_c}"];
+      m3_t   [label="{lbl$m3_t}"];
+      m3_c   [label="{lbl$m3_c}"];
+      m3_tb  [label="{lbl$m3_t_breakdown}"];
+      m3_cb  [label="{lbl$m3_c_breakdown}"];
+      m6_t   [label="{lbl$m6_t}"];
+      m6_c   [label="{lbl$m6_c}"];
+      m6_tb  [label="{lbl$m6_t_breakdown}"];
+      m6_cb  [label="{lbl$m6_c_breakdown}"];
+
+      top -> hm_y;   top -> hm_n [constraint=false];
+      hm_y -> elg_c; elg_c -> elg_dn [constraint=false]; elg_c -> elg_e;
+      elg_e -> svy_t; svy_t -> svy_i [constraint=false]; svy_t -> svy_e;
+      svy_e -> cons;  cons -> ncons [constraint=false]; cons -> rand; rand -> nbase [constraint=false];
+      rand -> arm_t;  rand -> arm_c;
+      arm_t -> m3_t;  arm_c -> m3_c;
+      m3_t -> m3_tb;  m3_c -> m3_cb;
+      m3_t -> m6_t;   m3_c -> m6_c;
+      m6_t -> m6_tb;  m6_c -> m6_cb;
+    }}
+    ')
+    DiagrammeR::grViz(dot)
+  }
 }
 ```
 
----
-
-# 10) SAE / AE – tabulations by item
-
-```{r sae-ae}
-# Number randomized
-print(gt(tabyl(dat_locked$treatment)) |> tab_header(title = "Randomized (treatment)"))
-
-# Youth 3m AEs/SAEs
-for (nm in c("y_edstars_2_3m","y_edstars_3a_3m","y_ed_stars_4d_3m",
-             "y_ed_stars_4d_2_3m","y_ed_stars_4d_3_3m","cssrs_6_3m")) {
-  if (nm %in% names(dat_locked)) {
-    print(gt(tabyl(dat_locked[[nm]])) |> tab_header(title = paste0("Tab: ", nm)))
-  }
-}
-
-# Youth 6m AEs/SAEs
-for (nm in c("y_edstars_2_6m","y_edstars_3_3m","y_ed_stars_4d_6m",
-             "y_ed_stars_4d_2_6m","y_ed_stars_4d_3_6m","cssrs_6_6m")) {
-  if (nm %in% names(dat_locked)) {
-    print(gt(tabyl(dat_locked[[nm]])) |> tab_header(title = paste0("Tab: ", nm)))
-  }
-}
-
-# Caregiver 3m AEs (examples)
-for (nm in c("p_edstars_2a_3m","p_edstars_3a_3m","p_edstars_4d_3m",
-             "p_edstars_4d_2_3m","p_edstars_4d_3_3m")) {
-  if (exists("dat3") && nm %in% names(dat3)) {
-    print(gt(tabyl(dat3[[nm]])) |> tab_header(title = paste0("Tab: ", nm)))
-  }
-}
-```
----
-
-# 11) Section 5: Demographics by site & treatment
-
-```{r demographics}
-d5 <- dat_locked |> filter(!is.na(treatment))
-# Age – summaries by site within treatment
-for (s in c("H","K")) {
-  subt <- d5 |> filter(site_id == s)
-  if (nrow(subt)) {
-    cat("### Age summary: site", s, "\n")
-    print(
-      subt |>
-        group_by(treatment) |>
-        summarise(n = sum(!is.na(screen_age)),
-                  mean = mean(screen_age, na.rm = TRUE),
-                  sd = sd(screen_age, na.rm = TRUE),
-                  min = min(screen_age, na.rm = TRUE),
-                  max = max(screen_age, na.rm = TRUE), .groups = "drop") |>
-        gt() |> tab_header(title = paste("Age summary (site", s, ")"))
-    )
-  }
-}
-# Age groups / Sex / Gender / Race / Ethnicity by treatment and site
-xstab_print <- function(df, var_name, site_code) {
-  if (!all(c(var_name, "treatment", "site_id") %in% names(df))) return(invisible(NULL))
-  v <- sym(var_name)
-
-  subt <- df %>% filter(site_id == site_code)
-  if (!nrow(subt)) return(invisible(NULL))
-
-  tab2 <- subt %>%
-    tabyl(!!v, treatment) %>%           # <- data-first, unquoted columns via !!
-    adorn_totals(c("row","col"))
-
-  title_txt <- paste(var_name, "by treatment (site", site_code, ")")
-
-  if (knitr::is_html_output()) {
-    print(gt(tab2) %>% tab_header(title = title_txt))
-  } else {
-    cat("\n", title_txt, "\n", sep = "")
-    print(addmargins(table(subt[[var_name]], subt$treatment, useNA = "ifany")))
-  }
-  invisible(NULL)
-}
-
-# Age groups / Sex / Gender / Race / Ethnicity by treatment and site
-vars_to_tab <- c("screen_age_group","screen_sex","giso_gender_identity_b","race_youth","screen_ethnicity")
-sites       <- c("H","K")
-
-for (nm in intersect(vars_to_tab, names(d5))) {
-  for (s in sites) {
-    xstab_print(d5, nm, s)
-  }
-}
-```
-
----
-
-# 12) Section 6.2:  Missing forms by site (baseline + 3m + core)
-
-```{r missing-forms}
-z <- dat_locked
-
-# Baseline blocks → counts and “answered at least one” binaries
-mk_count_inq <- function(df, vars, count_nm, inq_nm) {
-  vars <- intersect(vars, names(df))
-  if (!length(vars)) return(df |> mutate("{count_nm}" := NA_real_, "{inq_nm}" := NA_real_))
-  df |>
-    mutate("{count_nm}" := rownonmiss(!!!syms(vars)),
-           "{inq_nm}"   := case_when(is.na(.data[[count_nm]]) ~ NA_real_,
-                                     .data[[count_nm]] == 0 ~ 0, TRUE ~ 1))
-}
-
-# Baseline blocks (examples; mirrors STATA lists)
-z <- mk_count_inq(z, c("eligible_visited_ed","eligible_ed_today","eligible_hospitalized",
-                       "eligible_ed_mental_reason","eligible_ed_mental_reason_other",
-                       "eligible_taken_med","eligible_taking_med","eligible_received_therapy",
-                       "eligible_receiving_therapy","eligible_sought_counseling",
-                       "eligible_seeking_counseling","eligible_anxiety_1","eligible_anxiety_2",
-                       "eligible_depress_1","eligible_depress_2","eligible_nervous",
-                       "eligible_sch_connect_1","eligible_sch_connect_2","eligible_self_harm",
-                       "eligible_sleep_problem_1","eligible_sleep_problem_2"),
-                "count_edstars_b","inq_edstars_b")
-
-z <- mk_count_inq(z, c("demo_grade_b","demo_grade_other_b","demo_parent1_edu_b",
-                       "demo_parent2_edu_b","phone_primary","phone_verify","phone_alternate"),
-                  "count_demo_b","inq_demo_b")
-
-z <- mk_count_inq(z, c("cssrs_1a_b","cssrs_1b_b","cssrs_2a_b","cssrs_2b_b","cssrs_2c_b",
-                       "cssrs_3a_b","cssrs_3b_b","cssrs_4a_b","cssrs_4b_b","cssrs_5a_b",
-                       "cssrs_5b_b","cssrs_6a_b","cssrs_6b_b","cssrs_7a_b","cssrs_7b_b",
-                       "st_1_b","st_2a_b","st_2b_b"),
-                  "count_cssrs_b","inq_cssrs_b")
-
-# ...repeat mk_count_inq calls for all other baseline block listed...
-# (acfs, barriers, atphs, soc, tam, pfcs, pvp, cde, hopeless, uppss, yrbsa, dus,
-#  se, pet, pil, cdef, giso, ibelong, sc, joy)
-
-# Count measures baseline
-baseline_inq <- c("inq_edstars_b","inq_demo_b","inq_cssrs_b",
-                  "inq_ets_b","inq_acfs_b","inq_barriers_b","inq_atphs_b","inq_soc_b",
-                  "inq_tam_b","inq_pcfs_b","inq_pvp_b","inq_cde_b","inq_hopeless_b",
-                  "inq_uppss_b","inq_yrbsa_b","inq_dus_b","inq_se_b","inq_pet_b","inq_pil_b",
-                  "inq_cdef_b","inq_giso_b","inq_ibelong_b","inq_sc_b","inq_joy_b")
-baseline_inq <- intersect(baseline_inq, names(z))
-z <- z |> mutate(count_measures_b = if (length(baseline_inq)) rowtotal(!!!syms(baseline_inq)) else NA_real_)
-
-print(gt(tabyl(z$count_measures_b)) |> tab_header(title = "Baseline: # measures per participant"))
-print(gt(z |>
-           summarise(sum_measures_b = sum(count_measures_b, na.rm = TRUE)) |>
-           pivot_longer(everything())) |>
-        tab_header(title = "Baseline: total measures (all sites)"))
-
-# By site totals
-for (s in c("H","K")) {
-  subt <- z |> filter(site_id == s)
-  if (nrow(subt))
-    print(gt(subt |>
-               summarise(sum_measures_site = sum(count_measures_b, na.rm = TRUE))) |>
-            tab_header(title = paste("Baseline: total measures (site", s, ")")))
-}
-
-
-# Build the core count robustly (works if only one of the inputs exists)
-core_inputs <- intersect(c("inq_cssrs_b", "inq_edstars_b"), names(z))
-if (length(core_inputs) == 0) {
-  cat("Skipping core forms table: neither 'inq_cssrs_b' nor 'inq_edstars_b' found in 'z'.\n")
-} else {
-  z <- z %>%
-    mutate(
-      count_measures_core_b = rowSums(
-        across(all_of(core_inputs), ~ suppressWarnings(as.numeric(.))),
-        na.rm = TRUE
-      )
-    )
-
-  # Two-way tabyl: data first, unquoted columns
-  tab_core <- z %>%
-    tabyl(count_measures_core_b, site_id) %>%
-    adorn_totals(c("row","col"))
-
-  if (knitr::is_html_output()) {
-    print(gt(tab_core) %>% tab_header(title = "Core forms baseline by site"))
-  } else {
-    cat("\nCore forms baseline by site\n")
-    print(addmargins(table(z$count_measures_core_b, z$site_id, useNA = "ifany")))
-  }
-}
+# 11) QC Summary Quick Table 
+```{r warning=FALSE, message=FALSE}
+tibble::tibble(
+  metric = c(
+    "Youth approached in ER",
+    "Consented to hear more",
+    "Did not consent to hear more",
+    "Completed Eligibility Screen",
+    "Did not wish to participate (pre-survey)",
+    "Eligibility Screen: Eligible",
+    "Completed Eligibility Survey (total)",
+    "Eligibility Survey: Eligible",
+    "Eligibility Survey: Ineligible",
+    "Consented",
+    "Did not consent",
+    "Did not complete baseline",
+    "Randomized (any arm)",
+    "Treatment (n)",
+    "Control (n)"
+  ),
+  n = c(
+    youth_approached_n,
+    consented_to_hear_more_n,
+    did_not_consent_hear_more_n,
+    completed_elg_screen_n,
+    did_not_wish_participate_n,
+    eligibility_screen_eligible_n,
+    completed_eligibility_survey_n,
+    eligibility_survey_eligible_n,
+    eligibility_survey_ineligible_n,
+    consented_n,
+    did_not_consent_n,
+    did_not_complete_baseline_n,
+    randomized_n,
+    treatment_n,
+    control_n
+  )
+) |>
+  gt::gt() |>
+  gt::tab_header(title = "CONSORT — Count Summary")
 ```

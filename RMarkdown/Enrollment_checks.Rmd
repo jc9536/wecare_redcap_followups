@@ -55,9 +55,110 @@ CUTOFF_6M <- as.Date("2025-09-30")
 # ========================= HELPERS ==========================
 `%||%` <- function(a,b) if (is.null(a)) b else a
 
-as_date_safe <- function(x) {
-  if (inherits(x, "Date")) return(x)
-  suppressWarnings(ymd(x))
+# Parse mixed date representations to Date (drops time).
+# Handles: epoch seconds/ms, Excel serials (tightened), ISO/MDY strings, and YYYYMMDD numerics.
+to_date_smart <- function(x,
+                          tz_epoch = "UTC",
+                          tz_local = "America/New_York",
+                          min_year = 2010,   # discard anything older than this as likely bad parse
+                          max_year = 2100) {
+
+  x_chr <- as.character(x)
+  n <- length(x_chr)
+  out <- rep(as.Date(NA), n)
+
+  is_digits <- grepl("^\\d+$", x_chr)
+  idx_num   <- which(is_digits)
+
+  # helper to bound-check years
+  clip_years <- function(d) {
+    bad <- !is.na(d) & (as.integer(format(d, "%Y")) < min_year | as.integer(format(d, "%Y")) > max_year)
+    d[bad] <- as.Date(NA)
+    d
+  }
+
+  if (length(idx_num)) {
+    num <- suppressWarnings(as.numeric(x_chr[idx_num]))
+    nchar_num <- nchar(x_chr[idx_num])
+
+    # 8-digit YYYYMMDD (e.g., 20240819)
+    is_yyyymmdd <- nchar_num == 8 & grepl("^(19|20)\\d{6}$", x_chr[idx_num])
+
+    # Excel serials: only accept plausible modern range (>= 25569 = 1970-01-01) and
+    # cap to ~60k (~2064). Also reject if it looks like YYYYMMDD (8 digits).
+    is_excel <- !is_yyyymmdd & !is.na(num) & num >= 25569 & num <= 60000
+
+    # Epoch: treat >1e12 as ms, >1e8 as seconds (covers modern dates)
+    is_epoch_ms <- !is.na(num) & num > 1e12
+    is_epoch_s  <- !is.na(num) & num > 1e8 & num <= 1e12
+
+    # YYYYMMDD
+    if (any(is_yyyymmdd)) {
+      y <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 1, 4))
+      m <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 5, 6))
+      d <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 7, 8))
+      d_ymd <- suppressWarnings(as.Date(sprintf("%04d-%02d-%02d", y, m, d)))
+      d_ymd <- clip_years(d_ymd)
+      out[idx_num[is_yyyymmdd]] <- d_ymd
+    }
+
+    # Excel serials (modern only)
+    if (any(is_excel)) {
+      d_xl <- as.Date(num[is_excel], origin = "1899-12-30")
+      d_xl <- clip_years(d_xl)
+      out[idx_num[is_excel]] <- d_xl
+    }
+
+    # Epoch milliseconds
+    if (any(is_epoch_ms)) {
+      s <- num[is_epoch_ms] / 1000
+      posix <- as.POSIXct(s, origin = "1970-01-01", tz = tz_epoch)
+      posix_local <- as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)
+      d_ep_ms <- as.Date(posix_local)
+      d_ep_ms <- clip_years(d_ep_ms)
+      out[idx_num[is_epoch_ms]] <- d_ep_ms
+    }
+
+    # Epoch seconds
+    if (any(is_epoch_s)) {
+      s <- num[is_epoch_s]
+      posix <- as.POSIXct(s, origin = "1970-01-01", tz = tz_epoch)
+      posix_local <- as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)
+      d_ep_s <- as.Date(posix_local)
+      d_ep_s <- clip_years(d_ep_s)
+      out[idx_num[is_epoch_s]] <- d_ep_s
+    }
+  }
+
+  # Non-numeric strings: try ISO then MDY (with and without times)
+  idx_str <- which(!is_digits)
+  if (length(idx_str)) {
+    x_s <- x_chr[idx_str]
+
+    d1 <- suppressWarnings(lubridate::ymd(x_s,     quiet = TRUE))
+    miss <- is.na(d1)
+    if (any(miss)) {
+      d2 <- suppressWarnings(lubridate::ymd_hm(x_s[miss],  quiet = TRUE)); d1[miss] <- d2; miss <- is.na(d1)
+    }
+    if (any(miss)) {
+      d3 <- suppressWarnings(lubridate::ymd_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d3; miss <- is.na(d1)
+    }
+    if (any(miss)) {
+      d4 <- suppressWarnings(lubridate::mdy(x_s[miss],     quiet = TRUE)); d1[miss] <- d4; miss <- is.na(d1)
+    }
+    if (any(miss)) {
+      d5 <- suppressWarnings(lubridate::mdy_hm(x_s[miss],  quiet = TRUE)); d1[miss] <- d5; miss <- is.na(d1)
+    }
+    if (any(miss)) {
+      d6 <- suppressWarnings(lubridate::mdy_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d6
+    }
+
+    d1 <- as.Date(d1)
+    d1 <- clip_years(d1)
+    out[idx_str] <- d1
+  }
+
+  out
 }
 
 # Stata-style left-to-right coalesce for strings (treat "" as missing)
@@ -158,7 +259,7 @@ base_df <- raw |>
   ) |>
   filter(!is.na(merged_date_chr) & merged_date_chr != "") |>
   mutate(
-    merged_date = as_date_safe(merged_date_chr),
+    merged_date = to_date_smart(merged_date_chr),
     site_code   = site_code_from(site_id, coalesce_chr(p_participant_id, wecare_id_y, wecare_id_cg))
   )
 
