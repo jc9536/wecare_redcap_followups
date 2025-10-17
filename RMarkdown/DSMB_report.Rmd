@@ -297,8 +297,12 @@ table(elg_stage$eligible_screen, useNA = "ifany")
 
 # 7) Eligibility Survey Rules
 ```{r warning=FALSE, message=FALSE}
-# Anxiety (sum of dichotomous items)
-dat <- dat |>
+# 7) Eligibility Survey Rules — build from Section 6's elg_stage --------------
+s7_base <- elg_stage |> dplyr::filter(eligible_screen == 1)
+eligibility_screen_eligible_n <- nrow(s7_base)
+
+# 7.1 dichotomies (same thresholds as STATA)
+s7 <- s7_base |>
   mutate(
     eligible_anxiety = rowSums(across(c(eligible_anxiety_1, eligible_anxiety_2)), na.rm = FALSE),
     eligible_anxious = case_when(
@@ -329,36 +333,16 @@ dat <- dat |>
     ),
     eligible_sleep_problem_y = case_when(
       eligible_sleep_problem_1 > 1 ~ 1L,
-      eligible_sleep_problem_1 <=1 ~ 0L,
+      eligible_sleep_problem_1 <= 1 ~ 0L,
       TRUE ~ NA_integer_
     )
   )
 
-# How many survey items answered?
-dat <- dat |>
+# 7.2 count answered items (rownonmiss in STATA)
+s7 <- s7 |>
   mutate(
-    eligible_survey_count = rowSums(across(c(
-      eligible_visited_ed,
-      eligible_hospitalized,
-      eligible_taken_med,
-      eligible_received_therapy,
-      eligible_sought_counseling,
-      eligible_anxious,
-      eligible_depression,
-      eligible_sch_close,
-      eligible_sch_part,
-      eligible_self_harm_y,
-      eligible_sleep_problem_y
-    ), ~!is.na(.x)))
-  )
-
-# Overall survey eligibility (any positive), with date rule + manual inclusions
-dat <- dat |>
-  mutate(
-    eligible_survey = case_when(
-      eligible_survey_count <= 8 ~ NA_integer_,
-      TRUE ~ if_else(rowSums(across(c(
-        eligible_visited_ed,
+    eligible_survey_count = rowSums(across(
+      c(eligible_visited_ed,
         eligible_hospitalized,
         eligible_taken_med,
         eligible_received_therapy,
@@ -368,65 +352,127 @@ dat <- dat |>
         eligible_sch_close,
         eligible_sch_part,
         eligible_self_harm_y,
-        eligible_sleep_problem_y
-      ), \(x) replace_na(x,0))) >= 1, 1L, 0L)
+        eligible_sleep_problem_y),
+      ~ !is.na(.x)
+    ))
+  )
+
+# --- metrics BEFORE drop (exactly as STATA) ---
+completed_eligibility_survey_n <- sum(s7$eligible_survey_count > 8, na.rm = TRUE)
+did_not_wish_presurvey_n       <- eligibility_screen_eligible_n - completed_eligibility_survey_n
+
+# 7.3 drop non-completers (<=8 answered)
+s7 <- s7 |> filter(eligible_survey_count > 8)
+
+# 7.4 overall survey eligibility (anymatch values(1)) + overrides
+s7 <- s7 |>
+  mutate(
+    eligible_survey = if_else(
+      rowSums(across(
+        c(eligible_visited_ed,
+          eligible_hospitalized,
+          eligible_taken_med,
+          eligible_received_therapy,
+          eligible_sought_counseling,
+          eligible_anxious,
+          eligible_depression,
+          eligible_sch_close,
+          eligible_sch_part,
+          eligible_self_harm_y,
+          eligible_sleep_problem_y),
+        ~ replace_na(.x, 0)
+      )) >= 1, 1L, 0L
     ),
-    eligible_survey = if_else(merged_date > ymd("2024-12-04"), 1L, eligible_survey),
+    eligible_survey = if_else(merged_date > lubridate::ymd("2024-12-04"), 1L, eligible_survey),
     eligible_survey = if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
   )
 
-completed_eligibility_survey_n <- sum(!is.na(dat$eligible_survey))
-eligibility_survey_eligible_n  <- sum(dat$eligible_survey == 1, na.rm = TRUE)
-eligibility_survey_ineligible_n<- sum(dat$eligible_survey == 0, na.rm = TRUE)
-did_not_wish_after_screen_n    <- eligibility_screen_eligible_n - completed_eligibility_survey_n
+eligibility_survey_ineligible_n <- sum(s7$eligible_survey == 0, na.rm = TRUE)
+eligibility_survey_eligible_n   <- sum(s7$eligible_survey == 1, na.rm = TRUE)
 
+# hand off to Section 8:
+dat <- s7              # completed survey (eligible & ineligible)
 
-dat$eligible_survey
-completed_eligibility_survey_n 
-eligibility_survey_eligible_n  
-eligibility_survey_ineligible_n
-did_not_wish_after_screen_n
+# should equal eligibility_screen_eligible_n
+completed_eligibility_survey_n + did_not_wish_presurvey_n  
 
-# Keep only survey-eligible
-dat <- dat |>
-  filter(eligible_survey == 1)
+# Count Checks 
+completed_eligibility_survey_n
+did_not_wish_presurvey_n  
+eligibility_survey_ineligible_n 
+eligibility_survey_eligible_n   
+
+# --- cache the Section 7 counts so later chunks reuse EXACTLY these values ---
+s7_counts <- list(
+  eligibility_screen_eligible_n = eligibility_screen_eligible_n,
+  completed_eligibility_survey_n = completed_eligibility_survey_n,
+  did_not_wish_presurvey_n       = did_not_wish_presurvey_n,
+  eligibility_survey_eligible_n  = eligibility_survey_eligible_n,
+  eligibility_survey_ineligible_n= eligibility_survey_ineligible_n
+)
+
 ```
 
 # 8) Consent + Randomization 
 ```{r warning=FALSE, message=FALSE}
-dat <- dat |>
+# 8) Consent + Randomization  -------------------------------------------------
+# Base for consent: ONLY those who were Eligibility Survey: Eligible
+s8_base <- s7 |> dplyr::filter(eligible_survey == 1)
+
+s8 <- s8_base |>
   mutate(
-    consent = case_when(
+    consent = dplyr::case_when(
       p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
-      informed_consent_form_youth_complete  == 2 & screen_age_group == 1 ~ 1L,
+      informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
       p_participant_id %in% c("H-F0115","H-F0085") ~ 1L,  # verbal / form issues
       TRUE ~ 0L
     )
   )
 
-consented_n <- sum(dat$consent == 1, na.rm = TRUE)
-did_not_consent_n <- sum(dat$consent == 0, na.rm = TRUE)
+# Counts (now aligned with CONSORT/QC logic)
+consented_n       <- sum(s8$consent == 1, na.rm = TRUE)
+did_not_consent_n <- sum(s8$consent == 0, na.rm = TRUE)
 
 # Checks
 gt::gt(
-  dat |> filter(!is.na(treatment) & consent != 1) |>
-    select(p_participant_id, treatment, consent)
+  s8 |> dplyr::filter(!is.na(treatment) & consent != 1) |>
+    dplyr::select(p_participant_id, treatment, consent)
 ) |> gt::tab_header(title = "Check: Has treatment but consent != 1")
 
 gt::gt(
-  dat |> filter(is.na(treatment) & consent == 1) |>
-    select(p_participant_id)
+  s8 |> dplyr::filter(is.na(treatment) & consent == 1) |>
+    dplyr::select(p_participant_id)
 ) |> gt::tab_header(title = "Check: Consented but no treatment")
 
 # CONSORT counters
-did_not_complete_baseline_n <- sum(is.na(dat$treatment) & dat$consent == 1)
-randomized_n <- sum(!is.na(dat$treatment))
+did_not_complete_baseline_n <- sum(is.na(s8$treatment) & s8$consent == 1)
+randomized_n <- sum(!is.na(s8$treatment))
 
-treatment_n <- sum(dat$treatment == 1, na.rm = TRUE)
-control_n   <- sum(dat$treatment == 0, na.rm = TRUE)
+treatment_n <- sum(s8$treatment == 1, na.rm = TRUE)
+control_n   <- sum(s8$treatment == 0, na.rm = TRUE)
 
 # Keep only randomized for follow-up splits
-rand <- dat |> filter(!is.na(treatment))
+rand <- s8 |> dplyr::filter(!is.na(treatment))
+
+# Cache for Stage 9.5 reuse (optional but keeps everything in sync)
+s8_counts <- list(
+  consented_n = consented_n,
+  did_not_consent_n = did_not_consent_n,
+  did_not_complete_baseline_n = did_not_complete_baseline_n,
+  randomized_n = randomized_n,
+  treatment_n = treatment_n,
+  control_n = control_n
+)
+
+# Hand off for later chunks if you still use `dat`
+dat <- s8
+
+consented_n
+did_not_consent_n
+did_not_complete_baseline_n
+randomized_n
+treatment_n
+control_n
 ```
 
 # 9) Follow-ups: 3-Month & 6-Month
@@ -474,6 +520,20 @@ n3_t_total <- sum(rand$treatment==1 & !is.na(rand$consort_status_3m))
 n3_c_total <- sum(rand$treatment==0 & !is.na(rand$consort_status_3m))
 n6_t_total <- sum(rand$treatment==1 & !is.na(rand$consort_status_6m))
 n6_c_total <- sum(rand$treatment==0 & !is.na(rand$consort_status_6m))
+
+n3_t
+n3_c
+
+n6_t
+n6_c
+
+# Totals shown under each 3m/6m box
+n3_t_total
+n3_c_total 
+n6_t_total 
+n6_c_total 
+
+
 ```
 
 # 9.5) Stage Counts
@@ -544,87 +604,112 @@ elg_stage$eligible_screen <- eligible_screen
 eligibility_screen_eligible_n <- sum(elg_stage$eligible_screen == 1, na.rm = TRUE)
 ineligible_prescreen_n        <- sum(elg_stage$eligible_screen == 0, na.rm = TRUE)
 
-# A4: Eligibility survey (only among screen-eligible from A3)
-a4 <- elg_stage |> dplyr::filter(eligible_screen == 1) |>
-  mutate(
-    eligible_anxiety = rowSums(across(c(eligible_anxiety_1, eligible_anxiety_2)), na.rm = FALSE),
-    eligible_anxious = dplyr::case_when(
-      !is.na(eligible_anxiety) & eligible_anxiety >= 4 ~ 1L,
-      !is.na(eligible_anxiety) & eligible_anxiety <  4 ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    eligible_depress = rowSums(across(c(eligible_depress_1, eligible_depress_2)), na.rm = FALSE),
-    eligible_depression = dplyr::case_when(
-      !is.na(eligible_depress) & eligible_depress >= 4 ~ 1L,
-      !is.na(eligible_depress) & eligible_depress <  4 ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    eligible_sch_close = dplyr::case_when(
-      eligible_sch_connect_1 < 3 ~ 1L,
-      eligible_sch_connect_1 >=3 ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    eligible_sch_part = dplyr::case_when(
-      eligible_sch_connect_2 < 3 ~ 1L,
-      eligible_sch_connect_2 >=3 ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    eligible_self_harm_y = dplyr::case_when(
-      eligible_self_harm >= 1 ~ 1L,
-      eligible_self_harm == 0 ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    eligible_sleep_problem_y = dplyr::case_when(
-      eligible_sleep_problem_1 > 1 ~ 1L,
-      eligible_sleep_problem_1 <=1 ~ 0L,
-      TRUE ~ NA_integer_
-    ),
-    eligible_survey_count = rowSums(across(c(
-      eligible_visited_ed, eligible_hospitalized, eligible_taken_med,
-      eligible_received_therapy, eligible_sought_counseling,
-      eligible_anxious, eligible_depression,
-      eligible_sch_close, eligible_sch_part,
-      eligible_self_harm_y, eligible_sleep_problem_y
-    ), ~ !is.na(.x))),
-    eligible_survey = dplyr::case_when(
-      eligible_survey_count <= 8 ~ NA_integer_,
-      TRUE ~ dplyr::if_else(
-        rowSums(across(c(
-          eligible_visited_ed, eligible_hospitalized, eligible_taken_med,
-          eligible_received_therapy, eligible_sought_counseling,
-          eligible_anxious, eligible_depression,
-          eligible_sch_close, eligible_sch_part,
-          eligible_self_harm_y, eligible_sleep_problem_y
-        ), ~ tidyr::replace_na(.x, 0))) >= 1, 1L, 0L)
-    ),
-    eligible_survey = dplyr::if_else(merged_date > lubridate::ymd("2024-12-04"), 1L, eligible_survey),
-    eligible_survey = dplyr::if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
-  )
+# A4: Eligibility survey
+# Prefer to reuse the exact Section 7 outputs if they exist; otherwise, fall back.
+if (exists("s7") && exists("s7_base") && exists("s7_counts")) {
+  # Reuse exactly what Section 7 computed
+  eligibility_screen_eligible_n <- s7_counts$eligibility_screen_eligible_n
+  completed_eligibility_survey_n <- s7_counts$completed_eligibility_survey_n
+  did_not_wish_presurvey_n       <- s7_counts$did_not_wish_presurvey_n
+  eligibility_survey_eligible_n  <- s7_counts$eligibility_survey_eligible_n
+  eligibility_survey_ineligible_n<- s7_counts$eligibility_survey_ineligible_n
 
-completed_eligibility_survey_n <- sum(!is.na(a4$eligible_survey))
-did_not_wish_presurvey_n       <- eligibility_screen_eligible_n - completed_eligibility_survey_n
-eligibility_survey_eligible_n  <- sum(a4$eligible_survey == 1, na.rm = TRUE)
-eligibility_survey_ineligible_n<- sum(a4$eligible_survey == 0, na.rm = TRUE)
+  # Hand the completed survey frame (eligible + ineligible) forward as A4
+  a4 <- s7
 
-# A5/A6: consent + baseline/randomization
-a5 <- a4 |> dplyr::filter(eligible_survey == 1) |>
-  mutate(
-    consent = dplyr::case_when(
-      p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
-      informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
-      p_participant_id %in% c("H-F0115","H-F0085") ~ 1L,
-      TRUE ~ 0L
+} else {
+  # ---- fallback: derive A4 here (kept for robustness) ----------------------
+  a4 <- elg_stage |> dplyr::filter(eligible_screen == 1) |>
+    mutate(
+      eligible_anxiety = rowSums(across(c(eligible_anxiety_1, eligible_anxiety_2)), na.rm = FALSE),
+      eligible_anxious = dplyr::case_when(
+        !is.na(eligible_anxiety) & eligible_anxiety >= 4 ~ 1L,
+        !is.na(eligible_anxiety) & eligible_anxiety <  4 ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      eligible_depress = rowSums(across(c(eligible_depress_1, eligible_depress_2)), na.rm = FALSE),
+      eligible_depression = dplyr::case_when(
+        !is.na(eligible_depress) & eligible_depress >= 4 ~ 1L,
+        !is.na(eligible_depress) & eligible_depress <  4 ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      eligible_sch_close = dplyr::case_when(
+        eligible_sch_connect_1 < 3 ~ 1L,
+        eligible_sch_connect_1 >=3 ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      eligible_sch_part = dplyr::case_when(
+        eligible_sch_connect_2 < 3 ~ 1L,
+        eligible_sch_connect_2 >=3 ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      eligible_self_harm_y = dplyr::case_when(
+        eligible_self_harm >= 1 ~ 1L,
+        eligible_self_harm == 0 ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      eligible_sleep_problem_y = dplyr::case_when(
+        eligible_sleep_problem_1 > 1 ~ 1L,
+        eligible_sleep_problem_1 <=1 ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+      eligible_survey_count = rowSums(across(c(
+        eligible_visited_ed, eligible_hospitalized, eligible_taken_med,
+        eligible_received_therapy, eligible_sought_counseling,
+        eligible_anxious, eligible_depression,
+        eligible_sch_close, eligible_sch_part,
+        eligible_self_harm_y, eligible_sleep_problem_y
+      ), ~ !is.na(.x))),
+      eligible_survey = dplyr::case_when(
+        eligible_survey_count <= 8 ~ NA_integer_,
+        TRUE ~ dplyr::if_else(
+          rowSums(across(c(
+            eligible_visited_ed, eligible_hospitalized, eligible_taken_med,
+            eligible_received_therapy, eligible_sought_counseling,
+            eligible_anxious, eligible_depression,
+            eligible_sch_close, eligible_sch_part,
+            eligible_self_harm_y, eligible_sleep_problem_y
+          ), ~ tidyr::replace_na(.x, 0))) >= 1, 1L, 0L)
+      ),
+      eligible_survey = dplyr::if_else(merged_date > lubridate::ymd("2024-12-04"), 1L, eligible_survey),
+      eligible_survey = dplyr::if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
     )
-  )
 
-consented_n      <- sum(a5$consent == 1, na.rm = TRUE)
-did_not_consent_n<- sum(a5$consent == 0, na.rm = TRUE)
+  completed_eligibility_survey_n <- sum(!is.na(a4$eligible_survey))
+  did_not_wish_presurvey_n       <- eligibility_screen_eligible_n - completed_eligibility_survey_n
+  eligibility_survey_eligible_n  <- sum(a4$eligible_survey == 1, na.rm = TRUE)
+  eligibility_survey_ineligible_n<- sum(a4$eligible_survey == 0, na.rm = TRUE)
+}
 
-a6 <- a5
-did_not_complete_baseline_n <- sum(is.na(a6$treatment) & a6$consent == 1)
-randomized_n <- sum(!is.na(a6$treatment))
-treatment_n  <- sum(a6$treatment == 1, na.rm = TRUE)
-control_n    <- sum(a6$treatment == 0, na.rm = TRUE)
+# A5/A6: consent + baseline/randomization  -----------------------------------
+if (exists("s8") && exists("s8_counts")) {
+  a5 <- s8
+  consented_n                <- s8_counts$consented_n
+  did_not_consent_n          <- s8_counts$did_not_consent_n
+  did_not_complete_baseline_n<- s8_counts$did_not_complete_baseline_n
+  randomized_n               <- s8_counts$randomized_n
+  treatment_n                <- s8_counts$treatment_n
+  control_n                  <- s8_counts$control_n
+} else {
+  a5 <- a4 |> dplyr::filter(eligible_survey == 1) |>
+    mutate(
+      consent = dplyr::case_when(
+        p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
+        informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
+        p_participant_id %in% c("H-F0115","H-F0085") ~ 1L,
+        TRUE ~ 0L
+      )
+    )
+
+  consented_n       <- sum(a5$consent == 1, na.rm = TRUE)
+  did_not_consent_n <- sum(a5$consent == 0, na.rm = TRUE)
+
+  a6 <- a5
+  did_not_complete_baseline_n <- sum(is.na(a6$treatment) & a6$consent == 1)
+  randomized_n <- sum(!is.na(a6$treatment))
+  treatment_n  <- sum(a6$treatment == 1, na.rm = TRUE)
+  control_n    <- sum(a6$treatment == 0, na.rm = TRUE)
+}
 
 # Pre-3m Active/Exited by arm (uses `rand` built earlier)
 pre3m_t_active <- sum(rand$consort_status_3m %in% c("Active","Completed","Missed") & rand$treatment==1, na.rm=TRUE)
@@ -681,64 +766,61 @@ K <- list(
 
 # 10) CONSORT Diagram 
 ```{r warning=FALSE, message=FALSE}
-# 10) CONSORT Diagram labels from K, rows aligned like reference ------------
+# 10) CONSORT Diagram — labels from K, rows aligned like reference ------------
 {
-  # small helper so we can support either naming (new vs. legacy)
-  k <- function(name, alt = NULL) {
-    if (!is.null(K[[name]])) return(K[[name]])
-    if (!is.null(alt) && !is.null(K[[alt]])) return(K[[alt]])
-    NA_integer_
-  }
+  # coalesce helper so labels never print "NA"
+  nz <- function(x) ifelse(is.na(x), 0L, x)
 
-  # Build labels once (uses your requested variables)
+  # Build labels once (all values come from K)
   lbl <- list(
-    top              = glue("Youth approached in ER\nN = {K$youth_approached}"),
-    hear_more_y      = glue("Consented to hear more\nn = {K$hear_more_yes}"),
-    hear_more_n      = glue("Did not consent to hear more\nn = {K$hear_more_no}"),
+    top              = glue::glue("Youth approached in ER\nN = {nz(K$youth_approached)}"),
+    hear_more_y      = glue::glue("Consented to hear more\nn = {nz(K$hear_more_yes)}"),
+    hear_more_n      = glue::glue("Did not consent to hear more\nn = {nz(K$hear_more_no)}"),
 
-    elg_screen_cmpl  = glue("Completed Eligibility Screen\nn = {K$completed_elg_screen}"),
-    elg_screen_dnwp  = glue("Did not wish to participate\nn = {k('did_not_wish_participate','did_not_wish_pre_screen')}"),
+    elg_screen_cmpl  = glue::glue("Completed Eligibility Screen\nn = {nz(K$completed_elg_screen)}"),
+    elg_screen_dnwp  = glue::glue("Did not wish to participate\nn = {nz(K$did_not_wish_participate)}"),
 
-    elg_ineligible   = glue("Ineligible\nn = {K$ineligible_prescreen}"),
-    elg_screen_elig  = glue("Eligibility Screen: Eligible\nn = {K$elig_screen_eligible}"),
+    elg_ineligible   = glue::glue("Ineligible\nn = {nz(K$ineligible_prescreen)}"),
+    elg_screen_elig  = glue::glue("Eligibility Screen: Eligible\nn = {nz(K$elig_screen_eligible)}"),
 
-    elg_svy_total    = glue("Completed Eligibility Survey\nn = {K$completed_elig_survey}"),
-    elg_svy_dnwp     = glue("Did not wish to participate\nn = {K$did_not_wish_presurvey}"),
-    elg_svy_inelig   = glue("Ineligible\nn = {K$ineligible_presurvey}"),
-    elg_svy_elig     = glue("Eligibility Survey: Eligible\nn = {K$elig_survey_eligible}"),
+    elg_svy_total    = glue::glue("Completed Eligibility Survey\nn = {nz(K$completed_elig_survey)}"),
+    elg_svy_dnwp     = glue::glue("Did not wish to participate\nn = {nz(K$did_not_wish_presurvey)}"),
+    elg_svy_inelig   = glue::glue("Ineligible\nn = {nz(K$ineligible_presurvey)}"),
+    elg_svy_elig     = glue::glue("Eligibility Survey: Eligible\nn = {nz(K$elig_survey_eligible)}"),
 
-    consented        = glue("Consented\nn = {K$consented}"),
-    did_not_consent  = glue("Did not consent\nn = {K$did_not_consent}"),
+    consented        = glue::glue("Consented\nn = {nz(K$consented)}"),
+    did_not_consent  = glue::glue("Did not consent\nn = {nz(K$did_not_consent)}"),
 
-    randomized       = glue("Randomization\nn = {K$randomized}"),
-    did_not_baseline = glue("Did not complete baseline\nn = {K$did_not_complete_baseline}"),
+    randomized       = glue::glue("Randomization\nn = {nz(K$randomized)}"),
+    did_not_baseline = glue::glue("Did not complete baseline\nn = {nz(K$did_not_complete_baseline)}"),
 
-    arm_t            = glue("Treatment\nn = {K$treatment}"),
-    arm_c            = glue("Control\nn = {K$control}"),
+    arm_t            = glue::glue("Treatment\nn = {nz(K$treatment)}"),
+    arm_c            = glue::glue("Control\nn = {nz(K$control)}"),
 
-    pre_t_act        = glue("Active\nn = {K$t_active_pre3m}"),
-    pre_t_exit       = glue("Exited\nn = {K$t_exited_pre3m}"),
-    pre_c_act        = glue("Active\nn = {K$c_active_pre3m}"),
-    pre_c_exit       = glue("Exited\nn = {K$c_exited_pre3m}"),
+    pre_t_act        = glue::glue("Active\nn = {nz(K$t_active_pre3m)}"),
+    pre_t_exit       = glue::glue("Exited\nn = {nz(K$t_exited_pre3m)}"),
+    pre_c_act        = glue::glue("Active\nn = {nz(K$c_active_pre3m)}"),
+    pre_c_exit       = glue::glue("Exited\nn = {nz(K$c_exited_pre3m)}"),
 
-    m3_t             = glue("3-Month Follow Up: Treatment\nn = {K$m3_t_total}"),
-    m3_c             = glue("3-Month Follow Up: Control\nn = {K$m3_c_total}"),
+    m3_t             = glue::glue("3-Month Follow Up: Treatment\nn = {nz(K$m3_t_total)}"),
+    m3_c             = glue::glue("3-Month Follow Up: Control\nn = {nz(K$m3_c_total)}"),
 
-    m3_t_breakdown   = glue("Active\nn = {K$m3_t_active}\nCompleted\nn = {K$m3_t_completed}\nMissed\nn = {K$m3_t_missed}\nExited\nn = {K$m3_t_exited}"),
-    m3_c_breakdown   = glue("Active\nn = {K$m3_c_active}\nCompleted\nn = {K$m3_c_completed}\nMissed\nn = {K$m3_c_missed}\nExited\nn = {K$m3_c_exited}"),
+    m3_t_breakdown   = glue::glue("Active\nn = {nz(K$m3_t_active)}\nCompleted\nn = {nz(K$m3_t_completed)}\nMissed\nn = {nz(K$m3_t_missed)}\nExited\nn = {nz(K$m3_t_exited)}"),
+    m3_c_breakdown   = glue::glue("Active\nn = {nz(K$m3_c_active)}\nCompleted\nn = {nz(K$m3_c_completed)}\nMissed\nn = {nz(K$m3_c_missed)}\nExited\nn = {nz(K$m3_c_exited)}"),
 
-    m6_t             = glue("6-Month Follow Up: Treatment\nn = {K$m6_t_total}"),
-    m6_c             = glue("6-Month Follow Up: Control\nn = {K$m6_c_total}"),
+    m6_t             = glue::glue("6-Month Follow Up: Treatment\nn = {nz(K$m6_t_total)}"),
+    m6_c             = glue::glue("6-Month Follow Up: Control\nn = {nz(K$m6_c_total)}"),
 
-    m6_t_breakdown   = glue("Active\nn = {K$m6_t_active}\nCompleted\nn = {K$m6_t_completed}\nMissed\nn = {K$m6_t_missed}\nExited\nn = {K$m6_t_exited}"),
-    m6_c_breakdown   = glue("Active\nn = {K$m6_c_active}\nCompleted\nn = {K$m6_c_completed}\nMissed\nn = {K$m6_c_missed}\nExited\nn = {K$m6_c_exited}")
+    m6_t_breakdown   = glue::glue("Active\nn = {nz(K$m6_t_active)}\nCompleted\nn = {nz(K$m6_t_completed)}\nMissed\nn = {nz(K$m6_t_missed)}\nExited\nn = {nz(K$m6_t_exited)}"),
+    m6_c_breakdown   = glue::glue("Active\nn = {nz(K$m6_c_active)}\nCompleted\nn = {nz(K$m6_c_completed)}\nMissed\nn = {nz(K$m6_c_missed)}\nExited\nn = {nz(K$m6_c_exited)}")
   )
 
-  # DOT with rows aligned like the reference
-  dot <- glue('
+    # DOT with revised right-column positions (one row up) and extra right spacing
+  dot <- glue::glue('
   digraph consort {{
-    graph [rankdir=TB, splines=ortho, nodesep="0.32", ranksep="0.46", bgcolor="white"];
-    node  [shape=box, style="rounded,filled", fillcolor="white", color="black", fontname="Helvetica", fontsize=12, margin="0.10,0.07"];
+    graph [rankdir=TB, splines=ortho, nodesep="0.36", ranksep="0.46", bgcolor="white"];
+    node  [shape=box, style="rounded,filled", fillcolor="white", color="black",
+           fontname="Helvetica", fontsize=12, margin="0.10,0.07"];
     edge  [arrowhead=normal, color="black"];
 
     # main column
@@ -751,14 +833,23 @@ K <- list(
     cons  [label="{lbl$consented}"];
     rand  [label="{lbl$randomized}"];
 
-    # side boxes, aligned per row in reference order
-    hm_n     [label="{lbl$hear_more_n}"];
-    dnwp_pre [label="{lbl$elg_screen_dnwp}"];   # did not wish (pre-screen)
-    inel_scr [label="{lbl$elg_ineligible}"];    # ineligible after screen
-    dnwp_svy [label="{lbl$elg_svy_dnwp}"];      # did not wish (pre-survey)
-    inel_svy [label="{lbl$elg_svy_inelig}"];    # ineligible at survey
-    ncons    [label="{lbl$did_not_consent}"];
-    nbase    [label="{lbl$did_not_baseline}"];
+    # right-side boxes
+    hm_n     [label="{lbl$hear_more_n}"];     # to the right of TOP (moved up)
+    dnwp_pre [label="{lbl$elg_screen_dnwp}"]; # to the right of hm_y (moved up)
+    inel_scr [label="{lbl$elg_ineligible}"];  # to the right of elg_c (moved up)
+    dnwp_svy [label="{lbl$elg_svy_dnwp}"];    # to the right of elg_e (moved up)
+    inel_svy [label="{lbl$elg_svy_inelig}"];  # to the right of svy_t (moved up)
+    ncons    [label="{lbl$did_not_consent}"]; # to the right of svy_e (moved up)
+    nbase    [label="{lbl$did_not_baseline}"];# to the right of cons (moved up)
+
+    # invisible gutter spacers to push right column further right
+    g0 [label="", width=0.6, height=0.01, shape=box, style=invis];
+    g1 [label="", width=0.6, height=0.01, shape=box, style=invis];
+    g2 [label="", width=0.6, height=0.01, shape=box, style=invis];
+    g3 [label="", width=0.6, height=0.01, shape=box, style=invis];
+    g4 [label="", width=0.6, height=0.01, shape=box, style=invis];
+    g5 [label="", width=0.6, height=0.01, shape=box, style=invis];
+    g6 [label="", width=0.6, height=0.01, shape=box, style=invis];
 
     # arms
     arm_t [label="{lbl$arm_t}", width=2.6];
@@ -782,28 +873,28 @@ K <- list(
     m6_tb  [label="{lbl$m6_t_breakdown}"];
     m6_cb  [label="{lbl$m6_c_breakdown}"];
 
-    # flow
+    # vertical flow (left column)
     top -> hm_y -> elg_c -> elg_e -> svy_t -> svy_e -> cons -> rand;
 
-    # row alignment
-    {{ rank=same; hm_y; hm_n; }}
-    {{ rank=same; elg_c; dnwp_pre; }}
-    {{ rank=same; elg_e; inel_scr; }}
-    {{ rank=same; svy_t; dnwp_svy; }}
-    {{ rank=same; svy_e; inel_svy; }}
-    {{ rank=same; cons; ncons; }}
-    {{ rank=same; rand; nbase; }}
+    # revised row alignment (right boxes one row up + gutter to push them right)
+    {{ rank=same; top;    g0; hm_n;     }}
+    {{ rank=same; hm_y;   g1; dnwp_pre; }}
+    {{ rank=same; elg_c;  g2; inel_scr; }}
+    {{ rank=same; elg_e;  g3; dnwp_svy; }}
+    {{ rank=same; svy_t;  g4; inel_svy; }}
+    {{ rank=same; svy_e;  g5; ncons;    }}
+    {{ rank=same; cons;   g6; nbase;    }}
 
-    # horizontal links (no vertical constraints)
-    top  -> hm_n     [constraint=false];
-    elg_c -> dnwp_pre [constraint=false];
-    elg_e -> inel_scr [constraint=false];
-    svy_t -> dnwp_svy [constraint=false];
-    svy_e -> inel_svy [constraint=false];
-    cons -> ncons     [constraint=false];
-    rand -> nbase     [constraint=false];
+    # horizontal connectors (no vertical constraints)
+    top  -> hm_n      [constraint=false];
+    hm_y -> dnwp_pre  [constraint=false];
+    elg_c -> inel_scr [constraint=false];
+    elg_e -> dnwp_svy [constraint=false];
+    svy_t -> inel_svy [constraint=false];
+    svy_e -> ncons    [constraint=false];
+    cons  -> nbase    [constraint=false];
 
-    # arms and follow-ups
+    # arms and follow-ups (unchanged)
     rand -> arm_t; rand -> arm_c;
     {{ rank=same; arm_t; arm_c; }}
 
@@ -832,12 +923,8 @@ K <- list(
 
 # 11) QC Summary Quick Table 
 ```{r warning=FALSE, message=FALSE}
-# 11) QC Summary Quick Table every requested metric comes from K -------------
-k <- function(name, alt = NULL) {
-  if (!is.null(K[[name]])) return(K[[name]])
-  if (!is.null(alt) && !is.null(K[[alt]])) return(K[[alt]])
-  NA_integer_
-}
+# 11) QC Summary Quick Table — every requested metric comes from K -------------
+nz <- function(x) ifelse(is.na(x), 0L, x)
 
 qc_tbl <- tibble::tibble(
   Metric = c(
@@ -853,6 +940,7 @@ qc_tbl <- tibble::tibble(
     "Did not wish to participate (pre-survey)",
     "Completed Eligibility Survey",
     "Ineligible (pre Eligibility Survey: Eligible)",
+    "Eligibility Survey: Eligible",
 
     "Did not consent",
     "Consented",
@@ -892,59 +980,61 @@ qc_tbl <- tibble::tibble(
     "6-Month Follow Up: Control Exited"
   ),
   n = c(
-    K$youth_approached,
-    K$hear_more_no,
-    K$hear_more_yes,
+    nz(K$youth_approached),
+    nz(K$hear_more_no),
+    nz(K$hear_more_yes),
 
-    k("did_not_wish_participate","did_not_wish_pre_screen"),
-    K$completed_elg_screen,
-    K$ineligible_prescreen,
-    K$elig_screen_eligible,
+    nz(K$did_not_wish_participate),
+    nz(K$completed_elg_screen),
+    nz(K$ineligible_prescreen),
+    nz(K$elig_screen_eligible),
 
-    K$did_not_wish_presurvey,
-    K$completed_elig_survey,
-    K$ineligible_presurvey,
+    nz(K$did_not_wish_presurvey),
+    nz(K$completed_elig_survey),
+    nz(K$ineligible_presurvey),
+    nz(K$elig_survey_eligible),
 
-    K$did_not_consent,
-    K$consented,
-    K$did_not_complete_baseline,
+    nz(K$did_not_consent),
+    nz(K$consented),
+    nz(K$did_not_complete_baseline),
 
-    K$randomized,
-    K$treatment,
-    K$t_active_pre3m,
-    K$t_exited_pre3m,
+    nz(K$randomized),
+    nz(K$treatment),
+    nz(K$t_active_pre3m),
+    nz(K$t_exited_pre3m),
 
-    K$m3_t_total,
-    K$m3_t_active,
-    K$m3_t_completed,
-    K$m3_t_missed,
-    K$m3_t_exited,
+    nz(K$m3_t_total),
+    nz(K$m3_t_active),
+    nz(K$m3_t_completed),
+    nz(K$m3_t_missed),
+    nz(K$m3_t_exited),
 
-    K$m6_t_total,
-    K$m6_t_active,
-    K$m6_t_completed,
-    K$m6_t_missed,
-    K$m6_t_exited,
+    nz(K$m6_t_total),
+    nz(K$m6_t_active),
+    nz(K$m6_t_completed),
+    nz(K$m6_t_missed),
+    nz(K$m6_t_exited),
 
-    K$control,
-    K$c_active_pre3m,
-    K$c_exited_pre3m,
+    nz(K$control),
+    nz(K$c_active_pre3m),
+    nz(K$c_exited_pre3m),
 
-    K$m3_c_total,
-    K$m3_c_active,
-    K$m3_c_completed,
-    K$m3_c_missed,
-    K$m3_c_exited,
+    nz(K$m3_c_total),
+    nz(K$m3_c_active),
+    nz(K$m3_c_completed),
+    nz(K$m3_c_missed),
+    nz(K$m3_c_exited),
 
-    K$m6_c_total,
-    K$m6_c_active,
-    K$m6_c_completed,
-    K$m6_c_missed,
-    K$m6_c_exited
+    nz(K$m6_c_total),
+    nz(K$m6_c_active),
+    nz(K$m6_c_completed),
+    nz(K$m6_c_missed),
+    nz(K$m6_c_exited)
   )
 )
 
 qc_tbl |>
   gt::gt() |>
-  gt::tab_header(title = "CONSORT: Count Summary (Source of Truth)")
+  gt::tab_header(title = "CONSORT: Count Summary (Source of Truth)") |>
+  gt::fmt_number(columns = "n", decimals = 0)
 ```
