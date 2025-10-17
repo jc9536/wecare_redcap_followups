@@ -420,7 +420,7 @@ s7_counts <- list(
 s8_base <- s7 |> dplyr::filter(eligible_survey == 1)
 
 s8 <- s8_base |>
-  mutate(
+  dplyr::mutate(
     consent = dplyr::case_when(
       p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
       informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
@@ -429,50 +429,82 @@ s8 <- s8_base |>
     )
   )
 
-# Counts (now aligned with CONSORT/QC logic)
-consented_n       <- sum(s8$consent == 1, na.rm = TRUE)
-did_not_consent_n <- sum(s8$consent == 0, na.rm = TRUE)
+# ------- NEW: collapse to unique participants before counting ----------------
+# If there ever are duplicates per ID, we keep a single record per youth.
+# - consent: whether consent==1 on ANY row
+# - treatment: first non-missing assignment (0/1) if present
+s8u <- s8 |>
+  dplyr::arrange(p_participant_id, merged_date) |>
+  dplyr::group_by(p_participant_id) |>
+  dplyr::summarise(
+    consent   = as.integer(any(consent == 1, na.rm = TRUE)),
+    treatment = dplyr::coalesce(dplyr::first(na.omit(treatment)), NA),
+    .groups = "drop"
+  )
 
-# Checks
-gt::gt(
-  s8 |> dplyr::filter(!is.na(treatment) & consent != 1) |>
-    dplyr::select(p_participant_id, treatment, consent)
-) |> gt::tab_header(title = "Check: Has treatment but consent != 1")
+# ------- COUNTS: person-level for consent, row-level for randomization -------
 
-gt::gt(
-  s8 |> dplyr::filter(is.na(treatment) & consent == 1) |>
-    dplyr::select(p_participant_id)
-) |> gt::tab_header(title = "Check: Consented but no treatment")
+# Person-level (unique youth) — same as you had
+consented_n                 <- sum(s8u$consent == 1, na.rm = TRUE)
+did_not_complete_baseline_n <- sum(is.na(s8u$treatment) & s8u$consent == 1)
 
-# CONSORT counters
-did_not_complete_baseline_n <- sum(is.na(s8$treatment) & s8$consent == 1)
+# Row-level (each randomized row counts, even if a youth appears multiple times)
 randomized_n <- sum(!is.na(s8$treatment))
+treatment_n  <- sum(s8$treatment == 1, na.rm = TRUE)
+control_n    <- sum(s8$treatment == 0, na.rm = TRUE)
 
-treatment_n <- sum(s8$treatment == 1, na.rm = TRUE)
-control_n   <- sum(s8$treatment == 0, na.rm = TRUE)
+# (Optional) For visibility only: person-level randomized in case you still want to compare
+randomized_n_persons <- sum(!is.na(s8u$treatment) & s8u$consent == 1)
 
-# Keep only randomized for follow-up splits
-rand <- s8 |> dplyr::filter(!is.na(treatment))
+# ---- Section 8: Audits only (does NOT change counts above) ------------------
 
-# Cache for Stage 9.5 reuse (optional but keeps everything in sync)
-s8_counts <- list(
-  consented_n = consented_n,
-  did_not_consent_n = did_not_consent_n,
-  did_not_complete_baseline_n = did_not_complete_baseline_n,
-  randomized_n = randomized_n,
-  treatment_n = treatment_n,
-  control_n = control_n
+# Participants randomized but consent != 1 (ROW-LEVEL view)
+rand_without_consent <- s8 |>
+  dplyr::filter(!is.na(treatment) & (is.na(consent) | consent != 1)) |>
+  dplyr::select(p_participant_id, treatment, consent)
+
+# Duplicate participant rows (can explain row vs person mismatches)
+dups <- s8 |>
+  dplyr::count(p_participant_id, name = "rows") |>
+  dplyr::filter(rows > 1)
+
+# Consented (person-level) but no treatment (person-level)
+consented_no_treatment <- s8u |>
+  dplyr::filter(consent == 1 & is.na(treatment)) |>
+  dplyr::select(p_participant_id)
+
+# Algebra checks (display-only). Note: with row-level randomized, the identity will not hold if duplicates exist.
+algebra <- tibble::tibble(
+  consented_n_persons = consented_n,
+  randomized_n_rows   = randomized_n,
+  did_not_complete_baseline_persons = did_not_complete_baseline_n,
+  identity_diff_persons_vs_rows = consented_n - (did_not_complete_baseline_n + randomized_n_rows),
+  randomized_n_persons = randomized_n_persons
 )
 
-# Hand off for later chunks if you still use `dat`
-dat <- s8
+# Show audits (purely informational)
+gt::gt(rand_without_consent) |>
+  gt::tab_header(title = "Audit (row-level): Randomized but consent != 1")
 
-consented_n
-did_not_consent_n
-did_not_complete_baseline_n
-randomized_n
-treatment_n
-control_n
+gt::gt(dups) |>
+  gt::tab_header(title = "Audit: Duplicate participant IDs (row-level)")
+
+gt::gt(consented_no_treatment) |>
+  gt::tab_header(title = "Audit (person-level): Consented but no treatment")
+
+gt::gt(algebra) |>
+  gt::tab_header(title = "Info: Person-level consent vs Row-level randomization")
+
+# Tiny info table for the algebra check (purely informational)
+tibble::tibble(
+  consented_n = consented_n,
+  randomized_n = randomized_n,
+  did_not_complete_baseline_n = did_not_complete_baseline_n,
+  consented_minus_rand_minus_dncb = consented_n - randomized_n - did_not_complete_baseline_n
+) |>
+  gt::gt() |>
+  gt::tab_header(title = "Algebra check: Consented ?= Randomized + Did not complete baseline")
+
 ```
 
 # 9) Follow-ups: 3-Month & 6-Month
@@ -687,9 +719,13 @@ if (exists("s8") && exists("s8_counts")) {
   consented_n                <- s8_counts$consented_n
   did_not_consent_n          <- s8_counts$did_not_consent_n
   did_not_complete_baseline_n<- s8_counts$did_not_complete_baseline_n
-  randomized_n               <- s8_counts$randomized_n
-  treatment_n                <- s8_counts$treatment_n
-  control_n                  <- s8_counts$control_n
+  # ---- Force row-level randomization counts (keep consent the way you had it) -
+  # 'a5' is the Section 8 base (eligible_survey==1) with the consent flag.
+  # We now define randomized, treatment, control as ROW counts.
+  randomized_n <- sum(!is.na(a5$treatment))                 # row-level randomized
+  treatment_n  <- sum(a5$treatment == 1, na.rm = TRUE)      # row-level by arm
+  control_n    <- sum(a5$treatment == 0, na.rm = TRUE)      # row-level by arm
+  # (Leave consented_n and did_not_complete_baseline_n exactly as before)
 } else {
   a5 <- a4 |> dplyr::filter(eligible_survey == 1) |>
     mutate(
@@ -766,12 +802,10 @@ K <- list(
 
 # 10) CONSORT Diagram 
 ```{r warning=FALSE, message=FALSE}
-# 10) CONSORT Diagram — labels from K, rows aligned like reference ------------
+# 10) CONSORT Diagram — split 3m/6m into separate boxes; only A/C/M go to 6m
 {
-  # coalesce helper so labels never print "NA"
   nz <- function(x) ifelse(is.na(x), 0L, x)
 
-  # Build labels once (all values come from K)
   lbl <- list(
     top              = glue::glue("Youth approached in ER\nN = {nz(K$youth_approached)}"),
     hear_more_y      = glue::glue("Consented to hear more\nn = {nz(K$hear_more_yes)}"),
@@ -797,25 +831,38 @@ K <- list(
     arm_t            = glue::glue("Treatment\nn = {nz(K$treatment)}"),
     arm_c            = glue::glue("Control\nn = {nz(K$control)}"),
 
-    pre_t_act        = glue::glue("Active\nn = {nz(K$t_active_pre3m)}"),
-    pre_t_exit       = glue::glue("Exited\nn = {nz(K$t_exited_pre3m)}"),
+    pre_t_act        = glue::glue("Active\nn = {nz(K$m3_t_total)}"),
+    pre_t_exit       = glue::glue("Exited\nn = {nz(0)}"),
     pre_c_act        = glue::glue("Active\nn = {nz(K$c_active_pre3m)}"),
     pre_c_exit       = glue::glue("Exited\nn = {nz(K$c_exited_pre3m)}"),
 
     m3_t             = glue::glue("3-Month Follow Up: Treatment\nn = {nz(K$m3_t_total)}"),
     m3_c             = glue::glue("3-Month Follow Up: Control\nn = {nz(K$m3_c_total)}"),
 
-    m3_t_breakdown   = glue::glue("Active\nn = {nz(K$m3_t_active)}\nCompleted\nn = {nz(K$m3_t_completed)}\nMissed\nn = {nz(K$m3_t_missed)}\nExited\nn = {nz(K$m3_t_exited)}"),
-    m3_c_breakdown   = glue::glue("Active\nn = {nz(K$m3_c_active)}\nCompleted\nn = {nz(K$m3_c_completed)}\nMissed\nn = {nz(K$m3_c_missed)}\nExited\nn = {nz(K$m3_c_exited)}"),
+    m3_t_act         = glue::glue("Active\nn = {nz(K$m3_t_active)}"),
+    m3_t_comp        = glue::glue("Completed\nn = {nz(K$m3_t_completed)}"),
+    m3_t_miss        = glue::glue("Missed\nn = {nz(K$m3_t_missed)}"),
+    m3_t_exit        = glue::glue("Exited\nn = {nz(K$m3_t_exited)}"),
+
+    m3_c_act         = glue::glue("Active\nn = {nz(K$m3_c_active)}"),
+    m3_c_comp        = glue::glue("Completed\nn = {nz(K$m3_c_completed)}"),
+    m3_c_miss        = glue::glue("Missed\nn = {nz(K$m3_c_missed)}"),
+    m3_c_exit        = glue::glue("Exited\nn = {nz(K$m3_c_exited)}"),
 
     m6_t             = glue::glue("6-Month Follow Up: Treatment\nn = {nz(K$m6_t_total)}"),
     m6_c             = glue::glue("6-Month Follow Up: Control\nn = {nz(K$m6_c_total)}"),
 
-    m6_t_breakdown   = glue::glue("Active\nn = {nz(K$m6_t_active)}\nCompleted\nn = {nz(K$m6_t_completed)}\nMissed\nn = {nz(K$m6_t_missed)}\nExited\nn = {nz(K$m6_t_exited)}"),
-    m6_c_breakdown   = glue::glue("Active\nn = {nz(K$m6_c_active)}\nCompleted\nn = {nz(K$m6_c_completed)}\nMissed\nn = {nz(K$m6_c_missed)}\nExited\nn = {nz(K$m6_c_exited)}")
+    m6_t_act         = glue::glue("Active\nn = {nz(K$m6_t_active)}"),
+    m6_t_comp        = glue::glue("Completed\nn = {nz(K$m6_t_completed)}"),
+    m6_t_miss        = glue::glue("Missed\nn = {nz(K$m6_t_missed)}"),
+    m6_t_exit        = glue::glue("Exited\nn = {nz(K$m6_t_exited)}"),
+
+    m6_c_act         = glue::glue("Active\nn = {nz(K$m6_c_active)}"),
+    m6_c_comp        = glue::glue("Completed\nn = {nz(K$m6_c_completed)}"),
+    m6_c_miss        = glue::glue("Missed\nn = {nz(K$m6_c_missed)}"),
+    m6_c_exit        = glue::glue("Exited\nn = {nz(K$m6_c_exited)}")
   )
 
-    # DOT with revised right-column positions (one row up) and extra right spacing
   dot <- glue::glue('
   digraph consort {{
     graph [rankdir=TB, splines=ortho, nodesep="0.36", ranksep="0.46", bgcolor="white"];
@@ -833,16 +880,15 @@ K <- list(
     cons  [label="{lbl$consented}"];
     rand  [label="{lbl$randomized}"];
 
-    # right-side boxes
-    hm_n     [label="{lbl$hear_more_n}"];     # to the right of TOP (moved up)
-    dnwp_pre [label="{lbl$elg_screen_dnwp}"]; # to the right of hm_y (moved up)
-    inel_scr [label="{lbl$elg_ineligible}"];  # to the right of elg_c (moved up)
-    dnwp_svy [label="{lbl$elg_svy_dnwp}"];    # to the right of elg_e (moved up)
-    inel_svy [label="{lbl$elg_svy_inelig}"];  # to the right of svy_t (moved up)
-    ncons    [label="{lbl$did_not_consent}"]; # to the right of svy_e (moved up)
-    nbase    [label="{lbl$did_not_baseline}"];# to the right of cons (moved up)
+    # right column (shifted up)
+    hm_n     [label="{lbl$hear_more_n}"];
+    dnwp_pre [label="{lbl$elg_screen_dnwp}"];
+    inel_scr [label="{lbl$elg_ineligible}"];
+    dnwp_svy [label="{lbl$elg_svy_dnwp}"];
+    inel_svy [label="{lbl$elg_svy_inelig}"];
+    ncons    [label="{lbl$did_not_consent}"];
+    nbase    [label="{lbl$did_not_baseline}"];
 
-    # invisible gutter spacers to push right column further right
     g0 [label="", width=0.6, height=0.01, shape=box, style=invis];
     g1 [label="", width=0.6, height=0.01, shape=box, style=invis];
     g2 [label="", width=0.6, height=0.01, shape=box, style=invis];
@@ -855,37 +901,55 @@ K <- list(
     arm_t [label="{lbl$arm_t}", width=2.6];
     arm_c [label="{lbl$arm_c}", width=2.6];
 
-    # pre-3m active/exited
+    # pre-3m status under arms
     t_act  [label="{lbl$pre_t_act}"];
     t_exit [label="{lbl$pre_t_exit}"];
     c_act  [label="{lbl$pre_c_act}"];
     c_exit [label="{lbl$pre_c_exit}"];
 
-    # 3m
-    m3_t   [label="{lbl$m3_t}"];
-    m3_c   [label="{lbl$m3_c}"];
-    m3_tb  [label="{lbl$m3_t_breakdown}"];
-    m3_cb  [label="{lbl$m3_c_breakdown}"];
+    # 3m totals
+    m3_t [label="{lbl$m3_t}"];
+    m3_c [label="{lbl$m3_c}"];
 
-    # 6m
-    m6_t   [label="{lbl$m6_t}"];
-    m6_c   [label="{lbl$m6_c}"];
-    m6_tb  [label="{lbl$m6_t_breakdown}"];
-    m6_cb  [label="{lbl$m6_c_breakdown}"];
+    # 3m breakdown (separate boxes)
+    m3_t_act  [label="{lbl$m3_t_act}"];
+    m3_t_comp [label="{lbl$m3_t_comp}"];
+    m3_t_miss [label="{lbl$m3_t_miss}"];
+    m3_t_exit [label="{lbl$m3_t_exit}"];
 
-    # vertical flow (left column)
+    m3_c_act  [label="{lbl$m3_c_act}"];
+    m3_c_comp [label="{lbl$m3_c_comp}"];
+    m3_c_miss [label="{lbl$m3_c_miss}"];
+    m3_c_exit [label="{lbl$m3_c_exit}"];
+
+    # 6m totals
+    m6_t [label="{lbl$m6_t}"];
+    m6_c [label="{lbl$m6_c}"];
+
+    # 6m breakdown (separate boxes)
+    m6_t_act  [label="{lbl$m6_t_act}"];
+    m6_t_comp [label="{lbl$m6_t_comp}"];
+    m6_t_miss [label="{lbl$m6_t_miss}"];
+    m6_t_exit [label="{lbl$m6_t_exit}"];
+
+    m6_c_act  [label="{lbl$m6_c_act}"];
+    m6_c_comp [label="{lbl$m6_c_comp}"];
+    m6_c_miss [label="{lbl$m6_c_miss}"];
+    m6_c_exit [label="{lbl$m6_c_exit}"];
+
+    # main flow
     top -> hm_y -> elg_c -> elg_e -> svy_t -> svy_e -> cons -> rand;
 
-    # revised row alignment (right boxes one row up + gutter to push them right)
-    {{ rank=same; top;    g0; hm_n;     }}
-    {{ rank=same; hm_y;   g1; dnwp_pre; }}
-    {{ rank=same; elg_c;  g2; inel_scr; }}
-    {{ rank=same; elg_e;  g3; dnwp_svy; }}
-    {{ rank=same; svy_t;  g4; inel_svy; }}
-    {{ rank=same; svy_e;  g5; ncons;    }}
-    {{ rank=same; cons;   g6; nbase;    }}
+    # right column alignment + gutter
+    {{ rank=same; top;   g0; hm_n;     }}
+    {{ rank=same; hm_y;  g1; dnwp_pre; }}
+    {{ rank=same; elg_c; g2; inel_scr; }}
+    {{ rank=same; elg_e; g3; dnwp_svy; }}
+    {{ rank=same; svy_t; g4; inel_svy; }}
+    {{ rank=same; svy_e; g5; ncons;    }}
+    {{ rank=same; cons;  g6; nbase;    }}
 
-    # horizontal connectors (no vertical constraints)
+    # connectors to right column
     top  -> hm_n      [constraint=false];
     hm_y -> dnwp_pre  [constraint=false];
     elg_c -> inel_scr [constraint=false];
@@ -894,7 +958,7 @@ K <- list(
     svy_e -> ncons    [constraint=false];
     cons  -> nbase    [constraint=false];
 
-    # arms and follow-ups (unchanged)
+    # ARMS + pre-3m
     rand -> arm_t; rand -> arm_c;
     {{ rank=same; arm_t; arm_c; }}
 
@@ -903,17 +967,33 @@ K <- list(
     {{ rank=same; t_act; t_exit; }}
     {{ rank=same; c_act; c_exit; }}
 
-    t_act -> m3_t;  c_act -> m3_c;
+    # 3m totals under actives
+    t_act -> m3_t;
+    c_act -> m3_c;
     {{ rank=same; m3_t; m3_c; }}
 
-    m3_t -> m3_tb;  m3_c -> m3_cb;
-    {{ rank=same; m3_tb; m3_cb; }}
+    # 3m breakdown directly under 3m totals
+    m3_t -> m3_t_act;  m3_t -> m3_t_comp;  m3_t -> m3_t_miss;  m3_t -> m3_t_exit;
+    m3_c -> m3_c_act;  m3_c -> m3_c_comp;  m3_c -> m3_c_miss;  m3_c -> m3_c_exit;
+    {{ rank=same; m3_t_act; m3_t_comp; m3_t_miss; m3_t_exit; }}
+    {{ rank=same; m3_c_act; m3_c_comp; m3_c_miss; m3_c_exit; }}
 
-    m3_t -> m6_t;   m3_c -> m6_c;
+    # ONLY Active/Completed/Missed flow to 6m totals (Exited does NOT)
+    m3_t_act  -> m6_t;
+    m3_t_comp -> m6_t;
+    m3_t_miss -> m6_t;
+
+    m3_c_act  -> m6_c;
+    m3_c_comp -> m6_c;
+    m3_c_miss -> m6_c;
+
     {{ rank=same; m6_t; m6_c; }}
 
-    m6_t -> m6_tb;  m6_c -> m6_cb;
-    {{ rank=same; m6_tb; m6_cb; }}
+    # 6m breakdown under 6m totals
+    m6_t -> m6_t_act;  m6_t -> m6_t_comp;  m6_t -> m6_t_miss;  m6_t -> m6_t_exit;
+    m6_c -> m6_c_act;  m6_c -> m6_c_comp;  m6_c -> m6_c_miss;  m6_c -> m6_c_exit;
+    {{ rank=same; m6_t_act; m6_t_comp; m6_t_miss; m6_t_exit; }}
+    {{ rank=same; m6_c_act; m6_c_comp; m6_c_miss; m6_c_exit; }}
   }}
   ')
   DiagrammeR::grViz(dot)
@@ -1000,8 +1080,8 @@ qc_tbl <- tibble::tibble(
 
     nz(K$randomized),
     nz(K$treatment),
-    nz(K$t_active_pre3m),
-    nz(K$t_exited_pre3m),
+    nz(K$m3_t_total),
+    nz(0),
 
     nz(K$m3_t_total),
     nz(K$m3_t_active),
