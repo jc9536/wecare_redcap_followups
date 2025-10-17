@@ -19,6 +19,7 @@ Welcome! This guide walks you through **setup**, **configuration**, **what each 
 ### Software
 - **R** ≥ 4.3 (https://cran.r-project.org)
 - **RStudio** (optional but recommended: https://posit.co/download/rstudio-desktop/)
+- **Git for Rstudio** (Instructions: https://jennybc.github.io/2014-05-12-ubc/ubc-r/session03_git.html [for Windows: https://git-scm.com/downloads])
 
 ### R packages
 We’ll install everything in one go (copy/paste into the R Console):
