@@ -24,7 +24,7 @@ library(gt)
 # ========================= USER INPUTS ======================
 # File
 OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
-csv_path  <- file.path(OUT_DIR, "dat_merged.csv")
+csv_path  <- file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
 
 # Which datasets to run?
 RUN_CURRENT <- TRUE
@@ -37,13 +37,13 @@ SHOW_OUTREACH_WEEKLY <- TRUE
 SHOW_OUTREACH_DAILY  <- TRUE
 
 # Labels / dates / targets
-DATA_LOCK  <- as.Date("2025-08-01")
-AS_OF_DATE <- as.Date("2025-10-15")
+DATA_LOCK  <- as.Date("2025-10-15")
+AS_OF_DATE <- as.Date("2025-10-20")
 TARGET_H   <- 345
 TARGET_K   <- 630
 
 # Weeks to include (any day inside the week is fine)
-WEEKS_INPUT <- as.Date(c("2025-09-22","2025-09-29","2025-10-06","2025-10-15"))
+WEEKS_INPUT <- as.Date(c("2025-09-22","2025-09-29","2025-10-06","2025-10-17", "2025-10-20"))
 
 # 3m/6m “active if unscheduled but sched_min < cutoff” (Stata td(30sep2025))
 CUTOFF_3M <- as.Date("2025-09-30")
@@ -56,11 +56,11 @@ CUTOFF_6M <- as.Date("2025-09-30")
 `%||%` <- function(a,b) if (is.null(a)) b else a
 
 # Parse mixed date representations to Date (drops time).
-# Handles: epoch seconds/ms, Excel serials (tightened), ISO/MDY strings, and YYYYMMDD numerics.
+# Adds: SAS/Stata daily serials (origin = 1960-01-01).
 to_date_smart <- function(x,
                           tz_epoch = "UTC",
                           tz_local = "America/New_York",
-                          min_year = 2010,   # discard anything older than this as likely bad parse
+                          min_year = 2010,
                           max_year = 2100) {
 
   x_chr <- as.character(x)
@@ -70,9 +70,9 @@ to_date_smart <- function(x,
   is_digits <- grepl("^\\d+$", x_chr)
   idx_num   <- which(is_digits)
 
-  # helper to bound-check years
   clip_years <- function(d) {
-    bad <- !is.na(d) & (as.integer(format(d, "%Y")) < min_year | as.integer(format(d, "%Y")) > max_year)
+    bad <- !is.na(d) & (as.integer(format(d, "%Y")) < min_year |
+                        as.integer(format(d, "%Y")) > max_year)
     d[bad] <- as.Date(NA)
     d
   }
@@ -81,16 +81,20 @@ to_date_smart <- function(x,
     num <- suppressWarnings(as.numeric(x_chr[idx_num]))
     nchar_num <- nchar(x_chr[idx_num])
 
-    # 8-digit YYYYMMDD (e.g., 20240819)
+    # 8-digit YYYYMMDD
     is_yyyymmdd <- nchar_num == 8 & grepl("^(19|20)\\d{6}$", x_chr[idx_num])
 
-    # Excel serials: only accept plausible modern range (>= 25569 = 1970-01-01) and
-    # cap to ~60k (~2064). Also reject if it looks like YYYYMMDD (8 digits).
+    # Excel serials (modern)
     is_excel <- !is_yyyymmdd & !is.na(num) & num >= 25569 & num <= 60000
 
-    # Epoch: treat >1e12 as ms, >1e8 as seconds (covers modern dates)
+    # Epoch
     is_epoch_ms <- !is.na(num) & num > 1e12
     is_epoch_s  <- !is.na(num) & num > 1e8 & num <= 1e12
+
+    # SAS/Stata daily serials (days since 1960-01-01)
+    # Choose a broad plausible window (≈ 1950–2045) but exclude other classes
+    is_sas_stata <- !is_yyyymmdd & !is_excel & !is_epoch_ms & !is_epoch_s &
+                    !is.na(num) & num >= -3650 & num <= 32000
 
     # YYYYMMDD
     if (any(is_yyyymmdd)) {
@@ -98,64 +102,50 @@ to_date_smart <- function(x,
       m <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 5, 6))
       d <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 7, 8))
       d_ymd <- suppressWarnings(as.Date(sprintf("%04d-%02d-%02d", y, m, d)))
-      d_ymd <- clip_years(d_ymd)
-      out[idx_num[is_yyyymmdd]] <- d_ymd
+      out[idx_num[is_yyyymmdd]] <- clip_years(d_ymd)
     }
 
-    # Excel serials (modern only)
+    # Excel
     if (any(is_excel)) {
       d_xl <- as.Date(num[is_excel], origin = "1899-12-30")
-      d_xl <- clip_years(d_xl)
-      out[idx_num[is_excel]] <- d_xl
+      out[idx_num[is_excel]] <- clip_years(d_xl)
     }
 
-    # Epoch milliseconds
+    # SAS/Stata
+    if (any(is_sas_stata)) {
+      d_ss <- as.Date(num[is_sas_stata], origin = "1960-01-01")
+      out[idx_num[is_sas_stata]] <- clip_years(d_ss)
+    }
+
+    # Epoch ms
     if (any(is_epoch_ms)) {
       s <- num[is_epoch_ms] / 1000
       posix <- as.POSIXct(s, origin = "1970-01-01", tz = tz_epoch)
-      posix_local <- as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)
-      d_ep_ms <- as.Date(posix_local)
-      d_ep_ms <- clip_years(d_ep_ms)
-      out[idx_num[is_epoch_ms]] <- d_ep_ms
+      out[idx_num[is_epoch_ms]] <- clip_years(as.Date(as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)))
     }
 
-    # Epoch seconds
+    # Epoch s
     if (any(is_epoch_s)) {
       s <- num[is_epoch_s]
       posix <- as.POSIXct(s, origin = "1970-01-01", tz = tz_epoch)
-      posix_local <- as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)
-      d_ep_s <- as.Date(posix_local)
-      d_ep_s <- clip_years(d_ep_s)
-      out[idx_num[is_epoch_s]] <- d_ep_s
+      out[idx_num[is_epoch_s]] <- clip_years(as.Date(as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)))
     }
   }
 
-  # Non-numeric strings: try ISO then MDY (with and without times)
+  # Non-numeric strings
   idx_str <- which(!is_digits)
   if (length(idx_str)) {
     x_s <- x_chr[idx_str]
 
-    d1 <- suppressWarnings(lubridate::ymd(x_s,     quiet = TRUE))
+    d1 <- suppressWarnings(lubridate::ymd(x_s, quiet = TRUE))
     miss <- is.na(d1)
-    if (any(miss)) {
-      d2 <- suppressWarnings(lubridate::ymd_hm(x_s[miss],  quiet = TRUE)); d1[miss] <- d2; miss <- is.na(d1)
-    }
-    if (any(miss)) {
-      d3 <- suppressWarnings(lubridate::ymd_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d3; miss <- is.na(d1)
-    }
-    if (any(miss)) {
-      d4 <- suppressWarnings(lubridate::mdy(x_s[miss],     quiet = TRUE)); d1[miss] <- d4; miss <- is.na(d1)
-    }
-    if (any(miss)) {
-      d5 <- suppressWarnings(lubridate::mdy_hm(x_s[miss],  quiet = TRUE)); d1[miss] <- d5; miss <- is.na(d1)
-    }
-    if (any(miss)) {
-      d6 <- suppressWarnings(lubridate::mdy_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d6
-    }
+    if (any(miss)) { d2 <- suppressWarnings(lubridate::ymd_hm (x_s[miss], quiet = TRUE)); d1[miss] <- d2; miss <- is.na(d1) }
+    if (any(miss)) { d3 <- suppressWarnings(lubridate::ymd_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d3; miss <- is.na(d1) }
+    if (any(miss)) { d4 <- suppressWarnings(lubridate::mdy    (x_s[miss], quiet = TRUE)); d1[miss] <- d4; miss <- is.na(d1) }
+    if (any(miss)) { d5 <- suppressWarnings(lubridate::mdy_hm (x_s[miss], quiet = TRUE)); d1[miss] <- d5; miss <- is.na(d1) }
+    if (any(miss)) { d6 <- suppressWarnings(lubridate::mdy_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d6 }
 
-    d1 <- as.Date(d1)
-    d1 <- clip_years(d1)
-    out[idx_str] <- d1
+    out[idx_str] <- clip_years(as.Date(d1))
   }
 
   out
@@ -264,7 +254,7 @@ base_df <- raw |>
   )
 
 # Locked snapshot (same cleaning; just filter by merged_date)
-locked_df <- base_df |> filter(merged_date < DATA_LOCK)
+locked_df <- base_df |> filter(merged_date <= DATA_LOCK)
 ```
 
 # 5) Build Tables 
