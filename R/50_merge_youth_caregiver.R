@@ -262,35 +262,26 @@ youth_caregiver_full_join <- function(
   merged <- merged |> derive_site_id()
   merged <- merged |> derive_family_id()
   
-  # Backfill over_18
-  
+  # Backfill over_18 (youth-only; do NOT mix with caregiver p_over_18)
   merged <- merged %>%
     dplyr::mutate(
       over_18 = {
-        # 1) start from youth over_18 (normalized)
-        o <- to01(.data$over_18)
+        # Start with youth value exactly as carried through canonicalization
+        y <- to01(.data$over_18)
         
-        # 2) fallback to caregiver p_over_18 if youth missing
-        p <- if ("p_over_18" %in% names(.)) to01(.data$p_over_18) else NA_integer_
-        o <- dplyr::coalesce(o, p)
-        
-        # 3) **OVERRIDE using screen_age wherever available** (ignores existing o)
-        age <- if ("screen_age" %in% names(.))
-          suppressWarnings(as.numeric(.data$screen_age))
-        else NA_real_
-        o <- dplyr::case_when(
-          !is.na(age) & age >= 18 ~ 1L,
-          !is.na(age) & age <  18 ~ 0L,
-          TRUE                    ~ o         # keep prior value when age is missing
+        # If still missing, derive from screen_age (non-destructive)
+        age <- if ("screen_age" %in% names(.)) suppressWarnings(as.numeric(.data$screen_age)) else NA_real_
+        y2 <- dplyr::case_when(
+          is.na(y) & !is.na(age) & age >= 18 ~ 1L,
+          is.na(y) & !is.na(age) & age <  18 ~ 0L,
+          TRUE                               ~ y
         )
         
-        # 4) still missing? derive from screen_age_group (assumed 1 = adult, 0 = minor)
-        grp <- if ("screen_age_group" %in% names(.))
-          suppressWarnings(as.integer(as.character(.data$screen_age_group)))
-        else NA_integer_
+        # If still missing, final fallback from screen_age_group (1 adult, 0 minor)
+        grp <- if ("screen_age_group" %in% names(.)) suppressWarnings(as.integer(as.character(.data$screen_age_group))) else NA_integer_
         grp <- dplyr::case_when(grp == 1 ~ 1L, grp == 0 ~ 0L, TRUE ~ NA_integer_)
         
-        dplyr::coalesce(o, grp)
+        dplyr::coalesce(y2, grp)
       }
     )
   

@@ -16,6 +16,9 @@ Welcome! This guide walks you through **setup**, **configuration**, **what each 
 
 ## 2) Prerequisites
 
+### API Tokens 
+Please make sure you request API tokens from REDCAP! You can find them in the **API** tab on the **left side bar**. Your request make take a few days to be completed, so make sure you request them before downloading the project onto your own device. You **should have 4 API tokens from REDCAP**, one for each project (Baseline Youth, Baseline Caregiver, Youth Follow Up, Caregiver Follow Up).
+
 ### Software
 - **R** ≥ 4.3 (https://cran.r-project.org)
 - **RStudio** (optional but recommended: https://posit.co/download/rstudio-desktop/)
@@ -101,7 +104,7 @@ config.user.R
 
 ### Option A: One-command run  
 ```
-source("R/run.R")
+source("run.R")
 ```
 
 This runs the full workflow:

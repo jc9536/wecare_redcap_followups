@@ -24,7 +24,8 @@ library(gt)
 # ========================= USER INPUTS ======================
 # File
 OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
-csv_path  <- file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
+csv_path  <- "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/dat_merged.csv"
+  #file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
 
 # Which datasets to run?
 RUN_CURRENT <- TRUE
@@ -77,7 +78,7 @@ to_date_smart <- function(x,
     d
   }
 
-  if (length(idx_num)) {
+    if (length(idx_num)) {
     num <- suppressWarnings(as.numeric(x_chr[idx_num]))
     nchar_num <- nchar(x_chr[idx_num])
 
@@ -87,14 +88,18 @@ to_date_smart <- function(x,
     # Excel serials (modern)
     is_excel <- !is_yyyymmdd & !is.na(num) & num >= 25569 & num <= 60000
 
-    # Epoch
+    # Epoch seconds/milliseconds
     is_epoch_ms <- !is.na(num) & num > 1e12
     is_epoch_s  <- !is.na(num) & num > 1e8 & num <= 1e12
 
+    # >>> NEW: UNIX *days* since 1970-01-01 (typical range covers 2011–~2060+)
+    is_unix_days <- !is_yyyymmdd & !is_excel & !is_epoch_ms & !is_epoch_s &
+                    !is.na(num) & num >= 15000 & num <= 40000
+
     # SAS/Stata daily serials (days since 1960-01-01)
-    # Choose a broad plausible window (≈ 1950–2045) but exclude other classes
+    # Exclude other classes incl. unix-days
     is_sas_stata <- !is_yyyymmdd & !is_excel & !is_epoch_ms & !is_epoch_s &
-                    !is.na(num) & num >= -3650 & num <= 32000
+                    !is_unix_days & !is.na(num) & num >= -3650 & num <= 32000
 
     # YYYYMMDD
     if (any(is_yyyymmdd)) {
@@ -109,6 +114,12 @@ to_date_smart <- function(x,
     if (any(is_excel)) {
       d_xl <- as.Date(num[is_excel], origin = "1899-12-30")
       out[idx_num[is_excel]] <- clip_years(d_xl)
+    }
+
+    # >>> NEW: UNIX days
+    if (any(is_unix_days)) {
+      d_ud <- as.Date(num[is_unix_days], origin = "1970-01-01")
+      out[idx_num[is_unix_days]] <- clip_years(d_ud)
     }
 
     # SAS/Stata
@@ -398,8 +409,8 @@ build_all <- function(df,
       mutate(
         follow_visitstatus_3m = suppressWarnings(as.integer(as.character(follow_visitstatus_3m))),
         follow_visitstatus_6m = suppressWarnings(as.integer(as.character(follow_visitstatus_6m))),
-        follow_sch_min_3m = as_date_safe(follow_sch_min_3m),
-        follow_sch_min_6m = as_date_safe(follow_sch_min_6m),
+        follow_sch_min_3m = as_date_guess(follow_sch_min_3m),
+        follow_sch_min_6m = as_date_guess(follow_sch_min_6m),
         outreach_3m = recode_outreach(follow_visitstatus_3m, follow_sch_min_3m, cutoff_3m),
         outreach_6m = recode_outreach(follow_visitstatus_6m, follow_sch_min_6m, cutoff_6m)
       )
@@ -506,4 +517,17 @@ if (RUN_LOCKED) {
   if (SHOW_OUTREACH_WEEKLY) print(locked$weekly_gt)
   if (SHOW_OUTREACH_DAILY)  for (g in locked$daily_gts) print(g)
 }
+```
+
+```{r}
+sum(!is.na(base_df$merged_date))
+sum(!is.na(locked_df$merged_date))
+
+base_df %>%
+  select(p_participant_id, merged_date) %>%
+  arrange(merged_date)
+
+locked_df %>%
+  select(p_participant_id, merged_date) %>%
+  arrange(merged_date)
 ```

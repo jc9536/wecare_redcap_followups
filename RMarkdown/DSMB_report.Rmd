@@ -424,7 +424,7 @@ s8 <- s8_base |>
     consent = dplyr::case_when(
       p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
       informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
-      p_participant_id %in% c("H-F0115","H-F0085") ~ 1L,  # verbal / form issues
+      p_participant_id %in% c("H-F0115","H-F0085", "K-F0419") ~ 1L,  # verbal / form issues
       TRUE ~ 0L
     )
   )
@@ -509,75 +509,119 @@ tibble::tibble(
 
 # 9) Follow-ups: 3-Month & 6-Month
 ```{r warning=FALSE, message=FALSE}
-# Map to 4 categories
-map_status <- function(v){
-  dplyr::case_when(
-    v == 1 ~ "Completed",
-    v %in% 2:5 ~ "Active",
-    v == 6 ~ "Withdrawal",
-    v == 7 ~ "Missed",
-    TRUE   ~ NA_character_
-  )
+# ---------- 9) Follow-ups: 3-Month & 6-Month  --------------------------------
+LOCK <- DATA_LOCK  # you set DATA_LOCK earlier; e.g., as.Date("2025-08-01")
+
+# Parse visit status into integers (handles labels/strings too)
+coerce_status_num <- function(x) {
+  x_chr <- as.character(x)
+  out   <- suppressWarnings(readr::parse_number(x_chr))
+  out[is.na(out) & grepl("Completed",  x_chr, ignore.case = TRUE)] <- 1L
+  out[is.na(out) & grepl("Missed",     x_chr, ignore.case = TRUE)] <- 7L
+  out[is.na(out) & grepl("Withdraw|Exit", x_chr, ignore.case = TRUE)] <- 6L
+  out[is.na(out) & grepl("Active|In[- ]?progress", x_chr, ignore.case = TRUE)] <- 2L
+  as.integer(out)
 }
 
-rand <- rand |>
-  mutate(
-    consort_status_3m = map_status(follow_visitstatus_3m),
-    consort_status_6m = map_status(follow_visitstatus_6m)
-  ) |>
-  # Rule: if exited at 3m, keep exited in 6m
-  mutate(
-    consort_status_6m = if_else(consort_status_3m == "Withdrawal", "Withdrawal", consort_status_6m)
+# Base: randomized rows from Section 8
+rand <- s8 |> dplyr::filter(!is.na(treatment)) |>
+  dplyr::mutate(
+    treatment = as.integer(readr::parse_number(as.character(treatment))),
+    # visit status
+    visit3 = coerce_status_num(follow_visitstatus_3m),
+    visit6 = coerce_status_num(follow_visitstatus_6m),
+    # schedule windows (force to Date)
+    min3 = lubridate::ymd(as.character(follow_sch_min_3m)),
+    max3 = lubridate::ymd(as.character(follow_sch_max_3m)),
+    min6 = lubridate::ymd(as.character(follow_sch_min_6m)),
+    max6 = lubridate::ymd(as.character(follow_sch_max_6m)),
+    # exits
+    exit_base = (y_exit_wd_b == 1L),
+    exit3     = (visit3 == 6L)
   )
 
-# Count helper
-count_by_arm <- function(status_col, arm){
-  sum(rand[[status_col]] == "Completed" & rand$treatment == arm, na.rm = TRUE) %>% 
-    list(
-      completed = .,
-      active    = sum(rand[[status_col]] == "Active"    & rand$treatment == arm, na.rm = TRUE),
-      missed    = sum(rand[[status_col]] == "Missed"    & rand$treatment == arm, na.rm = TRUE),
-      exited    = sum(rand[[status_col]] == "Withdrawal"& rand$treatment == arm, na.rm = TRUE)
-    )
-}
+# ---------------- Pre-3m counts (your “Treatment Active/Exited”) --------------
+treatment_total <- sum(rand$treatment == 1, na.rm = TRUE)
+control_total   <- sum(rand$treatment == 0, na.rm = TRUE)
 
-n3_t <- count_by_arm("consort_status_3m", 1)
-n3_c <- count_by_arm("consort_status_3m", 0)
+t_exited_pre3m  <- sum(rand$exit_base & rand$treatment == 1, na.rm = TRUE)
+c_exited_pre3m  <- sum(rand$exit_base & rand$treatment == 0, na.rm = TRUE)
 
-n6_t <- count_by_arm("consort_status_6m", 1)
-n6_c <- count_by_arm("consort_status_6m", 0)
+t_active_pre3m  <- treatment_total - t_exited_pre3m
+c_active_pre3m  <- control_total   - c_exited_pre3m
 
-# Totals shown under each 3m/6m box
-n3_t_total <- sum(rand$treatment==1 & !is.na(rand$consort_status_3m))
-n3_c_total <- sum(rand$treatment==0 & !is.na(rand$consort_status_3m))
-n6_t_total <- sum(rand$treatment==1 & !is.na(rand$consort_status_6m))
-n6_c_total <- sum(rand$treatment==0 & !is.na(rand$consort_status_6m))
+# ---------------- 3-month classification (exclude baseline exits) -------------
+rand3 <- rand |> dplyr::filter(!exit_base)
 
-n3_t
-n3_c
+open3      <- !is.na(rand3$min3) & rand3$min3 <= LOCK
+in_window3 <- open3 & !is.na(rand3$max3) & LOCK <= rand3$max3
 
-n6_t
-n6_c
+completed3 <- rand3$visit3 == 1L
+exited3    <- rand3$exit3
+missed3    <- open3 & !in_window3 & !completed3 & !exited3 & !is.na(rand3$max3)
+active3    <- in_window3 & !completed3 & !exited3
 
-# Totals shown under each 3m/6m box
-n3_t_total
-n3_c_total 
-n6_t_total 
-n6_c_total 
+# N under the 3-month boxes = window opened by LOCK (excluding baseline exits)
+m3_t_total <- sum(open3 & rand3$treatment == 1L, na.rm = TRUE)
+m3_c_total <- sum(open3 & rand3$treatment == 0L, na.rm = TRUE)
 
+n3_t <- list(
+  completed = sum(completed3 & rand3$treatment == 1L, na.rm = TRUE),
+  active    = sum(active3    & rand3$treatment == 1L, na.rm = TRUE),
+  missed    = sum(missed3    & rand3$treatment == 1L, na.rm = TRUE),
+  exited    = sum(exited3    & rand3$treatment == 1L, na.rm = TRUE)
+)
+n3_c <- list(
+  completed = sum(completed3 & rand3$treatment == 0L, na.rm = TRUE),
+  active    = sum(active3    & rand3$treatment == 0L, na.rm = TRUE),
+  missed    = sum(missed3    & rand3$treatment == 0L, na.rm = TRUE),
+  exited    = sum(exited3    & rand3$treatment == 0L, na.rm = TRUE)
+)
 
+# ---------------- 6-month classification -------------------------------------
+# Base for 6-month N: drop 3-month exits; N = min6 <= LOCK (same rule)
+rand6_base <- rand3 |> dplyr::filter(!exit3)
+
+open6      <- !is.na(rand6_base$min6) & rand6_base$min6 <= LOCK
+in_window6 <- open6 & !is.na(rand6_base$max6) & LOCK <= rand6_base$max6
+
+completed6 <- rand6_base$visit6 == 1L
+# Per spec: 6-month "Exited" shows 3-month withdrawals (carry-forward)
+exited6_t  <- sum(rand$exit3 & rand$treatment == 1L, na.rm = TRUE)
+exited6_c  <- sum(rand$exit3 & rand$treatment == 0L, na.rm = TRUE)
+
+missed6 <- open6 & !in_window6 & !completed6 & !is.na(rand6_base$max6)
+active6 <- in_window6 & !completed6
+
+m6_t_total <- sum(open6 & rand6_base$treatment == 1L, na.rm = TRUE)
+m6_c_total <- sum(open6 & rand6_base$treatment == 0L, na.rm = TRUE)
+
+n6_t <- list(
+  completed = sum(completed6 & rand6_base$treatment == 1L, na.rm = TRUE),
+  active    = sum(active6    & rand6_base$treatment == 1L, na.rm = TRUE),
+  missed    = sum(missed6    & rand6_base$treatment == 1L, na.rm = TRUE),
+  exited    = exited6_t
+)
+n6_c <- list(
+  completed = sum(completed6 & rand6_base$treatment == 0L, na.rm = TRUE),
+  active    = sum(active6    & rand6_base$treatment == 0L, na.rm = TRUE),
+  missed    = sum(missed6    & rand6_base$treatment == 0L, na.rm = TRUE),
+  exited    = exited6_c
+)
+
+# ---------------- Quick sanity (should NOT be all zeros) ----------------------
+table(rand$visit3, useNA="ifany"); table(rand$visit6, useNA="ifany")
+summary(rand$min3); summary(rand$max3); summary(rand$min6); summary(rand$max6)
 ```
 
 # 9.5) Stage Counts
 ```{r warning=FALSE, message=FALSE}
 # 9.5) Stage Counts  -----------------------------------------------------------
-# Source of truth counts for both the diagram and the QC table.
-# IMPORTANT: We only use stage snapshots, never the later-filtered `dat`.
+LOCK <- as.Date("2025-10-20")   # data-lock date for window logic
 
-# A0: Youth approached
+# ---------------- A0–A4 (unchanged from your working code) -------------------
 youth_approached_n <- n_distinct_na(raw$p_participant_id)
 
-# A1: Hear more (rebuild directly from raw so it's independent of later filters)
 a1 <- raw |>
   mutate(
     ps_hear_more   = type.convert(ps_hear_more, as.is = TRUE),
@@ -586,30 +630,21 @@ a1 <- raw |>
     merged_hear_more = dplyr::if_else(p_participant_id %in% c("K-F0006","H-F0115","K-F0250"), 1L, merged_hear_more),
     merged_hear_more = tidyr::replace_na(merged_hear_more, 0L)
   )
-
 consented_to_hear_more_n    <- sum(a1$merged_hear_more == 1, na.rm = TRUE)
 did_not_consent_hear_more_n <- sum(a1$merged_hear_more == 0, na.rm = TRUE)
 
-# A2: Eligibility Screen completion (USE THE SNAPSHOT FROM CHUNK 5!)
-# dat_s5 is the frame immediately after we normalized eligibility_screen_complete
-# and BEFORE we filtered to complete==2.
 stopifnot(exists("dat_s5"))
-
 a2 <- dat_s5
-completed_elg_screen_n      <- sum(a2$eligibility_screen_complete == 2, na.rm = TRUE)
-did_not_wish_participate_n  <- sum(a2$eligibility_screen_complete == 0, na.rm = TRUE)  # pre-screen DNWP
+completed_elg_screen_n     <- sum(a2$eligibility_screen_complete == 2, na.rm = TRUE)
+did_not_wish_participate_n <- sum(a2$eligibility_screen_complete == 0, na.rm = TRUE)
 
-# A3: Screen eligibility (apply rules ONLY on completed screens from A2)
+# A3 rules (same as yours)
 elg_stage <- a2 |> dplyr::filter(eligibility_screen_complete == 2)
-
 flip0 <- function(cur, cond) dplyr::if_else(dplyr::coalesce(cond, FALSE), 0L, cur)
-
 elg_stage <- elg_stage |>
   mutate(
     merge_black = dplyr::if_else(
-      rowSums(across(c(screen_race_1, screen_race_2, screen_race_3, screen_race_4), ~ .x == 1), na.rm = TRUE) >= 1,
-      1L, 0L
-    ),
+      rowSums(across(c(screen_race_1, screen_race_2, screen_race_3, screen_race_4), ~ .x == 1), na.rm = TRUE) >= 1, 1L, 0L),
     elg_age = dplyr::case_when(
       !is.na(screen_age) & screen_age >= 12 & screen_age < 20 ~ 1L,
       !is.na(screen_age) & (screen_age < 12 | screen_age >= 20) ~ 0L,
@@ -617,7 +652,6 @@ elg_stage <- elg_stage |>
     ),
     elg_age = dplyr::if_else(p_participant_id == "H-F0023", 1L, elg_age)
   )
-
 eligible_screen <- rep(1L, nrow(elg_stage))
 eligible_screen <- flip0(eligible_screen, elg_stage$merge_black == 0)
 eligible_screen <- flip0(eligible_screen, elg_stage$elg_age != 1)
@@ -626,146 +660,145 @@ eligible_screen <- flip0(eligible_screen, elg_stage$screen_seek_therapy == 1)
 eligible_screen <- flip0(eligible_screen, elg_stage$screen_self_repeat == 1)
 eligible_screen <- flip0(eligible_screen, elg_stage$screen_sibling_repeat == 1)
 eligible_screen <- flip0(eligible_screen, elg_stage$p_screen_sibling_repeat == 1)
-eligible_screen <- flip0(
-  eligible_screen,
-  elg_stage$screen_has_cell_phone == 0 & elg_stage$merged_date < lubridate::ymd("2025-01-01")
-)
+eligible_screen <- flip0(eligible_screen, elg_stage$screen_has_cell_phone == 0 & elg_stage$merged_date < lubridate::ymd("2025-01-01"))
 eligible_screen <- ifelse(elg_stage$p_participant_id == "H-F0269", 1L, eligible_screen)
 elg_stage$eligible_screen <- eligible_screen
 
 eligibility_screen_eligible_n <- sum(elg_stage$eligible_screen == 1, na.rm = TRUE)
 ineligible_prescreen_n        <- sum(elg_stage$eligible_screen == 0, na.rm = TRUE)
 
-# A4: Eligibility survey
-# Prefer to reuse the exact Section 7 outputs if they exist; otherwise, fall back.
-if (exists("s7") && exists("s7_base") && exists("s7_counts")) {
-  # Reuse exactly what Section 7 computed
-  eligibility_screen_eligible_n <- s7_counts$eligibility_screen_eligible_n
+# A4: reuse Section 7 results if available
+if (exists("s7") && exists("s7_counts")) {
+  eligibility_screen_eligible_n  <- s7_counts$eligibility_screen_eligible_n
   completed_eligibility_survey_n <- s7_counts$completed_eligibility_survey_n
   did_not_wish_presurvey_n       <- s7_counts$did_not_wish_presurvey_n
   eligibility_survey_eligible_n  <- s7_counts$eligibility_survey_eligible_n
   eligibility_survey_ineligible_n<- s7_counts$eligibility_survey_ineligible_n
-
-  # Hand the completed survey frame (eligible + ineligible) forward as A4
   a4 <- s7
-
 } else {
-  # ---- fallback: derive A4 here (kept for robustness) ----------------------
-  a4 <- elg_stage |> dplyr::filter(eligible_screen == 1) |>
-    mutate(
-      eligible_anxiety = rowSums(across(c(eligible_anxiety_1, eligible_anxiety_2)), na.rm = FALSE),
-      eligible_anxious = dplyr::case_when(
-        !is.na(eligible_anxiety) & eligible_anxiety >= 4 ~ 1L,
-        !is.na(eligible_anxiety) & eligible_anxiety <  4 ~ 0L,
-        TRUE ~ NA_integer_
-      ),
-      eligible_depress = rowSums(across(c(eligible_depress_1, eligible_depress_2)), na.rm = FALSE),
-      eligible_depression = dplyr::case_when(
-        !is.na(eligible_depress) & eligible_depress >= 4 ~ 1L,
-        !is.na(eligible_depress) & eligible_depress <  4 ~ 0L,
-        TRUE ~ NA_integer_
-      ),
-      eligible_sch_close = dplyr::case_when(
-        eligible_sch_connect_1 < 3 ~ 1L,
-        eligible_sch_connect_1 >=3 ~ 0L,
-        TRUE ~ NA_integer_
-      ),
-      eligible_sch_part = dplyr::case_when(
-        eligible_sch_connect_2 < 3 ~ 1L,
-        eligible_sch_connect_2 >=3 ~ 0L,
-        TRUE ~ NA_integer_
-      ),
-      eligible_self_harm_y = dplyr::case_when(
-        eligible_self_harm >= 1 ~ 1L,
-        eligible_self_harm == 0 ~ 0L,
-        TRUE ~ NA_integer_
-      ),
-      eligible_sleep_problem_y = dplyr::case_when(
-        eligible_sleep_problem_1 > 1 ~ 1L,
-        eligible_sleep_problem_1 <=1 ~ 0L,
-        TRUE ~ NA_integer_
-      ),
-      eligible_survey_count = rowSums(across(c(
-        eligible_visited_ed, eligible_hospitalized, eligible_taken_med,
-        eligible_received_therapy, eligible_sought_counseling,
-        eligible_anxious, eligible_depression,
-        eligible_sch_close, eligible_sch_part,
-        eligible_self_harm_y, eligible_sleep_problem_y
-      ), ~ !is.na(.x))),
-      eligible_survey = dplyr::case_when(
-        eligible_survey_count <= 8 ~ NA_integer_,
-        TRUE ~ dplyr::if_else(
-          rowSums(across(c(
-            eligible_visited_ed, eligible_hospitalized, eligible_taken_med,
-            eligible_received_therapy, eligible_sought_counseling,
-            eligible_anxious, eligible_depression,
-            eligible_sch_close, eligible_sch_part,
-            eligible_self_harm_y, eligible_sleep_problem_y
-          ), ~ tidyr::replace_na(.x, 0))) >= 1, 1L, 0L)
-      ),
-      eligible_survey = dplyr::if_else(merged_date > lubridate::ymd("2024-12-04"), 1L, eligible_survey),
-      eligible_survey = dplyr::if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
-    )
-
-  completed_eligibility_survey_n <- sum(!is.na(a4$eligible_survey))
-  did_not_wish_presurvey_n       <- eligibility_screen_eligible_n - completed_eligibility_survey_n
-  eligibility_survey_eligible_n  <- sum(a4$eligible_survey == 1, na.rm = TRUE)
-  eligibility_survey_ineligible_n<- sum(a4$eligible_survey == 0, na.rm = TRUE)
+  stop("Section 7 outputs not found; please run Section 7 before 9.5.")
 }
 
-# A5/A6: consent + baseline/randomization  -----------------------------------
-if (exists("s8") && exists("s8_counts")) {
+# ---------------- A5/A6: Consent (person) + Randomization (row) --------------
+if (exists("s8") && exists("s8u")) {
   a5 <- s8
-  consented_n                <- s8_counts$consented_n
-  did_not_consent_n          <- s8_counts$did_not_consent_n
-  did_not_complete_baseline_n<- s8_counts$did_not_complete_baseline_n
-  # ---- Force row-level randomization counts (keep consent the way you had it) -
-  # 'a5' is the Section 8 base (eligible_survey==1) with the consent flag.
-  # We now define randomized, treatment, control as ROW counts.
-  randomized_n <- sum(!is.na(a5$treatment))                 # row-level randomized
-  treatment_n  <- sum(a5$treatment == 1, na.rm = TRUE)      # row-level by arm
-  control_n    <- sum(a5$treatment == 0, na.rm = TRUE)      # row-level by arm
-  # (Leave consented_n and did_not_complete_baseline_n exactly as before)
+  consented_n                 <- sum(s8u$consent == 1, na.rm = TRUE)
+  did_not_consent_n           <- sum(s8u$consent == 0, na.rm = TRUE)
+  did_not_complete_baseline_n <- sum(is.na(s8u$treatment) & s8u$consent == 1)
+  randomized_n <- sum(!is.na(s8$treatment))
+  treatment_n  <- sum(s8$treatment == 1, na.rm = TRUE)
+  control_n    <- sum(s8$treatment == 0, na.rm = TRUE)
 } else {
-  a5 <- a4 |> dplyr::filter(eligible_survey == 1) |>
-    mutate(
+  s8_base <- a4 |> dplyr::filter(eligible_survey == 1)
+  s8 <- s8_base |>
+    dplyr::mutate(
       consent = dplyr::case_when(
         p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
         informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
-        p_participant_id %in% c("H-F0115","H-F0085") ~ 1L,
+        p_participant_id %in% c("H-F0115","H-F0085","K-F0419") ~ 1L,
         TRUE ~ 0L
       )
     )
-
-  consented_n       <- sum(a5$consent == 1, na.rm = TRUE)
-  did_not_consent_n <- sum(a5$consent == 0, na.rm = TRUE)
-
-  a6 <- a5
-  did_not_complete_baseline_n <- sum(is.na(a6$treatment) & a6$consent == 1)
-  randomized_n <- sum(!is.na(a6$treatment))
-  treatment_n  <- sum(a6$treatment == 1, na.rm = TRUE)
-  control_n    <- sum(a6$treatment == 0, na.rm = TRUE)
+  s8u <- s8 |>
+    dplyr::arrange(p_participant_id, merged_date) |>
+    dplyr::group_by(p_participant_id) |>
+    dplyr::summarise(
+      consent   = as.integer(any(consent == 1, na.rm = TRUE)),
+      treatment = dplyr::coalesce(dplyr::first(na.omit(treatment)), NA),
+      .groups = "drop"
+    )
+  consented_n                 <- sum(s8u$consent == 1, na.rm = TRUE)
+  did_not_consent_n           <- sum(s8u$consent == 0, na.rm = TRUE)
+  did_not_complete_baseline_n <- sum(is.na(s8u$treatment) & s8u$consent == 1)
+  randomized_n <- sum(!is.na(s8$treatment))
+  treatment_n  <- sum(s8$treatment == 1, na.rm = TRUE)
+  control_n    <- sum(s8$treatment == 0, na.rm = TRUE)
 }
 
-# Pre-3m Active/Exited by arm (uses `rand` built earlier)
-pre3m_t_active <- sum(rand$consort_status_3m %in% c("Active","Completed","Missed") & rand$treatment==1, na.rm=TRUE)
-pre3m_t_exit   <- sum(rand$consort_status_3m == "Withdrawal" & rand$treatment==1, na.rm=TRUE)
-pre3m_c_active <- sum(rand$consort_status_3m %in% c("Active","Completed","Missed") & rand$treatment==0, na.rm=TRUE)
-pre3m_c_exit   <- sum(rand$consort_status_3m == "Withdrawal" & rand$treatment==0, na.rm=TRUE)
+# Row-level randomized set
+rand <- if (exists("rand")) rand else s8 |> dplyr::filter(!is.na(treatment))
 
-m3_t_total <- n3_t_total; m3_c_total <- n3_c_total
-m6_t_total <- n6_t_total; m6_c_total <- n6_c_total
+# -------------------------- FOLLOW-UPS (defensive) ---------------------------
+# ---------- LOCK ----------
+LOCK <- DATA_LOCK
 
-# Build K with unambiguous names
+rand3_base <- rand |>
+  dplyr::mutate(
+    status3 = dplyr::case_when(
+      follow_visitstatus_3m == 1 ~ "Completed",
+      follow_visitstatus_3m == 6 ~ "Withdrawal",
+      follow_visitstatus_3m == 7 ~ "Missed",
+      follow_visitstatus_3m %in% 2:5 ~ "Active",
+      TRUE ~ NA_character_
+    ),
+    status6 = dplyr::case_when(
+      follow_visitstatus_6m == 1 ~ "Completed",
+      follow_visitstatus_6m == 6 ~ "Withdrawal",
+      follow_visitstatus_6m == 7 ~ "Missed",
+      follow_visitstatus_6m %in% 2:5 ~ "Active",
+      TRUE ~ NA_character_
+    ),
+    min3 = as.Date(follow_sch_min_3m),
+    max3 = as.Date(follow_sch_max_3m),
+    min6 = as.Date(follow_sch_min_6m),
+    max6 = as.Date(follow_sch_max_6m)
+  )
+
+treat3 <- rand3_base |> dplyr::filter(treatment == 1)
+ctrl3  <- rand3_base |> dplyr::filter(treatment == 0)
+
+# Drop 3m withdrawals for 6m universe
+treat6 <- treat3 |> dplyr::filter(status3 != "Withdrawal")
+ctrl6  <- ctrl3  |> dplyr::filter(status3 != "Withdrawal")
+
+# Helper: “not completed or exited” with NAs treated as TRUE
+not_comp_or_exit3 <- function(df) is.na(df$status3) | !(df$status3 %in% c("Completed","Withdrawal"))
+not_comp_or_exit6 <- function(df) is.na(df$status6) | !(df$status6 %in% c("Completed","Withdrawal"))
+
+count3_strict <- function(df){
+  in_scope <- !is.na(df$min3) & df$min3 <= LOCK
+
+  completed <- sum(in_scope & df$status3 == "Completed",  na.rm = TRUE)
+  exited    <- sum(in_scope & df$status3 == "Withdrawal", na.rm = TRUE)
+  active    <- sum(in_scope & (LOCK <= df$max3) & not_comp_or_exit3(df), na.rm = TRUE)
+  missed    <- sum(in_scope & (LOCK >  df$max3) & not_comp_or_exit3(df), na.rm = TRUE)
+
+  total <- sum(in_scope, na.rm = TRUE)    # your definition
+  stopifnot(total == completed + active + missed + exited)
+  list(total=total, completed=completed, active=active, missed=missed, exited=exited)
+}
+
+count6_strict <- function(df){
+  in_scope <- !is.na(df$min6) & df$min6 <= LOCK
+
+  completed <- sum(in_scope & df$status6 == "Completed",  na.rm = TRUE)
+  exited    <- 0L  # 3m withdrawals were removed already
+  active    <- sum(in_scope & (LOCK <= df$max6) & not_comp_or_exit6(df), na.rm = TRUE)
+  missed    <- sum(in_scope & (LOCK >  df$max6) & not_comp_or_exit6(df), na.rm = TRUE)
+
+  total <- sum(in_scope, na.rm = TRUE)    # your definition
+  stopifnot(total == completed + active + missed + exited)
+  list(total=total, completed=completed, active=active, missed=missed, exited=exited)
+}
+
+n3_t <- count3_strict(treat3)
+n3_c <- count3_strict(ctrl3)
+n6_t <- count6_strict(treat6)
+n6_c <- count6_strict(ctrl6)
+
+n3_t_total <- n3_t$total; n3_c_total <- n3_c$total
+n6_t_total <- n6_t$total; n6_c_total <- n6_c$total
+
+# ------------------------------- Build K -------------------------------------
 K <- list(
   youth_approached = youth_approached_n,
   hear_more_yes    = consented_to_hear_more_n,
   hear_more_no     = did_not_consent_hear_more_n,
 
-  did_not_wish_participate = did_not_wish_participate_n,  # pre-screen DNWP
+  did_not_wish_participate = did_not_wish_participate_n,
   completed_elg_screen     = completed_elg_screen_n,
 
-  ineligible_prescreen     = ineligible_prescreen_n,      # eligible_screen==0
+  ineligible_prescreen     = ineligible_prescreen_n,
   elig_screen_eligible     = eligibility_screen_eligible_n,
 
   did_not_wish_presurvey   = did_not_wish_presurvey_n,
@@ -773,31 +806,39 @@ K <- list(
   ineligible_presurvey     = eligibility_survey_ineligible_n,
   elig_survey_eligible     = eligibility_survey_eligible_n,
 
-  did_not_consent          = did_not_consent_n,
-  consented                = consented_n,
+  did_not_consent           = did_not_consent_n,
+  consented                 = consented_n,
   did_not_complete_baseline = did_not_complete_baseline_n,
 
   randomized = randomized_n,
   treatment  = treatment_n,
   control    = control_n,
 
-  t_active_pre3m = pre3m_t_active, t_exited_pre3m = pre3m_t_exit,
-  c_active_pre3m = pre3m_c_active, c_exited_pre3m = pre3m_c_exit,
+  # Baseline status under arms
+  t_active_pre3m = treatment_active_pre3m, t_exited_pre3m = treatment_exit_baseline,
+  c_active_pre3m = control_active_pre3m,   c_exited_pre3m = control_exit_baseline,
 
-  m3_t_total = m3_t_total, m3_c_total = m3_c_total,
+  # 3-month
+  m3_t_total = n3_t_total, m3_c_total = n3_c_total,
   m3_t_active = n3_t$active, m3_t_completed = n3_t$completed,
   m3_t_missed = n3_t$missed, m3_t_exited = n3_t$exited,
   m3_c_active = n3_c$active, m3_c_completed = n3_c$completed,
   m3_c_missed = n3_c$missed, m3_c_exited = n3_c$exited,
 
-  m6_t_total = m6_t_total, m6_c_total = m6_c_total,
+  # 6-month
+  m6_t_total = n6_t_total, m6_c_total = n6_c_total,
   m6_t_active = n6_t$active, m6_t_completed = n6_t$completed,
-  m6_t_missed = n6_t$missed, m6_t_exited = n6_t$exited,
+  m6_t_missed = n6_t$missed, m6_t_exited = n6_t$exited, # will be 0
   m6_c_active = n6_c$active, m6_c_completed = n6_c$completed,
-  m6_c_missed = n6_c$missed, m6_c_exited = n6_c$exited
+  m6_c_missed = n6_c$missed, m6_c_exited = n6_c$exited  # will be 0
 )
 ```
 
+```{r}
+table_in_scope3 <- with(treat3, table(in_scope = (!is.na(min3) & min3 <= LOCK),
+                                      status3 = addNA(status3)))
+print(table_in_scope3)
+```
 
 
 # 10) CONSORT Diagram 
@@ -831,8 +872,8 @@ K <- list(
     arm_t            = glue::glue("Treatment\nn = {nz(K$treatment)}"),
     arm_c            = glue::glue("Control\nn = {nz(K$control)}"),
 
-    pre_t_act        = glue::glue("Active\nn = {nz(K$m3_t_total)}"),
-    pre_t_exit       = glue::glue("Exited\nn = {nz(0)}"),
+    pre_t_act        = glue::glue("Active\nn = {nz(K$t_active_pre3m)}"),
+    pre_t_exit       = glue::glue("Exited\nn = {nz(K$t_exited_pre3m)}"),
     pre_c_act        = glue::glue("Active\nn = {nz(K$c_active_pre3m)}"),
     pre_c_exit       = glue::glue("Exited\nn = {nz(K$c_exited_pre3m)}"),
 
@@ -1080,8 +1121,8 @@ qc_tbl <- tibble::tibble(
 
     nz(K$randomized),
     nz(K$treatment),
-    nz(K$m3_t_total),
-    nz(0),
+    nz(K$t_active_pre3m),
+    nz(K$t_exited_pre3m),
 
     nz(K$m3_t_total),
     nz(K$m3_t_active),

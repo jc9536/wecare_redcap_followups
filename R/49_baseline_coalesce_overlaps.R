@@ -66,8 +66,14 @@
 # Gather all sources for a given base into a list of vectors (missing → NA)
 .get_sources <- function(dat, base) {
   list(
-    bl_y  = if (paste0(base, "_y")     %in% names(dat)) dat[[paste0(base, "_y")]]     else rep(NA, nrow(dat)),
-    bl_cg = if (paste0(base, "_cg")    %in% names(dat)) dat[[paste0(base, "_cg")]]    else rep(NA, nrow(dat)),
+    bl_y  = if (paste0(base, "_y") %in% names(dat)) {
+      dat[[paste0(base, "_y")]]
+    } else if (base %in% names(dat)) {
+      dat[[base]]   # fallback to unsuffixed youth column
+    } else {
+      rep(NA, nrow(dat))
+    },
+    bl_cg = if (paste0(base, "_cg") %in% names(dat)) dat[[paste0(base, "_cg")]] else rep(NA, nrow(dat)),
     y_3m  = if (paste0(base, "_y_3m")  %in% names(dat)) dat[[paste0(base, "_y_3m")]]  else rep(NA, nrow(dat)),
     y_6m  = if (paste0(base, "_y_6m")  %in% names(dat)) dat[[paste0(base, "_y_6m")]]  else rep(NA, nrow(dat)),
     cg_3m = if (paste0(base, "_cg_3m") %in% names(dat)) dat[[paste0(base, "_cg_3m")]] else rep(NA, nrow(dat)),
