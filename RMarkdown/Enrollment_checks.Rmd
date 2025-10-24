@@ -24,8 +24,7 @@ library(gt)
 # ========================= USER INPUTS ======================
 # File
 OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
-csv_path  <- "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/dat_merged.csv"
-  #file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
+csv_path  <- file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
 
 # Which datasets to run?
 RUN_CURRENT <- TRUE
