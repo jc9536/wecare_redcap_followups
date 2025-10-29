@@ -9,6 +9,7 @@
 #   5) Attach follow-ups (3m/6m) to baselines + build completion indicators
 #   6) Merge Youth & Caregiver (full outer), label/coalesce overlaps, write outputs
 #   7) QC summaries + schema overlap reports
+#   8) Post-process dat_merged.csv file for appropriate ID names and composite variables
 #
 # Usage:
 #   From the repo root:   source("run.R")
@@ -76,6 +77,12 @@ source("R/50_merge_youth_caregiver.R")
 
 # Post-merge schema overlap report
 source("R/60_schema_overlap_report.R")
+
+# Post-process dat_merged.csv file
+source("R/70_postprocess_dat_merged.R")
+
+# NIMH GUID dataset creation
+source("R/72_nda_guid_prep.R")
 
 
 # --- 2) Configure follow-up events -------------------------------------------
@@ -195,5 +202,18 @@ write_overlap_checks(
 # Console dashboard
 print(chk1)
 print(chk2)
+
+# --- 8) Post-process dat_merged.csv file ---------------------------------------
+message("🛠️ Running post-processing ...")
+
+tryCatch(
+  postprocess_dat_merged_in_place(OUT_DIR, backup = FALSE),
+  error = function(e) warning("Post-process failed; original dat_merged.csv left as-is. Reason: ", conditionMessage(e))
+)
+
+# --- 9) Create NIMH GUID dataset ---------------------------------------
+message("📑 Creating NIMH GUID dataset ...")
+
+nda_guid_prep_in_place(OUT_DIR)
 
 message("✅ Done.\n  Raw:   data/raw\n  Clean: data/out\n  Checks:data/checks")

@@ -92,34 +92,34 @@ dat <- raw |>
 # 2) Merge Dates & Initial Checks 
 ```{r warning=FALSE, message=FALSE}
 # --- Merge dates & initial checks (robust) ---
-dat <- dat |>
-  mutate(
-    ps_date_dt          = parse_any_datetime(ps_date),
-    p_ps_date_dt        = parse_any_datetime(p_ps_date),
-    screen_doe_dt       = parse_any_datetime(screen_doe),
-    date_baseline_dt    = parse_any_datetime(date_baseline),
-    p_date_baseline_dt  = parse_any_datetime(p_date_baseline),
+# dat <- dat |>
+#  mutate(
+#    ps_date_dt          = parse_any_datetime(ps_date),
+#    p_ps_date_dt        = parse_any_datetime(p_ps_date),
+#    screen_doe_dt       = parse_any_datetime(screen_doe),
+#    date_baseline_dt    = parse_any_datetime(date_baseline),
+#    p_date_baseline_dt  = parse_any_datetime(p_date_baseline),
 
-    merged_datetime = coalesce(
-      ps_date_dt, p_ps_date_dt, screen_doe_dt, date_baseline_dt, p_date_baseline_dt
-    ),
-    merged_date = as.Date(merged_datetime)
-  )
+#    merged_datetime = coalesce(
+#      ps_date_dt, p_ps_date_dt, screen_doe_dt, date_baseline_dt, p_date_baseline_dt
+#    ),
+#    merged_date = as.Date(merged_datetime)
+#  )
 
 # Quick spot check row(s) you showed
-dat |>
-  select(merged_date, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline) |>
-  head(10) |>
-  gt::gt() |>
-  gt::tab_header(title = "Post-fix: merged_date now populated when any source has a timestamp")
+# dat |>
+#  select(merged_date, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline) |>
+#  head(10) |>
+#  gt::gt() |>
+#  gt::tab_header(title = "Post-fix: merged_date now populated when any source has a timestamp")
 
 # Check: any missing merged dates?
-miss_merged_date <- dat |>
-  filter(is.na(merged_date)) |>
-  select(p_participant_id, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline)
+# miss_merged_date <- dat |>
+#  filter(is.na(merged_date)) |>
+#  select(p_participant_id, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline)
 
-gt::gt(miss_merged_date) |>
-  gt::tab_header(title = "Check: Remaining missing merged_date (should be few/none)")
+# gt::gt(miss_merged_date) |>
+#  gt::tab_header(title = "Check: Remaining missing merged_date (should be few/none)")
 ```
 
 # 3) Preeligibility Counts & Data Issues 
@@ -788,6 +788,11 @@ n6_c <- count6_strict(ctrl6)
 
 n3_t_total <- n3_t$total; n3_c_total <- n3_c$total
 n6_t_total <- n6_t$total; n6_c_total <- n6_c$total
+
+treatment_active_pre3m  <- t_active_pre3m
+control_active_pre3m    <- c_active_pre3m
+treatment_exit_baseline <- t_exited_pre3m
+control_exit_baseline   <- c_exited_pre3m
 
 # ------------------------------- Build K -------------------------------------
 K <- list(

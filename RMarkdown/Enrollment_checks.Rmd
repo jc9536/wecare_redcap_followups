@@ -242,26 +242,26 @@ raw <- raw |>
   )
 
 # Build participant id from youth then caregiver
-ppid_y  <- str_sub(as.character(raw$wecare_id_y), 1, 7)
-ppid_cg <- str_sub(as.character(raw$wecare_id_cg), 1, 7)
+# ppid_y  <- str_sub(as.character(raw$wecare_id_y), 1, 7)
+# ppid_cg <- str_sub(as.character(raw$wecare_id_cg), 1, 7)
 
 # Merge date (youth→caregiver→screen→baseline→p_baseline), then drop blanks
-base_df <- raw |>
-  mutate(
-    p_participant_id = if_else(is.na(ppid_y) | ppid_y == "", ppid_cg, ppid_y),
-    merged_date_chr  = coalesce_chr(
-      as.character(ps_date),
-      as.character(p_ps_date),
-      as.character(screen_doe),
-      as.character(date_baseline),
-      as.character(p_date_baseline)
-    )
-  ) |>
-  filter(!is.na(merged_date_chr) & merged_date_chr != "") |>
-  mutate(
-    merged_date = to_date_smart(merged_date_chr),
-    site_code   = site_code_from(site_id, coalesce_chr(p_participant_id, wecare_id_y, wecare_id_cg))
-  )
+# base_df <- raw |>
+#  mutate(
+#    p_participant_id = if_else(is.na(ppid_y) | ppid_y == "", ppid_cg, ppid_y),
+#   merged_date_chr  = coalesce_chr(
+#      as.character(ps_date),
+#      as.character(p_ps_date),
+#      as.character(screen_doe),
+#      as.character(date_baseline),
+#      as.character(p_date_baseline)
+#    )
+#  ) |>
+#  filter(!is.na(merged_date_chr) & merged_date_chr != "") |>
+#  mutate(
+#    merged_date = to_date_smart(merged_date_chr),
+#    site_code   = site_code_from(site_id, coalesce_chr(p_participant_id, wecare_id_y, wecare_id_cg))
+#  )
 
 # Locked snapshot (same cleaning; just filter by merged_date)
 locked_df <- base_df |> filter(merged_date <= DATA_LOCK)
@@ -516,17 +516,4 @@ if (RUN_LOCKED) {
   if (SHOW_OUTREACH_WEEKLY) print(locked$weekly_gt)
   if (SHOW_OUTREACH_DAILY)  for (g in locked$daily_gts) print(g)
 }
-```
-
-```{r}
-sum(!is.na(base_df$merged_date))
-sum(!is.na(locked_df$merged_date))
-
-base_df %>%
-  select(p_participant_id, merged_date) %>%
-  arrange(merged_date)
-
-locked_df %>%
-  select(p_participant_id, merged_date) %>%
-  arrange(merged_date)
 ```
