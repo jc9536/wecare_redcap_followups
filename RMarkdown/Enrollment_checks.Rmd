@@ -38,12 +38,12 @@ SHOW_OUTREACH_DAILY  <- TRUE
 
 # Labels / dates / targets
 DATA_LOCK  <- as.Date("2025-10-15")
-AS_OF_DATE <- as.Date("2025-10-20")
+AS_OF_DATE <- as.Date("2025-10-29")
 TARGET_H   <- 345
 TARGET_K   <- 630
 
 # Weeks to include (any day inside the week is fine)
-WEEKS_INPUT <- as.Date(c("2025-09-22","2025-09-29","2025-10-06","2025-10-17", "2025-10-20"))
+WEEKS_INPUT <- as.Date(c("2025-09-22","2025-09-29","2025-10-06","2025-10-17", "2025-10-29"))
 
 # 3m/6m “active if unscheduled but sched_min < cutoff” (Stata td(30sep2025))
 CUTOFF_3M <- as.Date("2025-09-30")
@@ -171,7 +171,7 @@ coalesce_chr <- function(...) {
 }
 
 # Canonical site code (H/K) from site_id or ID prefix
-site_code_from <- function(site_id, id_like) {
+site_id_from <- function(site_id, id_like) {
   sid <- toupper(trimws(as.character(site_id)))
   idl <- as.character(id_like)
   dplyr::case_when(
@@ -186,8 +186,8 @@ site_code_from <- function(site_id, id_like) {
 count_by_site <- function(df, filter_expr = TRUE) {
   tmp <- dplyr::filter(df, {{ filter_expr }})
   tibble(
-    Harlem = sum(tmp$site_code == "H", na.rm = TRUE),
-    Kings  = sum(tmp$site_code == "K", na.rm = TRUE)
+    Harlem = sum(tmp$site_id == "H", na.rm = TRUE),
+    Kings  = sum(tmp$site_id == "K", na.rm = TRUE)
   ) |> mutate(Total = Harlem + Kings)
 }
 
@@ -242,13 +242,13 @@ raw <- raw |>
   )
 
 # Build participant id from youth then caregiver
-# ppid_y  <- str_sub(as.character(raw$wecare_id_y), 1, 7)
-# ppid_cg <- str_sub(as.character(raw$wecare_id_cg), 1, 7)
+# ppid_y  <- str_sub(as.character(raw$participant_id), 1, 7)
+# ppid_cg <- str_sub(as.character(raw$p_participant_id), 1, 7)
 
 # Merge date (youth→caregiver→screen→baseline→p_baseline), then drop blanks
 # base_df <- raw |>
 #  mutate(
-#    p_participant_id = if_else(is.na(ppid_y) | ppid_y == "", ppid_cg, ppid_y),
+#    record_id = if_else(is.na(ppid_y) | ppid_y == "", ppid_cg, ppid_y),
 #   merged_date_chr  = coalesce_chr(
 #      as.character(ps_date),
 #      as.character(p_ps_date),
@@ -260,11 +260,11 @@ raw <- raw |>
 #  filter(!is.na(merged_date_chr) & merged_date_chr != "") |>
 #  mutate(
 #    merged_date = to_date_smart(merged_date_chr),
-#    site_code   = site_code_from(site_id, coalesce_chr(p_participant_id, wecare_id_y, wecare_id_cg))
+#    site_code   = site_code_from(site_id, coalesce_chr(record_id, participant_id, p_participant_id))
 #  )
 
 # Locked snapshot (same cleaning; just filter by merged_date)
-locked_df <- base_df |> filter(merged_date <= DATA_LOCK)
+locked_df <- raw |> filter(merged_date <= DATA_LOCK)
 ```
 
 # 5) Build Tables 
@@ -290,8 +290,8 @@ count_outreach <- function(dd, var) {
   tmp <- dd %>%
     filter(!is.na(.data[[var]])) %>%
     mutate(cat = factor(.data[[var]], levels = lvls, labels = labs)) %>%
-    count(cat, site_code, name = "n") %>%
-    tidyr::pivot_wider(names_from = site_code, values_from = n, values_fill = 0)
+    count(cat, site_id, name = "n") %>%
+    tidyr::pivot_wider(names_from = site_id, values_from = n, values_fill = 0)
   for (nm in c("H","K")) if (!(nm %in% names(tmp))) tmp[[nm]] <- 0L
   tmp %>%
     mutate(H = coalesce(H, 0L), K = coalesce(K, 0L)) %>%
@@ -375,7 +375,7 @@ build_all <- function(df,
 
   # ----- ENROLLMENT -----
   if (want_enroll) {
-    approached     <- df %>% distinct(p_participant_id, site_code) %>% count_by_site()
+    approached     <- df %>% distinct(record_id, site_id) %>% count_by_site()
     enrolled_total <- count_by_site(df, !is.na(treatment))
     enrolled_ctrl  <- count_by_site(df, treatment == 0)
     enrolled_tx    <- count_by_site(df, treatment == 1)
@@ -479,7 +479,7 @@ build_all <- function(df,
 
 if (RUN_CURRENT) {
   current <- build_all(
-    df          = base_df,
+    df          = raw,
     as_of_date  = AS_OF_DATE,
     target_H    = TARGET_H,
     target_K    = TARGET_K,

@@ -23,7 +23,7 @@ theme_set(theme_minimal(base_size = 13))
 # ---------- USER INPUTS ----------
 OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
 csv_path  <- file.path(OUT_DIR, "dat_merged.csv")
-DATA_LOCK <- as.Date("2025-08-01")  # used in some filters; update as needed
+DATA_LOCK <- as.Date("2025-10-01")  # used in some filters; update as needed
 
 # ---------- HELPERS ----------
 na_empty <- function(x) replace(x, is.na(x) | x %in% c("NA",""), NA)
@@ -116,7 +116,7 @@ dat <- raw |>
 # Check: any missing merged dates?
 # miss_merged_date <- dat |>
 #  filter(is.na(merged_date)) |>
-#  select(p_participant_id, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline)
+#  select(record_id, ps_date, p_ps_date, screen_doe, date_baseline, p_date_baseline)
 
 # gt::gt(miss_merged_date) |>
 #  gt::tab_header(title = "Check: Remaining missing merged_date (should be few/none)")
@@ -124,16 +124,16 @@ dat <- raw |>
 
 # 3) Preeligibility Counts & Data Issues 
 ```{r warning=FALSE, message=FALSE}
-youth_approached_n <- n_distinct_na(dat$p_participant_id)
+youth_approached_n <- n_distinct_na(dat$record_id)
 
 no_legal_guardian <- dat |>
   filter(over_18 == 0, p_screen_legal_guardian == 0) |>
-  select(p_participant_id)
+  select(record_id)
 no_legal_guardian_n <- nrow(no_legal_guardian)
 
 no_english <- dat |>
   filter(p_screen_understand_eng == 0) |>
-  select(p_participant_id)
+  select(record_id)
 no_english_n <- nrow(no_english)
 
 list(
@@ -153,7 +153,7 @@ dat <- dat |>
 # Manual fixes
 dat <- dat |>
   mutate(
-    merged_hear_more = if_else(p_participant_id %in% c("K-F0006","H-F0115","K-F0250"),
+    merged_hear_more = if_else(record_id %in% c("K-F0006","H-F0115","K-F0250"),
                                1L, merged_hear_more),
     merged_hear_more = replace_na(merged_hear_more, 0L)
   )
@@ -164,7 +164,7 @@ did_not_consent_hear_more_n <- sum(dat$merged_hear_more == 0, na.rm = TRUE)
 # Check: anyone with treatment assigned but not interested in hearing more?
 chk_treat_but_no_interest <- dat |>
   filter(!is.na(treatment), merged_hear_more == 0) |>
-  select(p_participant_id, treatment)
+  select(record_id, treatment)
 gt::gt(chk_treat_but_no_interest) |>
   gt::tab_header(title = "Check: Treatment present but 'hear more' == 0")
 
@@ -219,7 +219,7 @@ elg_stage <- elg_stage |>
       !is.na(screen_age) & (screen_age < 12 | screen_age >= 20) ~ 0L,
       TRUE ~ NA_integer_
     ),
-    elg_age = if_else(p_participant_id == "H-F0023", 1L, elg_age)
+    elg_age = if_else(record_id == "H-F0023", 1L, elg_age)
   )
 
 # --- Helper: flip to 0 only when condition is TRUE; treat NA as FALSE ---
@@ -238,7 +238,7 @@ eligible_screen <- flip0(
   eligible_screen,
   elg_stage$screen_has_cell_phone == 0 & elg_stage$merged_date < lubridate::ymd("2025-01-01")
 )
-eligible_screen <- ifelse(elg_stage$p_participant_id == "H-F0269", 1L, eligible_screen)
+eligible_screen <- ifelse(elg_stage$record_id == "H-F0269", 1L, eligible_screen)
 
 elg_stage$eligible_screen <- eligible_screen
 
@@ -384,7 +384,7 @@ s7 <- s7 |>
       )) >= 1, 1L, 0L
     ),
     eligible_survey = if_else(merged_date > lubridate::ymd("2024-12-04"), 1L, eligible_survey),
-    eligible_survey = if_else(p_participant_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
+    eligible_survey = if_else(record_id %in% c("K-F0082","K-F0080"), 1L, eligible_survey)
   )
 
 eligibility_survey_ineligible_n <- sum(s7$eligible_survey == 0, na.rm = TRUE)
@@ -424,7 +424,7 @@ s8 <- s8_base |>
     consent = dplyr::case_when(
       p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
       informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
-      p_participant_id %in% c("H-F0115","H-F0085", "K-F0419") ~ 1L,  # verbal / form issues
+      record_id %in% c("H-F0115","H-F0085", "K-F0419") ~ 1L,  # verbal / form issues
       TRUE ~ 0L
     )
   )
@@ -434,8 +434,8 @@ s8 <- s8_base |>
 # - consent: whether consent==1 on ANY row
 # - treatment: first non-missing assignment (0/1) if present
 s8u <- s8 |>
-  dplyr::arrange(p_participant_id, merged_date) |>
-  dplyr::group_by(p_participant_id) |>
+  dplyr::arrange(record_id, merged_date) |>
+  dplyr::group_by(record_id) |>
   dplyr::summarise(
     consent   = as.integer(any(consent == 1, na.rm = TRUE)),
     treatment = dplyr::coalesce(dplyr::first(na.omit(treatment)), NA),
@@ -461,17 +461,17 @@ randomized_n_persons <- sum(!is.na(s8u$treatment) & s8u$consent == 1)
 # Participants randomized but consent != 1 (ROW-LEVEL view)
 rand_without_consent <- s8 |>
   dplyr::filter(!is.na(treatment) & (is.na(consent) | consent != 1)) |>
-  dplyr::select(p_participant_id, treatment, consent)
+  dplyr::select(record_id, treatment, consent)
 
 # Duplicate participant rows (can explain row vs person mismatches)
 dups <- s8 |>
-  dplyr::count(p_participant_id, name = "rows") |>
+  dplyr::count(record_id, name = "rows") |>
   dplyr::filter(rows > 1)
 
 # Consented (person-level) but no treatment (person-level)
 consented_no_treatment <- s8u |>
   dplyr::filter(consent == 1 & is.na(treatment)) |>
-  dplyr::select(p_participant_id)
+  dplyr::select(record_id)
 
 # Algebra checks (display-only). Note: with row-level randomized, the identity will not hold if duplicates exist.
 algebra <- tibble::tibble(
@@ -620,14 +620,14 @@ summary(rand$min3); summary(rand$max3); summary(rand$min6); summary(rand$max6)
 LOCK <- as.Date("2025-10-20")   # data-lock date for window logic
 
 # ---------------- A0–A4 (unchanged from your working code) -------------------
-youth_approached_n <- n_distinct_na(raw$p_participant_id)
+youth_approached_n <- n_distinct_na(raw$record_id)
 
 a1 <- raw |>
   mutate(
     ps_hear_more   = type.convert(ps_hear_more, as.is = TRUE),
     p_ps_hear_more = type.convert(p_ps_hear_more, as.is = TRUE),
     merged_hear_more = dplyr::coalesce(ps_hear_more, p_ps_hear_more),
-    merged_hear_more = dplyr::if_else(p_participant_id %in% c("K-F0006","H-F0115","K-F0250"), 1L, merged_hear_more),
+    merged_hear_more = dplyr::if_else(record_id %in% c("K-F0006","H-F0115","K-F0250"), 1L, merged_hear_more),
     merged_hear_more = tidyr::replace_na(merged_hear_more, 0L)
   )
 consented_to_hear_more_n    <- sum(a1$merged_hear_more == 1, na.rm = TRUE)
@@ -650,7 +650,7 @@ elg_stage <- elg_stage |>
       !is.na(screen_age) & (screen_age < 12 | screen_age >= 20) ~ 0L,
       TRUE ~ NA_integer_
     ),
-    elg_age = dplyr::if_else(p_participant_id == "H-F0023", 1L, elg_age)
+    elg_age = dplyr::if_else(record_id == "H-F0023", 1L, elg_age)
   )
 eligible_screen <- rep(1L, nrow(elg_stage))
 eligible_screen <- flip0(eligible_screen, elg_stage$merge_black == 0)
@@ -661,7 +661,7 @@ eligible_screen <- flip0(eligible_screen, elg_stage$screen_self_repeat == 1)
 eligible_screen <- flip0(eligible_screen, elg_stage$screen_sibling_repeat == 1)
 eligible_screen <- flip0(eligible_screen, elg_stage$p_screen_sibling_repeat == 1)
 eligible_screen <- flip0(eligible_screen, elg_stage$screen_has_cell_phone == 0 & elg_stage$merged_date < lubridate::ymd("2025-01-01"))
-eligible_screen <- ifelse(elg_stage$p_participant_id == "H-F0269", 1L, eligible_screen)
+eligible_screen <- ifelse(elg_stage$record_id == "H-F0269", 1L, eligible_screen)
 elg_stage$eligible_screen <- eligible_screen
 
 eligibility_screen_eligible_n <- sum(elg_stage$eligible_screen == 1, na.rm = TRUE)
@@ -695,13 +695,13 @@ if (exists("s8") && exists("s8u")) {
       consent = dplyr::case_when(
         p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
         informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
-        p_participant_id %in% c("H-F0115","H-F0085","K-F0419") ~ 1L,
+        record_id %in% c("H-F0115","H-F0085","K-F0419") ~ 1L,
         TRUE ~ 0L
       )
     )
   s8u <- s8 |>
-    dplyr::arrange(p_participant_id, merged_date) |>
-    dplyr::group_by(p_participant_id) |>
+    dplyr::arrange(record_id, merged_date) |>
+    dplyr::group_by(record_id) |>
     dplyr::summarise(
       consent   = as.integer(any(consent == 1, na.rm = TRUE)),
       treatment = dplyr::coalesce(dplyr::first(na.omit(treatment)), NA),
