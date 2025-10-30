@@ -39,7 +39,7 @@ install.packages(c(
 Your repository should look like this:
 ```
 WeCare/
-│
+├── run.r                            ← main file that will run the pipeline
 ├── config.user.example.R            ← See Step 4 in this README.md
 ├── config.user.R                    ← Your personal config file
 │
@@ -56,7 +56,6 @@ WeCare/
 │   ├── 50_merge_youth_caregiver.R
 │   ├── 60_schema_overlap_report.R
 │   ├── legacy_cleaning.R
-│   └── run.R
 │
 ├── RMarkdown/
 │   ├── DSMB_report.Rmd
@@ -70,8 +69,9 @@ WeCare/
 ## 4) Configuration Setup
 
 ### Step 1: Copy the example file
-```bash
-cp config.user.example.R
+```r
+# 2. Copy and edit config
+file.copy("config.user.example.R","config.user.R")
 ```
 
 ### Step 2: Edit your personal configuration file  
@@ -95,6 +95,7 @@ CHECKS_DIR <- "data/checks"
 
 ### Step 3: Add to `.gitignore`  
 ```
+# This step is already done for you, please double check 
 config.user.R
 ```
 
@@ -155,6 +156,8 @@ rmarkdown::render("RMarkdown/Enrollment_checks.Rmd")
 | `49_baseline_coalesce_overlaps.R` | Coalesces overlapping baseline fields |
 | `50_merge_youth_caregiver.R` | Merges youth + caregiver datasets |
 | `60_schema_overlap_report.R` | Summarizes schema and label overlaps |
+| `70_postprocess_dat_merged.R`| processes dat_merged.csv into a cleaned file |
+| `72_nda_guid_prep.R` | Creates another dataset for NIMH data sharing |
 | `run.R` | Orchestrates entire pipeline |
 | `DSMB_report.Rmd` | DSMB report (enrollment, CONSORT, demographics) |
 | `Enrollment_checks.Rmd` | Bi-weekly recruitment + eligibility tables |
@@ -248,3 +251,47 @@ rmarkdown::render("RMarkdown/Enrollment_checks.Rmd")
 ```
 
 **Outputs** appear in `OUT_DIR`, and reports in `RMarkdown/`.  
+
+---
+
+## 14) Pulling Updates 
+
+
+**What are you updating?**
+• **Code updates (new scripts, fixes)**: pull from Git (see below).
+• **Data refresh (new REDCap records)**: just re-run the pipeline; no Git pull needed.
+
+### A) If you have no local edits
+
+In your **Terminal**
+
+```bash
+git checkout main        # or the branch you use
+git pull origin main
+```
+
+**OR**
+
+In **RStudio** open the project → **Git** pane (top right pane) → Pull
+
+### B) If you have local changes
+
+#### Option 1:  Commit, then pull
+
+In your **Terminal**
+
+```bash
+git add -A
+git commit -m "WIP: local changes"
+git pull --rebase origin main   # or: git pull origin main
+```
+
+#### Option 2:  Temporarily stash
+
+In your **Terminal**
+
+```bash
+git stash push -m "local WIP"
+git pull --rebase origin main
+git stash pop                   # re-apply your changes
+```
