@@ -48,6 +48,38 @@ coalesce_columns <- function(data,
   dplyr::coalesce(!!!as.list(vals))
 }
 
+add_coalesced_column <- function(data,
+                                 regex  = "ps[0-9]{2}_",
+                                 keyword,
+                                 out    = paste0("coalesced_", keyword),
+                                 treat_zero_as_missing = TRUE) {
+  pat  <- paste0(regex, ".*", keyword, "$")
+  cols <- grep(pat, names(data), value = TRUE, perl = TRUE)
+  
+  if (!length(cols)) {
+    data[[out]] <- NA
+    return(data)
+  }
+  
+  vals <- data[cols]
+  
+  # prep only for the calculation; originals in `data` untouched
+  prep <- lapply(vals, function(x) {
+    y <- x
+    if (is.data.frame(y)) y <- if (ncol(y) == 1L) y[[1]] else y[[1]]
+    if (inherits(y, "haven_labelled") && requireNamespace("haven", quietly = TRUE)) y <- haven::zap_labels(y)
+    if (is.factor(y)) y <- as.character(y)
+    if (isTRUE(treat_zero_as_missing)) {
+      if (is.numeric(y))        y[y == 0] <- NA_real_
+      else if (is.character(y)) y[y %in% c("0", "")] <- NA_character_
+    }
+    y
+  })
+  
+  data[[out]] <- dplyr::coalesce(!!!prep)
+  data
+}
+
 # Safe CSV writer (readr if present; falls back to utils)
 # - Flattens embedded newlines in character fields so one record == one CSV row
 # - Uses CRLF line endings and double-quote escaping (Stata-friendly)

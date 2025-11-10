@@ -265,7 +265,9 @@ clean_caregiver <- function(dat_caregiver_raw){
       p_icf_name_2          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_2"),
       p_icf_name_3          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_3"),
       p_icf_name_4          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_4"),
-      p_icf_nih_share       = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "nih_share"),
+      p_icf_nih_share       = coalesce_columns(dplyr::cur_data_all(),
+                                               "icf(0[1-9]|1[0-7]|[2-9][0-9])_",  # excludes 18
+                                               "nih_share"),
       p_icf_name_5          = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "name_5"),
       p_icf_nih_first_name  = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "first_name"),
       p_icf_nih_middle_name = coalesce_columns(dplyr::cur_data_all(), "icf[0-9]{2}_", "middle_name"),
