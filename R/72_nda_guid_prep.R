@@ -39,14 +39,81 @@ nda_guid_prep_in_place <- function(out_dir,
   
   df <- readr::read_csv(pin, col_types = cols(.default = col_character()))
   
-  need <- c("record_id","site_id","merged_date",
-            "icf_nih_dob","p_icf_nih_dob","screen_dob",
-            "icf_nih_sex","p_icf_nih_sex","screen_sex",
-            "icf_nih_first_name","icf_nih_middle_name","icf_nih_last_name",
-            "youth_firstname","youth_lastname","first_name","last_name",
-            "p_youth_firstname","p_youth_lastname",
-            "icf_nih_city","p_icf_nih_city",
-            "icf_nih_share","p_icf_nih_share","over_18")
+  # extra variables you want carried into final CSV
+  extra_vars <- c(
+    "screen_age",
+    "screen_doe",
+    "screen_sex",
+    "follow_age_3m",
+    "follow_visitdate_3m",
+    "cde1_1_3m",
+    "cde1_2_3m",
+    "cde1_3_3m",
+    "cde1_4_3m",
+    "cdeh_1_3m",
+    "cdeh_2_3m",
+    "followup_age_6m",
+    "follow_visitdate_6m",
+    "cdeocd1_5_6m",
+    "cdeocd1_4_6m",
+    "cdeocd1_1_6m",
+    "cdeocd1_2_6m",
+    "cdeocd1_3_6m",
+    "cde_2_b",
+    "cde_7_b",
+    "cdef_1_b",
+    "cde_1_b",
+    "cdef_7_b",
+    "cdef_2_b",
+    "cdef_6_b",
+    "cde_3_b",
+    "cdef_3_b",
+    "cde_6_b",
+    "cde_4_b",
+    "cdehr_2_6m",
+    "cdef_4_b",
+    "cde_5_b",
+    "cdef_5_b",
+    "cde_8_b",
+    "cdef_8_b",
+    "cde2_2_3m",
+    "cde2_7_3m",
+    "cde2_1_3m",
+    "cde2_3_3m",
+    "cde2_6_3m",
+    "cde2_4_3m",
+    "cded_1_3m",
+    "cde2_5_3m",
+    "cde2_8_3m",
+    "cde2_2_6m",
+    "cde2_7_6m",
+    "cde2_1_6m",
+    "cde2_3_6m",
+    "cde2_6_6m",
+    "cdehr_1_6m",
+    "cdeocd2_1_6m",
+    "cde2_4_6m",
+    "cdehr_4_6m",
+    "cdeocd2_3_6m",
+    "cdehr_3_6m",
+    "cde2_5_6m",
+    "cdeocd2_2_6m",
+    "cde2_8_6m"
+  )
+  
+  # core variables needed for logic
+  need_core <- c(
+    "record_id","site_id","merged_date",
+    "icf_nih_dob","p_icf_nih_dob","screen_dob",
+    "icf_nih_sex","p_icf_nih_sex","screen_sex",
+    "icf_nih_first_name","icf_nih_middle_name","icf_nih_last_name",
+    "youth_firstname","youth_lastname","first_name","last_name",
+    "p_youth_firstname","p_youth_lastname",
+    "icf_nih_city","p_icf_nih_city",
+    "icf_nih_share","p_icf_nih_share","over_18"
+  )
+  
+  need <- c(need_core, extra_vars)
   miss <- setdiff(need, names(df)); if(length(miss)) stop("Missing: ", paste(miss, collapse=", "))
   
   # ----- consent flags (0/1) -----
@@ -102,11 +169,17 @@ nda_guid_prep_in_place <- function(out_dir,
   # sex must be 1/2/blank
   out$icf_nih_sex[!(out$icf_nih_sex %in% c("1","2"))] <- ""
   
-  # order columns exactly as requested
+  # add empty GUID column for NDA tool (must be first in final CSV)
+  out$GUID <- ""
+  
+  # order columns exactly as requested, with GUID first,
+  # then core PII, then all the extra_vars in the order you listed
   final_cols <- c(
+    "GUID",
     "record_id","site_id","nda_share_any","icf_nih_share","p_icf_nih_share","over_18",
     "icf_nih_first_name","icf_nih_middle_name","icf_nih_last_name",
-    "icf_nih_dob","icf_nih_sex","icf_nih_city"
+    "icf_nih_dob","icf_nih_sex","icf_nih_city",
+    extra_vars
   )
   miss_out <- setdiff(final_cols, names(out)); if(length(miss_out)) stop("Missing output columns: ", paste(miss_out, collapse=", "))
   out <- out[, final_cols, drop=FALSE]

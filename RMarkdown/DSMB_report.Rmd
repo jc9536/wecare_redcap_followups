@@ -23,7 +23,7 @@ theme_set(theme_minimal(base_size = 13))
 # ---------- USER INPUTS ----------
 OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
 csv_path  <- file.path(OUT_DIR, "dat_merged.csv")
-DATA_LOCK <- as.Date("2025-10-01")  # used in some filters; update as needed
+DATA_LOCK <- as.Date("2025-11-20")  # used in some filters; update as needed
 
 # ---------- HELPERS ----------
 na_empty <- function(x) replace(x, is.na(x) | x %in% c("NA",""), NA)
@@ -764,6 +764,19 @@ count3_strict <- function(df){
   missed    <- sum(in_scope & (LOCK >  df$max3) & not_comp_or_exit3(df), na.rm = TRUE)
 
   total <- sum(in_scope, na.rm = TRUE)    # your definition
+  
+  # --- DEBUG: inspect any rows that are in_scope but not in a bucket ----
+  bucket_flag <- logical(nrow(df))
+  bucket_flag[in_scope & df$status3 == "Completed"]  <- TRUE
+  bucket_flag[in_scope & not_comp_or_exit3(df) & !is.na(df$max3)] <- TRUE
+  # If you have an explicit 6m exit status, add it as another flag
+
+  bad_rows <- df[in_scope & !bucket_flag, ]
+  if (nrow(bad_rows) > 0) {
+    message("Rows in 3m total that do not fall into any bucket:")
+    print(bad_rows |> dplyr::select(record_id, min3, max3, status3))
+  }
+  
   stopifnot(total == completed + active + missed + exited)
   list(total=total, completed=completed, active=active, missed=missed, exited=exited)
 }
@@ -772,12 +785,26 @@ count6_strict <- function(df){
   in_scope <- !is.na(df$min6) & df$min6 <= LOCK
 
   completed <- sum(in_scope & df$status6 == "Completed",  na.rm = TRUE)
-  exited    <- 0L  # 3m withdrawals were removed already
+  exited    <- sum(in_scope & df$status6 == "Withdrawal", na.rm = TRUE)
   active    <- sum(in_scope & (LOCK <= df$max6) & not_comp_or_exit6(df), na.rm = TRUE)
   missed    <- sum(in_scope & (LOCK >  df$max6) & not_comp_or_exit6(df), na.rm = TRUE)
 
-  total <- sum(in_scope, na.rm = TRUE)    # your definition
+  total <- sum(in_scope, na.rm = TRUE)
+
+  # --- DEBUG: inspect any rows that are in_scope but not in a bucket ----
+  bucket_flag <- logical(nrow(df))
+  bucket_flag[in_scope & df$status6 == "Completed"]  <- TRUE
+  bucket_flag[in_scope & not_comp_or_exit6(df) & !is.na(df$max6)] <- TRUE
+  # If you have an explicit 6m exit status, add it as another flag
+
+  bad_rows <- df[in_scope & !bucket_flag, ]
+  if (nrow(bad_rows) > 0) {
+    message("Rows in 6m total that do not fall into any bucket:")
+    print(bad_rows |> dplyr::select(record_id, min6, max6, status6))
+  }
+
   stopifnot(total == completed + active + missed + exited)
+
   list(total=total, completed=completed, active=active, missed=missed, exited=exited)
 }
 

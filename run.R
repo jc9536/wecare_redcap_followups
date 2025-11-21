@@ -64,6 +64,10 @@ ensure_pkgs(c("REDCapR","dplyr","janitor","readr"))
 
 # Pipeline steps
 source("R/10_fetch_redcap.R")
+
+# NEW: Coalesce audit (youth) – runs on raw export
+source("R/19_youth_coalesce_audit.R")
+
 source("R/20_baseline_cleaning.R")
 source("R/30_followups_attach.R")
 source("R/35_followups_export_audits.R")
@@ -117,6 +121,13 @@ export_followup_csvs(
   outdir = file.path(CHECKS_DIR, "followups")
 )
 
+# --- 3.4) Youth baseline coalesce audit (runs on RAW) ------------------------
+# Requires helpers you added (coalesce_check_frame / write_all_youth_coalesce_checks)
+# and the same coalesce_columns() used by cleaning.
+
+message("🧪 Writing youth baseline coalesce QC files ...")
+qc_dir_y <- file.path(CHECKS_DIR, "baseline_coalesce", "youth", format(Sys.Date(), "%Y%m%d"))
+write_all_youth_coalesce_checks(youth_base_raw, out_dir = qc_dir_y)
 
 # --- 4) Clean baselines (one row per ID; canonical keys) ---------------------
 # Uses legacy cleaners if present; otherwise uses hardened defaults.

@@ -23,7 +23,7 @@ library(gt)
 ```{r message=FALSE, warning=FALSE}
 # ========================= USER INPUTS ======================
 # File
-OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
+OUT_DIR   <- OUT_DIR %||% "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New ETL Output"   # if OUT_DIR not set
 csv_path  <- file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
 
 # Which datasets to run?
@@ -32,18 +32,17 @@ RUN_LOCKED  <- TRUE
 
 # Which tables to render?
 SHOW_ENROLL          <- TRUE
+SHOW_ENROLL_WEEKLY   <- TRUE
 SHOW_FOLLOWUP        <- TRUE     # outreach summary (3m/6m)
 SHOW_OUTREACH_WEEKLY <- TRUE
 SHOW_OUTREACH_DAILY  <- TRUE
 
 # Labels / dates / targets
-DATA_LOCK  <- as.Date("2025-10-15")
-AS_OF_DATE <- as.Date("2025-10-29")
-TARGET_H   <- 345
-TARGET_K   <- 630
+DATA_LOCK  <- as.Date("2025-10-31")
+AS_OF_DATE <- as.Date("2025-11-17")
 
 # Weeks to include (any day inside the week is fine)
-WEEKS_INPUT <- as.Date(c("2025-09-22","2025-09-29","2025-10-06","2025-10-17", "2025-10-29"))
+WEEKS_INPUT <- as.Date(c("2025-10-30", "2025-11-03", "2025-11-12", "2025-11-17"))
 
 # 3m/6m “active if unscheduled but sched_min < cutoff” (Stata td(30sep2025))
 CUTOFF_3M <- as.Date("2025-09-30")
@@ -226,6 +225,223 @@ as_date_guess <- function(x,
 }
 ```
 
+# Projections Table + Weekday-based target calculator 
+```{r}
+# ==== PROJECTIONS TABLE (cumulative by site; BEGINNING of month anchors) ====
+projections <- tibble::tribble(
+  ~end_date,           ~Harlem, ~Kings,
+  as.Date("2022-12-01"),   0,      0,
+  as.Date("2023-04-01"),   0,      0,
+  as.Date("2023-08-01"),   0,      0,
+  as.Date("2023-12-01"),   0,      0,
+  as.Date("2024-04-01"),   0,      0,
+  as.Date("2024-08-01"),   0,     60,
+  as.Date("2024-12-01"),  60,    160,
+  as.Date("2025-04-01"), 135,    280,
+  as.Date("2025-08-01"), 275,    497,
+  as.Date("2025-12-01"), 415,    714,   # << December is 12/01
+  as.Date("2026-04-01"), 555,    931,
+  as.Date("2026-08-01"), 695,   1148,
+  as.Date("2026-12-01"), 836,   1364,
+  as.Date("2027-04-01"), 836,   1364
+) %>% mutate(Total = Harlem + Kings)
+
+# Quarter/term start that leads to each reporting endpoint
+period_start_for <- function(end_date) {
+  m <- lubridate::month(end_date); y <- lubridate::year(end_date)
+  if      (m == 4)  as.Date(sprintf("%04d-01-01", y))  # Jan–Apr -> Apr 30 end
+  else if (m == 8)  as.Date(sprintf("%04d-05-01", y))  # May–Aug -> Aug 31 end
+  else if (m == 12) as.Date(sprintf("%04d-09-01", y))  # Sep–Dec -> Dec 31 end
+  else              stop("Unexpected anchor month in projections.")
+}
+
+# --- helpers to compute nth/last weekday of a month ---
+nth_wday <- function(year, month, wday_target, n, week_start = 1L) {
+  # wday_target: 1=Mon ... 7=Sun when week_start=1
+  first <- as.Date(sprintf("%04d-%02d-01", year, month))
+  # day-of-week for the 1st of month under Monday=1
+  w1 <- lubridate::wday(first, week_start = week_start)
+  # days to add to reach first target weekday
+  offset <- (wday_target - w1) %% 7
+  first_target <- first + offset
+  first_target + 7L * (n - 1L)
+}
+last_wday <- function(year, month, wday_target, week_start = 1L) {
+  last <- lubridate::ceiling_date(as.Date(sprintf("%04d-%02d-01", year, month)), "month") - 1
+  w_last <- lubridate::wday(last, week_start = week_start)
+  offset <- (w_last - wday_target) %% 7
+  last - offset
+}
+
+# --- observed date for fixed-date holidays (Sat -> Fri, Sun -> Mon) ---
+observe_fixed_us <- function(d) {
+  wd <- lubridate::wday(d, week_start = 1L) # Mon=1 ... Sun=7
+  if (wd == 6L) d - 1L else if (wd == 7L) d + 1L else d
+}
+
+# --- US federal holidays (observed) for a year ---
+us_federal_holidays <- function(year) {
+  # floating mondays
+  mlk        <- nth_wday(year, 1, 1, 3)   # 3rd Mon in Jan
+  presidents <- nth_wday(year, 2, 1, 3)   # 3rd Mon in Feb
+  memorial   <- last_wday(year, 5, 1)     # last Mon in May
+  labor      <- nth_wday(year, 9, 1, 1)   # 1st Mon in Sep
+  columbus   <- nth_wday(year, 10, 1, 2)  # 2nd Mon in Oct
+  thanks     <- nth_wday(year, 11, 4, 4)  # 4th Thu in Nov (Thu=4)
+
+  # fixed dates (observed)
+  newyrs     <- observe_fixed_us(as.Date(sprintf("%04d-01-01", year)))
+  juneteenth <- observe_fixed_us(as.Date(sprintf("%04d-06-19", year)))
+  july4      <- observe_fixed_us(as.Date(sprintf("%04d-07-04", year)))
+  veterans   <- observe_fixed_us(as.Date(sprintf("%04d-11-11", year)))
+  xmas       <- observe_fixed_us(as.Date(sprintf("%04d-12-25", year)))
+
+  sort(unique(c(newyrs, mlk, presidents, memorial, juneteenth, july4,
+                labor, columbus, veterans, thanks, xmas)))
+}
+
+# --- holidays within [start, end] (inclusive) across all years spanned ---
+us_holidays_between <- function(start, end) {
+  if (is.na(start) || is.na(end) || end < start) return(as.Date(character()))
+  yrs <- seq(lubridate::year(start), lubridate::year(end), by = 1L)
+  hol <- unlist(lapply(yrs, us_federal_holidays), use.names = FALSE)
+  hol[hol >= start & hol <= end]
+}
+
+# --- business days excluding U.S. federal holidays (observed) ---
+bizdays_ex_us_holidays <- function(start, end, closed_interval = TRUE) {
+  if (is.na(start) || is.na(end) || end < start) return(0L)
+  rng <- seq.Date(start, end, by = "day")
+  if (!closed_interval && length(rng) > 0) rng <- head(rng, -1L)  # [start, end)
+  wk <- lubridate::wday(rng, week_start = 1L) <= 5L               # Mon–Fri
+  hol <- us_holidays_between(min(rng), max(rng))
+  sum(wk & !(rng %in% hol))
+}
+
+# Interpolate cumulative targets for AS_OF_DATE using business days excluding US holidays
+calc_targets_asof <- function(as_of_date,
+                              closed_interval = TRUE,
+                              round_sites = TRUE) {
+
+  # choose the next projection row on/after the as_of_date
+  row_next <- projections %>% dplyr::filter(end_date >= as_of_date) %>% dplyr::slice_head(n = 1)
+  if (nrow(row_next) == 0) row_next <- projections %>% dplyr::slice_tail(n = 1)
+
+  idx_next <- which(projections$end_date == row_next$end_date)[1]
+  row_prev <- if (idx_next > 1) projections[idx_next - 1, ] else projections[1, ]
+
+  start_date <- period_start_for(row_next$end_date)
+
+  # business-day fractions (Mon–Fri, excluding US federal holidays)
+  num_bd <- bizdays_ex_us_holidays(start_date, as_of_date,  closed_interval = closed_interval)
+  den_bd <- bizdays_ex_us_holidays(start_date, row_next$end_date, closed_interval = TRUE)
+  frac   <- if (den_bd > 0) pmin(pmax(num_bd / den_bd, 0), 1) else 0
+
+  # interpolate by site (cumulative)
+  H <- row_prev$Harlem + (row_next$Harlem - row_prev$Harlem) * frac
+  K <- row_prev$Kings  + (row_next$Kings  - row_prev$Kings ) * frac
+  T <- row_prev$Total  + (row_next$Total  - row_prev$Total ) * frac
+
+  if (round_sites) {
+    H_r <- round(H); K_r <- round(K); T_r <- round(T)
+    # keep site sum aligned with rounded total
+    adj <- T_r - (H_r + K_r)
+    if (adj != 0) {
+      frac_parts <- c(H - floor(H), K - floor(K))
+      if (frac_parts[1] >= frac_parts[2]) H_r <- H_r + adj else K_r <- K_r + adj
+    }
+    dplyr::tibble(
+      as_of_date, start_date, end_date = row_next$end_date,
+      business_days_elapsed = num_bd,
+      business_days_total   = den_bd,
+      fraction_elapsed      = frac,
+      Harlem_target = H_r, Kings_target = K_r, Total_target = H_r + K_r,
+      Harlem_raw = H, Kings_raw = K, Total_raw = T
+    )
+  } else {
+    dplyr::tibble(
+      as_of_date, start_date, end_date = row_next$end_date,
+      business_days_elapsed = num_bd,
+      business_days_total   = den_bd,
+      fraction_elapsed      = frac,
+      Harlem_target = H, Kings_target  = K, Total_target  = T
+    )
+  }
+}
+
+# ---------- Week bounds (Mon..Sun) ----------
+week_bounds <- function(any_date) {
+  mon <- lubridate::floor_date(as.Date(any_date), "week", week_start = 1)
+  tibble::tibble(week_mon = mon, week_sun = mon + lubridate::days(6))
+}
+
+# ---------- Weekly target delta from projections ----------
+# Returns the *incremental* target for that week (not cumulative):
+#   target(week_sun) - target(week_mon - 1)
+weekly_target_for_week <- function(week_mon) {
+  wb <- week_bounds(week_mon)
+  t_end  <- calc_targets_asof(wb$week_sun, closed_interval = TRUE, round_sites = TRUE)
+  t_prev <- calc_targets_asof(wb$week_mon - 1L, closed_interval = TRUE, round_sites = TRUE)
+
+  tibble::tibble(
+    week_mon,
+    tgt_H_week = as.integer(t_end$Harlem_target - t_prev$Harlem_target),
+    tgt_K_week = as.integer(t_end$Kings_target  - t_prev$Kings_target),
+    tgt_T_week = as.integer(t_end$Total_target  - t_prev$Total_target)
+  )
+}
+
+# ---------- Weekly Enrollment table (Actuals vs Target) ----------
+# Uses merged_date as the authoritative enrollment date
+weekly_enrollment_table <- function(df, weeks_input, as_of_date, label) {
+  dd <- df %>%
+    dplyr::mutate(
+      site_norm   = site_id_from(site_id, coalesce_chr(participant_id, p_participant_id)),
+      enroll_date = to_date_smart(merged_date)
+    ) %>%
+    dplyr::filter(
+      !is.na(treatment),                 # enrolled only
+      !is.na(site_norm),
+      !is.na(enroll_date),
+      enroll_date <= as_of_date,         # respect as-of cut
+      lubridate::wday(enroll_date, week_start = 1) <= 5L  # Mon–Fri only
+    )
+
+  rows <- lapply(weeks_input, function(w) {
+    wb <- week_bounds(w)
+    # actuals this week
+    cnt <- dd %>%
+      dplyr::filter(enroll_date >= wb$week_mon, enroll_date <= wb$week_sun) %>%
+      dplyr::count(site_norm, name = "n") %>%
+      tidyr::pivot_wider(names_from = site_norm, values_from = n, values_fill = 0)
+    H <- if ("H" %in% names(cnt)) cnt$H[1] else 0L
+    K <- if ("K" %in% names(cnt)) cnt$K[1] else 0L
+    T <- H + K
+
+    # target deltas this week
+    tdelta <- weekly_target_for_week(wb$week_mon)
+
+    tibble::tibble(
+      `Week of:`          = format(wb$week_mon, "%m/%d/%Y"),
+      Harlem              = as.integer(H),
+      Kings               = as.integer(K),
+      Total               = as.integer(T),
+      `Target Harlem`     = tdelta$tgt_H_week,
+      `Target Kings`      = tdelta$tgt_K_week,
+      `Target Total`      = tdelta$tgt_T_week
+    )
+  }) %>% dplyr::bind_rows() %>%
+    dplyr::arrange(dplyr::desc(as.Date(`Week of:`, format = "%m/%d/%Y")))
+
+  gt::gt(rows) %>%
+    gt::tab_header(
+      title = gt::md(paste0("**Weekly Enrollment vs Target**<br>",
+                            "<span style='font-size:12px'>", label, "</span>"))
+    ) %>%
+    gt::fmt_number(columns = c(Harlem, Kings, Total, `Target Harlem`, `Target Kings`, `Target Total`), decimals = 0)
+}
+```
+
 # 4) Load & Clean the Dataset 
 ```{r message=FALSE, warning=FALSE}
 # ========================= LOAD + CLEAN =====================
@@ -267,6 +483,113 @@ raw <- raw |>
 locked_df <- raw |> filter(merged_date <= DATA_LOCK)
 ```
 
+```{r}
+# ========================= SOGI NUMERIC CLEANING ======================
+raw <- raw |>
+  mutate(
+    treatment              = suppressWarnings(as.integer(as.character(treatment))),
+    cassy_result           = suppressWarnings(as.integer(as.character(cassy_result))),
+    giso_gender_identity_b = suppressWarnings(as.integer(as.character(giso_gender_identity_b))),
+    giso_trans_b           = suppressWarnings(as.integer(as.character(giso_trans_b))),
+    giso_sex_orient_b      = suppressWarnings(as.integer(as.character(giso_sex_orient_b)))
+  )
+
+# ========================= LGBTQ+ FLAG (UPDATED FOR ADAM) ======================
+is_lgbtq_sogi <- function(gender_code, trans_code, orient_code) {
+  gender_code <- as.integer(gender_code)
+  trans_code  <- as.integer(trans_code)
+  orient_code <- as.integer(orient_code)
+
+  # Non-informative / "skip" codes
+  # 77 = don't know what this question is asking/means
+  # 99 = do not want to answer
+  noninfo_codes <- c(77L, 99L)
+
+  # --- Sexual minority ---
+  # 2–7 = Gay/Lesbian/Bi/Queer/Pan/Ace
+  # 66  = I am not sure or questioning        -> LGBTQ+
+  # 88  = I do not identify as any of these  -> LGBTQ+
+  orient_minority <- orient_code %in% c(2L, 3L, 4L, 5L, 6L, 7L, 66L, 88L)
+
+  # --- Gender minority ---
+  # Assume:
+  #   3,4,5 = Nonbinary / Genderfluid / Genderqueer
+  #   66    = I am not sure or questioning        -> LGBTQ+
+  #   88    = I do not identify as any of these  -> LGBTQ+
+  gender_minority <- gender_code %in% c(3L, 4L, 5L, 66L, 88L)
+
+  # --- Trans / questioning trans ---
+  # 1  = Yes, I am transgender
+  # 66 = I am not sure yet or I am questioning if I am transgender -> LGBTQ+
+  trans_minority <- trans_code %in% c(1L, 66L)
+
+  lgbtq <- orient_minority | gender_minority | trans_minority
+
+  # If ALL three are non-informative / missing, set to NA (unknown SOGI)
+  all_noninfo <- (is.na(gender_code) | gender_code %in% noninfo_codes) &
+                 (is.na(trans_code)  | trans_code  %in% noninfo_codes) &
+                 (is.na(orient_code) | orient_code %in% noninfo_codes)
+
+  lgbtq[all_noninfo] <- NA
+
+  lgbtq
+}
+
+# ========================= SIMPLE CASSY x LGBTQ+ SUMMARY ======================
+cass_sogi <- raw %>%
+  mutate(
+    lgbtq = is_lgbtq_sogi(
+      giso_gender_identity_b,
+      giso_trans_b,
+      giso_sex_orient_b
+    )
+  )
+
+total_n <- nrow(cass_sogi)
+
+# 1) Total number of CASSY+ in dat_merged
+total_cassy_plus <- sum(cass_sogi$cassy_result == 1, na.rm = TRUE)
+
+# 2) Total number of LGBTQ+ in dat_merged
+total_lgbtq <- sum(cass_sogi$lgbtq == TRUE, na.rm = TRUE)
+
+# 3) Among LGBTQ+ with non-missing CASSY:
+#    how many & % who are CASSY+ / NOT CASSY+
+lgbtq_with_cassy <- cass_sogi %>%
+  filter(lgbtq == TRUE, !is.na(cassy_result))
+
+n_lgbtq_cassy_plus <- sum(lgbtq_with_cassy$cassy_result == 1)
+n_lgbtq_not_cassy  <- sum(lgbtq_with_cassy$cassy_result != 1)
+
+den_lgbtq_valid <- nrow(lgbtq_with_cassy)
+
+summary_tbl <- tibble::tribble(
+  ~Metric,                                ~N,                     ~Percent,
+  "Total CASSY+ in sample",               total_cassy_plus,       100 * total_cassy_plus / total_n,
+  "Total LGBTQ+ in sample",               total_lgbtq,            100 * total_lgbtq / total_n,
+  "LGBTQ+ who are CASSY+",                n_lgbtq_cassy_plus,     100 * n_lgbtq_cassy_plus / den_lgbtq_valid,
+  "LGBTQ+ who are NOT CASSY+",            n_lgbtq_not_cassy,      100 * n_lgbtq_not_cassy  / den_lgbtq_valid
+)
+
+lgbtq_cassy_simple_gt <- summary_tbl %>%
+  gt::gt() %>%
+  gt::fmt_number(columns = "Percent", decimals = 1) %>%
+  gt::tab_header(
+    title = gt::md("**CASSY+ and LGBTQ+ Summary (dat_merged.csv)**")
+  ) %>%
+  gt::tab_footnote(
+    footnote = "Percent for last two rows is within LGBTQ+ youth with a non-missing CASSY result.",
+    locations = gt::cells_body(rows = 3:4, columns = "Percent")
+  )
+
+# If you are using emit_gt() helper in your Rmd:
+if (exists("emit_gt")) {
+  emit_gt(lgbtq_cassy_simple_gt)
+} else {
+  lgbtq_cassy_simple_gt
+}
+```
+
 # 5) Build Tables 
 ```{r warning=FALSE, message=FALSE}
 # ========================= TABLE BUILDERS ===================
@@ -300,6 +623,30 @@ count_outreach <- function(dd, var) {
     mutate(Total = H + K) %>%
     rename(Item = cat)
 }
+
+# AUTO-COMPUTE TARGETS FROM PROJECTIONS USING WEEKDAYS ONLY
+# ---------- Targets for CURRENT and for DATA LOCK ----------
+tgt_current <- calc_targets_asof(AS_OF_DATE,  closed_interval = TRUE, round_sites = TRUE)
+TARGET_H_CURR <- tgt_current$Harlem_target
+TARGET_K_CURR <- tgt_current$Kings_target
+
+tgt_lock <- calc_targets_asof(DATA_LOCK, closed_interval = TRUE, round_sites = TRUE)
+TARGET_H_LOCK <- tgt_lock$Harlem_target
+TARGET_K_LOCK <- tgt_lock$Kings_target
+
+# (Optional) show both calculations
+print(
+  dplyr::bind_rows(
+    tgt_current %>% dplyr::mutate(which = "AS_OF_DATE"),
+    tgt_lock    %>% dplyr::mutate(which = "DATA_LOCK")
+  ) %>%
+    dplyr::select(which, as_of_date, start_date, end_date,
+                  business_days_elapsed, business_days_total, fraction_elapsed,
+                  Harlem_target, Kings_target, Total_target) %>%
+    gt::gt() %>%
+    gt::fmt_number(columns = c(fraction_elapsed), decimals = 4) %>%
+    gt::tab_header(title = gt::md("**Targets (Begin-of-Month, Weekdays excl. US Holidays)**"))
+)
 
 # Build event log (3m + 6m outreach columns → long)
 make_events <- function(df) {
@@ -369,7 +716,8 @@ build_all <- function(df,
                       want_enroll = TRUE,
                       want_fu     = TRUE,
                       want_weekly = TRUE,
-                      want_daily  = TRUE) {
+                      want_daily  = TRUE,
+                      want_enroll_weekly = TRUE) {
 
   out <- list()
 
@@ -468,52 +816,338 @@ build_all <- function(df,
       out$daily_gts <- lapply(weeks_input, function(w) daily_table_for_week(events, w, label))
     }
   }
+  
+    # ----- WEEKLY ENROLLMENT (Actuals vs Target) -----
+  if (want_enroll_weekly) {
+    out$weekly_enroll_gt <- weekly_enrollment_table(
+      df          = df,
+      weeks_input = weeks_input,
+      as_of_date  = as_of_date,
+      label       = label
+    )
+  }
 
   out
 }
 ```
 
 # Table Output 
-```{r warning=FALSE, message=FALSE}
+```{r warning=FALSE, message=FALSE, results='asis'}
 # ========================= RUN BUILDS =======================
+
+# Helper that ALWAYS emits a gt table
+emit_gt <- function(x) {
+  if (inherits(x, "gt_tbl")) {
+    cat(gt::as_raw_html(x), sep = "\n")
+    cat("\n")
+  }
+}
+
+# (Optional) show the targets comparison table first
+if (exists("targets_gt")) emit_gt(targets_gt)
 
 if (RUN_CURRENT) {
   current <- build_all(
     df          = raw,
     as_of_date  = AS_OF_DATE,
-    target_H    = TARGET_H,
-    target_K    = TARGET_K,
+    target_H    = TARGET_H_CURR,
+    target_K    = TARGET_K_CURR,
     weeks_input = WEEKS_INPUT,
     label       = "Current data",
     want_enroll = SHOW_ENROLL,
     want_fu     = SHOW_FOLLOWUP,
     want_weekly = SHOW_OUTREACH_WEEKLY,
-    want_daily  = SHOW_OUTREACH_DAILY
+    want_daily  = SHOW_OUTREACH_DAILY,
+    want_enroll_weekly = SHOW_ENROLL_WEEKLY
   )
 
-  if (SHOW_ENROLL)          print(current$enroll_gt)
-  if (SHOW_FOLLOWUP)       { print(current$fu3_gt); print(current$fu6_gt) }
-  if (SHOW_OUTREACH_WEEKLY) print(current$weekly_gt)
-  if (SHOW_OUTREACH_DAILY)  for (g in current$daily_gts) print(g)
+  if (SHOW_ENROLL)            emit_gt(current$enroll_gt)
+  if (SHOW_FOLLOWUP)        { emit_gt(current$fu3_gt); emit_gt(current$fu6_gt) }
+  if (SHOW_OUTREACH_WEEKLY)   emit_gt(current$weekly_gt)
+  if (SHOW_ENROLL_WEEKLY)     emit_gt(current$weekly_enroll_gt)
+  if (SHOW_OUTREACH_DAILY)    for (g in current$daily_gts) emit_gt(g)
 }
 
 if (RUN_LOCKED) {
+  weeks_for_lock <- WEEKS_INPUT[WEEKS_INPUT <= DATA_LOCK]
+
   locked <- build_all(
     df          = locked_df,
-    as_of_date  = AS_OF_DATE,
-    target_H    = TARGET_H,
-    target_K    = TARGET_K,
-    weeks_input = WEEKS_INPUT,
+    as_of_date  = DATA_LOCK,
+    target_H    = TARGET_H_LOCK,
+    target_K    = TARGET_K_LOCK,
+    weeks_input = if (length(weeks_for_lock)) weeks_for_lock else WEEKS_INPUT,
     label       = paste0("Data locked < ", format(DATA_LOCK, "%m/%d/%Y")),
     want_enroll = SHOW_ENROLL,
     want_fu     = SHOW_FOLLOWUP,
     want_weekly = SHOW_OUTREACH_WEEKLY,
-    want_daily  = SHOW_OUTREACH_DAILY
+    want_daily  = SHOW_OUTREACH_DAILY,
+    want_enroll_weekly = SHOW_ENROLL_WEEKLY
   )
 
-  if (SHOW_ENROLL)          print(locked$enroll_gt)
-  if (SHOW_FOLLOWUP)       { print(locked$fu3_gt); print(locked$fu6_gt) }
-  if (SHOW_OUTREACH_WEEKLY) print(locked$weekly_gt)
-  if (SHOW_OUTREACH_DAILY)  for (g in locked$daily_gts) print(g)
+  if (SHOW_ENROLL)            emit_gt(locked$enroll_gt)
+  if (SHOW_FOLLOWUP)        { emit_gt(locked$fu3_gt); emit_gt(locked$fu6_gt) }
+  if (SHOW_OUTREACH_WEEKLY)   emit_gt(locked$weekly_gt)
+  if (SHOW_ENROLL_WEEKLY)     emit_gt(locked$weekly_enroll_gt)
+  if (SHOW_OUTREACH_DAILY)    for (g in locked$daily_gts) emit_gt(g)
 }
+```
+
+```{r}
+# --- Inputs ---
+date_to_check <- as.Date("2025-10-28")
+
+ids_46 <- c(
+  "K-F0330","K-F0331","H-F0352","K-F0324","K-F0325","K-F0326","H-F0350","H-F0351",
+  "K-F0317","K-F0319","K-F0320","K-F0323","K-F0257","K-F0258","K-F0253","K-F0254",
+  "K-F0255","H-F0325","K-F0251","H-F0323","K-F0248","K-F0249","K-F0250","H-F0319",
+  "K-F0244","K-F0238","H-F0313","H-F0314","K-F0233","H-F0311","K-F0230","K-F0232",
+  "H-F0306","K-F0226","H-F0304","K-F0222","H-F0300","K-F0216","K-F0219","K-F0213",
+  "K-F0214","H-F0294","K-F0212","H-F0279","H-F0267","H-F0273"
+)
+
+# --- Columns (exactly like your make_events) ---
+cols_3m <- intersect(
+  c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m")),
+  names(raw)
+)
+
+# --- Long frame of ALL 3m instances on the target date (no dedupe) ---
+# relies on your helpers: coalesce_chr(), as_date_guess()
+long3 <- raw %>%
+  mutate(
+    id_full    = coalesce_chr(record_id, participant_id, p_participant_id),
+    id7        = stringr::str_sub(id_full, 1, 7),
+    sch_min_3m = as_date_guess(follow_sch_min_3m),
+    sch_max_3m = as_date_guess(follow_sch_max_3m)
+  ) %>%
+  select(id7, id_full, site_id, sch_min_3m, sch_max_3m, all_of(cols_3m)) %>%
+  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "raw") %>%
+  mutate(date = as_date_guess(raw)) %>%
+  filter(!is.na(date), date == date_to_check)
+
+# 1) TOTAL INSTANCES (cells) — should match your table number (e.g., 53)
+total_instances <- nrow(long3)
+cat("Total 3m instances on", format(date_to_check, "%Y-%m-%d"), "=", total_instances, "\n")
+
+# 2) EXTRA IDs (present in instances but not in your 46-list)
+extra_ids <- setdiff(unique(long3$id7), ids_46)
+
+# For context, gather ALL 3m dates for those extra IDs (from the wide row)
+all_dates_for_extra <- raw %>%
+  mutate(
+    id_full = coalesce_chr(record_id, participant_id, p_participant_id),
+    id7     = stringr::str_sub(id_full, 1, 7)
+  ) %>%
+  select(id7, all_of(cols_3m)) %>%
+  filter(id7 %in% extra_ids) %>%
+  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "dt") %>%
+  mutate(dt = as_date_guess(dt)) %>%
+  filter(!is.na(dt)) %>%
+  group_by(id7) %>%
+  summarise(
+    outreach_dates_all_3m = paste(sort(unique(format(dt, "%Y-%m-%d"))), collapse = "; "),
+    .groups = "drop"
+  )
+
+# Build the extra-IDs table for the target date
+extra_table <- long3 %>%
+  filter(id7 %in% extra_ids) %>%
+  mutate(
+    in_window = (is.na(sch_min_3m) | date >= sch_min_3m) &
+                (is.na(sch_max_3m) | date <= sch_max_3m)
+  ) %>%
+  group_by(id7, site_id, sch_min_3m, sch_max_3m) %>%
+  summarise(
+    hits_on_date  = n(),                                  # how many cells fired on this date
+    outreach_cols = paste(sort(unique(var)), collapse=", "),
+    .groups = "drop"
+  ) %>%
+  left_join(all_dates_for_extra, by = "id7") %>%
+  arrange(id7)
+
+extra_table
+```
+
+```{r}
+# --- Inputs ---
+date_to_check <- as.Date("2025-10-29")
+
+ids_46 <- c(
+  "K-F0397","K-F0394","K-F0383","K-F0384","K-F0362","K-F0336",
+  "H-F0356","H-F0354","K-F0329","K-F0301","K-F0280","K-F0283",
+  "K-F0274","H-F0329","K-F0265","K-F0266","K-F0260","K-F0263",
+  "K-F0256","K-F0239"
+)
+
+# --- Columns (exactly like your make_events) ---
+cols_3m <- intersect(
+  c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m")),
+  names(raw)
+)
+
+# --- Long frame of ALL 3m instances on the target date (no dedupe) ---
+# relies on your helpers: coalesce_chr(), as_date_guess()
+long3 <- raw %>%
+  mutate(
+    id_full    = coalesce_chr(record_id, participant_id, p_participant_id),
+    id7        = stringr::str_sub(id_full, 1, 7),
+    sch_min_3m = as_date_guess(follow_sch_min_3m),
+    sch_max_3m = as_date_guess(follow_sch_max_3m)
+  ) %>%
+  select(id7, id_full, site_id, sch_min_3m, sch_max_3m, all_of(cols_3m)) %>%
+  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "raw") %>%
+  mutate(date = as_date_guess(raw)) %>%
+  filter(!is.na(date), date == date_to_check)
+
+# 1) TOTAL INSTANCES (cells) — should match your table number (e.g., 53)
+total_instances <- nrow(long3)
+cat("Total 3m instances on", format(date_to_check, "%Y-%m-%d"), "=", total_instances, "\n")
+
+# 2) EXTRA IDs (present in instances but not in your 46-list)
+extra_ids <- setdiff(unique(long3$id7), ids_46)
+
+# For context, gather ALL 3m dates for those extra IDs (from the wide row)
+all_dates_for_extra <- raw %>%
+  mutate(
+    id_full = coalesce_chr(record_id, participant_id, p_participant_id),
+    id7     = stringr::str_sub(id_full, 1, 7)
+  ) %>%
+  select(id7, all_of(cols_3m)) %>%
+  filter(id7 %in% extra_ids) %>%
+  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "dt") %>%
+  mutate(dt = as_date_guess(dt)) %>%
+  filter(!is.na(dt)) %>%
+  group_by(id7) %>%
+  summarise(
+    outreach_dates_all_3m = paste(sort(unique(format(dt, "%Y-%m-%d"))), collapse = "; "),
+    .groups = "drop"
+  )
+
+# Build the extra-IDs table for the target date
+extra_table <- long3 %>%
+  filter(id7 %in% extra_ids) %>%
+  mutate(
+    in_window = (is.na(sch_min_3m) | date >= sch_min_3m) &
+                (is.na(sch_max_3m) | date <= sch_max_3m)
+  ) %>%
+  group_by(id7, site_id, sch_min_3m, sch_max_3m) %>%
+  summarise(
+    hits_on_date  = n(),                                  # how many cells fired on this date
+    outreach_cols = paste(sort(unique(var)), collapse=", "),
+    .groups = "drop"
+  ) %>%
+  left_join(all_dates_for_extra, by = "id7") %>%
+  arrange(id7)
+
+extra_table
+```
+
+```{r}
+# --- Inputs ---
+date_to_check <- as.Date("2025-10-21")
+
+ids_46 <- c(
+  "K-F0418","K-F0413","K-F0414","K-F0412","K-F0409","K-F0407","K-F0403","K-F0404",
+  "K-F0406","K-F0399","K-F0400","K-F0396","K-F0397","K-F0394","K-F0388","K-F0383",
+  "K-F0384","K-F0378","K-F0375","K-F0376","K-F0377","K-F0373","K-F0369","K-F0371",
+  "K-F0362","K-F0363","K-F0329","K-F0314","H-F0271","H-F0253"
+)
+
+# --- Columns (exactly like your make_events) ---
+cols_3m <- intersect(
+  c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m")),
+  names(raw)
+)
+
+# --- Long frame of ALL 3m instances on the target date (no dedupe) ---
+# relies on your helpers: coalesce_chr(), as_date_guess()
+long3 <- raw %>%
+  mutate(
+    id_full    = coalesce_chr(record_id, participant_id, p_participant_id),
+    id7        = stringr::str_sub(id_full, 1, 7),
+    sch_min_3m = as_date_guess(follow_sch_min_3m),
+    sch_max_3m = as_date_guess(follow_sch_max_3m)
+  ) %>%
+  select(id7, id_full, site_id, sch_min_3m, sch_max_3m, all_of(cols_3m)) %>%
+  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "raw") %>%
+  mutate(date = as_date_guess(raw)) %>%
+  filter(!is.na(date), date == date_to_check)
+
+# 1) TOTAL INSTANCES (cells) — should match your table number (e.g., 53)
+total_instances <- nrow(long3)
+cat("Total 3m instances on", format(date_to_check, "%Y-%m-%d"), "=", total_instances, "\n")
+
+# 2) EXTRA IDs (present in instances but not in your 46-list)
+extra_ids <- setdiff(unique(long3$id7), ids_46)
+
+# For context, gather ALL 3m dates for those extra IDs (from the wide row)
+all_dates_for_extra <- raw %>%
+  mutate(
+    id_full = coalesce_chr(record_id, participant_id, p_participant_id),
+    id7     = stringr::str_sub(id_full, 1, 7)
+  ) %>%
+  select(id7, all_of(cols_3m)) %>%
+  filter(id7 %in% extra_ids) %>%
+  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "dt") %>%
+  mutate(dt = as_date_guess(dt)) %>%
+  filter(!is.na(dt)) %>%
+  group_by(id7) %>%
+  summarise(
+    outreach_dates_all_3m = paste(sort(unique(format(dt, "%Y-%m-%d"))), collapse = "; "),
+    .groups = "drop"
+  )
+
+# Build the extra-IDs table for the target date
+extra_table <- long3 %>%
+  filter(id7 %in% extra_ids) %>%
+  mutate(
+    in_window = (is.na(sch_min_3m) | date >= sch_min_3m) &
+                (is.na(sch_max_3m) | date <= sch_max_3m)
+  ) %>%
+  group_by(id7, site_id, sch_min_3m, sch_max_3m) %>%
+  summarise(
+    hits_on_date  = n(),                                  # how many cells fired on this date
+    outreach_cols = paste(sort(unique(var)), collapse=", "),
+    .groups = "drop"
+  ) %>%
+  left_join(all_dates_for_extra, by = "id7") %>%
+  arrange(id7)
+
+extra_table
+```
+
+```{r}
+# Ethnicity counts for approached vs enrolled (screen_ethnicity == 1)
+# ---------------------------------------------------------------
+
+# 1) Unique approached base (one row per youth/site)
+approached_base <- raw %>%
+  dplyr::distinct(record_id, site_id, screen_ethnicity)
+
+# 2) Counts by site for approached (screen_ethnicity == 1)
+ethn_approached <- approached_base %>%
+  count_by_site(screen_ethnicity == 1)
+
+# 3) Counts by site for enrolled (treatment not NA & screen_ethnicity == 1)
+ethn_enrolled <- raw %>%
+  dplyr::filter(!is.na(treatment)) %>%                 # enrolled
+  dplyr::distinct(record_id, site_id, screen_ethnicity) %>%
+  count_by_site(screen_ethnicity == 1)
+
+# 4) Put in one table (same shape as your enrollment table)
+ethn_tbl <- dplyr::bind_rows(
+  tibble::tibble(Item = "screen_ethnicity = 1 — Approached") %>% dplyr::bind_cols(ethn_approached),
+  tibble::tibble(Item = "screen_ethnicity = 1 — Enrolled")   %>% dplyr::bind_cols(ethn_enrolled)
+)
+
+ethn_gt <- ethn_tbl %>%
+  gt::gt(rowname_col = "Item") %>%
+  gt::tab_header(
+    title = gt::md("**WeCare Youth Enrollment by Ethnicity (screen_ethnicity = 1)**")
+  ) %>%
+  gt::cols_label(Harlem = "Harlem", Kings = "Kings", Total = "Total") %>%
+  gt::fmt_number(columns = c(Harlem, Kings, Total), decimals = 0)
+
+ethn_gt
 ```
