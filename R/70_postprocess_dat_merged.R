@@ -105,6 +105,99 @@ to_date_smart <- function(x,
 # Safe fetcher: returns an NA-character vector if the column doesn't exist
 get_col_chr <- function(df, nm) if (nm %in% names(df)) as.character(df[[nm]]) else rep(NA_character_, nrow(df))
 
+# ---------------- LGBTQ+ helper + export -------------------
+
+# LGBTQ+ flag based on SOGI codes
+is_lgbtq_sogi <- function(gender_code, trans_code, orient_code) {
+  gender_code <- as.integer(gender_code)
+  trans_code  <- as.integer(trans_code)
+  orient_code <- as.integer(orient_code)
+  
+  # Non-informative / "skip" codes
+  # 77 = don't know what this question is asking/means
+  # 99 = do not want to answer
+  noninfo_codes <- c(77L, 99L)
+  
+  # --- Sexual minority ---
+  # 2–7 = Gay/Lesbian/Bi/Queer/Pan/Ace
+  # 66  = I am not sure or questioning        -> LGBTQ+
+  # 88  = I do not identify as any of these  -> LGBTQ+
+  orient_minority <- orient_code %in% c(2L, 3L, 4L, 5L, 6L, 7L, 66L, 88L)
+  
+  # --- Gender minority ---
+  # 3,4,5 = Nonbinary / Genderfluid / Genderqueer
+  # 66    = I am not sure or questioning        -> LGBTQ+
+  # 88    = I do not identify as any of these  -> LGBTQ+
+  gender_minority <- gender_code %in% c(3L, 4L, 5L, 66L, 88L)
+  
+  # --- Trans / questioning trans ---
+  # 1  = Yes, I am transgender
+  # 66 = I am not sure yet or I am questioning if I am transgender -> LGBTQ+
+  trans_minority <- trans_code %in% c(1L, 66L)
+  
+  lgbtq <- orient_minority | gender_minority | trans_minority
+  
+  # If ALL three are non-informative / missing, set to NA (unknown SOGI)
+  all_noninfo <- (is.na(gender_code) | gender_code %in% noninfo_codes) &
+    (is.na(trans_code)  | trans_code  %in% noninfo_codes) &
+    (is.na(orient_code) | orient_code %in% noninfo_codes)
+  
+  lgbtq[all_noninfo] <- NA
+  
+  lgbtq
+}
+
+# Write an export focused on CASSY + LGBTQ+ from dat_merged
+write_cass_sogi_with_lgbtq <- function(df,
+                                       out_dir,
+                                       fname = paste0("cass_sogi_with_lgbtq_", format(Sys.Date(), "%Y%m%d"), ".csv")) {
+  stopifnot(dir.exists(out_dir))
+  
+  if (!all(c("treatment", "cassy_result",
+             "giso_gender_identity_b", "giso_trans_b", "giso_sex_orient_b") %in% names(df))) {
+    warning("Required columns for cass_sogi_with_lgbtq export are missing; skipping write.")
+    return(invisible(NULL))
+  }
+  
+  tmp <- df %>%
+    dplyr::mutate(
+      treatment              = suppressWarnings(as.integer(treatment)),
+      cassy_result           = suppressWarnings(as.integer(cassy_result)),
+      giso_gender_identity_b = suppressWarnings(as.integer(giso_gender_identity_b)),
+      giso_trans_b           = suppressWarnings(as.integer(giso_trans_b)),
+      giso_sex_orient_b      = suppressWarnings(as.integer(giso_sex_orient_b))
+    ) %>%
+    dplyr::mutate(
+      lgbtq = is_lgbtq_sogi(
+        giso_gender_identity_b,
+        giso_trans_b,
+        giso_sex_orient_b
+      )
+    )
+  
+  # Keep a focused set of columns for Adam / Pamela to work with
+  cass_sogi <- tmp %>%
+    dplyr::select(
+      record_id,
+      participant_id,
+      treatment,
+      cassy_result,
+      giso_gender_identity_b,
+      giso_trans_b,
+      giso_sex_orient_b,
+      lgbtq
+    )
+  
+  out_path <- file.path(out_dir, fname)
+  readr::write_csv(cass_sogi, out_path)
+  message(sprintf(
+    "Wrote cass_sogi_with_lgbtq export → %s | Rows: %s, Cols: %s",
+    basename(out_path), nrow(cass_sogi), ncol(cass_sogi)
+  ))
+  
+  invisible(cass_sogi)
+}
+
 # -------------------- Main transformer ---------------------
 postprocess_dat_merged <- function(df) {
   df <- df %>%
@@ -193,7 +286,11 @@ postprocess_dat_merged <- function(df) {
 }
 
 # ------------------ Read → transform → write ----------------
-postprocess_dat_merged_in_place <- function(out_dir, fname = "dat_merged.csv", backup = FALSE) {
+postprocess_dat_merged_in_place <- function(out_dir,
+                                            fname = "dat_merged.csv",
+                                            backup = FALSE,
+                                            write_cass_sogi = FALSE,
+                                            cass_sogi_fname = NULL) {
   stopifnot(dir.exists(out_dir))
   path <- file.path(out_dir, fname)
   if (!file.exists(path)) stop("File not found: ", path)
@@ -213,5 +310,14 @@ postprocess_dat_merged_in_place <- function(out_dir, fname = "dat_merged.csv", b
     basename(path), nrow(dat_out), ncol(dat_out),
     paste(colnames(dat_out)[1:4], collapse = ", ")
   ))
+  
+  # Optional one-off export for CASSY × LGBTQ+ work
+  if (isTRUE(write_cass_sogi)) {
+    if (is.null(cass_sogi_fname) || !nzchar(cass_sogi_fname)) {
+      cass_sogi_fname <- paste0("cass_sogi_with_lgbtq_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    }
+    write_cass_sogi_with_lgbtq(dat_out, out_dir = out_dir, fname = cass_sogi_fname)
+  }
+  
   invisible(dat_out)
 }

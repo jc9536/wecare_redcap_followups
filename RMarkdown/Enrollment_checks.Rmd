@@ -28,7 +28,7 @@ csv_path  <- file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with 
 
 # Which datasets to run?
 RUN_CURRENT <- TRUE
-RUN_LOCKED  <- TRUE
+RUN_LOCKED  <- FALSE
 
 # Which tables to render?
 SHOW_ENROLL          <- TRUE
@@ -39,10 +39,10 @@ SHOW_OUTREACH_DAILY  <- TRUE
 
 # Labels / dates / targets
 DATA_LOCK  <- as.Date("2025-10-31")
-AS_OF_DATE <- as.Date("2025-11-17")
+AS_OF_DATE <- as.Date("2025-11-24")
 
 # Weeks to include (any day inside the week is fine)
-WEEKS_INPUT <- as.Date(c("2025-10-30", "2025-11-03", "2025-11-12", "2025-11-17"))
+WEEKS_INPUT <- as.Date(c("2025-10-30", "2025-11-03", "2025-11-12", "2025-11-17", "2025-11-24"))
 
 # 3m/6m “active if unscheduled but sched_min < cutoff” (Stata td(30sep2025))
 CUTOFF_3M <- as.Date("2025-09-30")
@@ -484,16 +484,6 @@ locked_df <- raw |> filter(merged_date <= DATA_LOCK)
 ```
 
 ```{r}
-# ========================= SOGI NUMERIC CLEANING ======================
-raw <- raw |>
-  mutate(
-    treatment              = suppressWarnings(as.integer(as.character(treatment))),
-    cassy_result           = suppressWarnings(as.integer(as.character(cassy_result))),
-    giso_gender_identity_b = suppressWarnings(as.integer(as.character(giso_gender_identity_b))),
-    giso_trans_b           = suppressWarnings(as.integer(as.character(giso_trans_b))),
-    giso_sex_orient_b      = suppressWarnings(as.integer(as.character(giso_sex_orient_b)))
-  )
-
 # ========================= LGBTQ+ FLAG (UPDATED FOR ADAM) ======================
 is_lgbtq_sogi <- function(gender_code, trans_code, orient_code) {
   gender_code <- as.integer(gender_code)
@@ -536,7 +526,16 @@ is_lgbtq_sogi <- function(gender_code, trans_code, orient_code) {
 }
 
 # ========================= SIMPLE CASSY x LGBTQ+ SUMMARY ======================
+
 cass_sogi <- raw %>%
+  mutate(
+    treatment              = suppressWarnings(as.integer(as.character(treatment))),
+    giso_gender_identity_b = suppressWarnings(as.integer(as.character(giso_gender_identity_b))),
+    giso_trans_b           = suppressWarnings(as.integer(as.character(giso_trans_b))),
+    giso_sex_orient_b      = suppressWarnings(as.integer(as.character(giso_sex_orient_b)))
+  ) %>%
+  # >>> only youth in the intervention arm
+  filter(treatment == 1L) %>%
   mutate(
     lgbtq = is_lgbtq_sogi(
       giso_gender_identity_b,
@@ -547,14 +546,13 @@ cass_sogi <- raw %>%
 
 total_n <- nrow(cass_sogi)
 
-# 1) Total number of CASSY+ in dat_merged
+# 1) Total number of CASSY+ in *treatment group* only
 total_cassy_plus <- sum(cass_sogi$cassy_result == 1, na.rm = TRUE)
 
-# 2) Total number of LGBTQ+ in dat_merged
+# 2) Total number of LGBTQ+ in *treatment group* only
 total_lgbtq <- sum(cass_sogi$lgbtq == TRUE, na.rm = TRUE)
 
-# 3) Among LGBTQ+ with non-missing CASSY:
-#    how many & % who are CASSY+ / NOT CASSY+
+# 3) Among LGBTQ+ in treatment, with non-missing CASSY:
 lgbtq_with_cassy <- cass_sogi %>%
   filter(lgbtq == TRUE, !is.na(cassy_result))
 
@@ -563,31 +561,118 @@ n_lgbtq_not_cassy  <- sum(lgbtq_with_cassy$cassy_result != 1)
 
 den_lgbtq_valid <- nrow(lgbtq_with_cassy)
 
+# 4) Non-LGBTQ+ in treatment, with non-missing CASSY:
+non_lgbtq_with_cassy <- cass_sogi %>%
+  filter(lgbtq == FALSE, !is.na(cassy_result))
+
+n_non_lgbtq_valid      <- nrow(non_lgbtq_with_cassy)
+n_non_lgbtq_cassy_plus <- sum(non_lgbtq_with_cassy$cassy_result == 1)
+n_non_lgbtq_not_cassy  <- sum(non_lgbtq_with_cassy$cassy_result != 1)
+
+rate_non_lgbtq_cassy <- 100 * n_non_lgbtq_cassy_plus / n_non_lgbtq_valid
+rate_non_lgbtq_not   <- 100 * n_non_lgbtq_not_cassy  / n_non_lgbtq_valid
+
+# Percent of the *treatment group as a whole* that is both LGBTQ+ and CASSY+
+pct_lgbtq_cassy_of_sample <- 100 * n_lgbtq_cassy_plus / total_n
+pct_lgbtq_cassy_not_of_sample <- 100 * n_lgbtq_not_cassy / total_n
+
 summary_tbl <- tibble::tribble(
-  ~Metric,                                ~N,                     ~Percent,
-  "Total CASSY+ in sample",               total_cassy_plus,       100 * total_cassy_plus / total_n,
-  "Total LGBTQ+ in sample",               total_lgbtq,            100 * total_lgbtq / total_n,
-  "LGBTQ+ who are CASSY+",                n_lgbtq_cassy_plus,     100 * n_lgbtq_cassy_plus / den_lgbtq_valid,
-  "LGBTQ+ who are NOT CASSY+",            n_lgbtq_not_cassy,      100 * n_lgbtq_not_cassy  / den_lgbtq_valid
+  ~Metric,                                           ~N,                          ~Percent,
+  "Total CASSY+ in treatment arm",                  total_cassy_plus,            100 * total_cassy_plus / total_n,
+  "Total LGBTQ+ in treatment arm",                  total_lgbtq,                 100 * total_lgbtq / total_n,
+  "LGBTQ+ who are CASSY+ (within LGBTQ+ w/ CASSY)", n_lgbtq_cassy_plus,          100 * n_lgbtq_cassy_plus / den_lgbtq_valid,
+  "LGBTQ+ who are NOT CASSY+ (within LGBTQ+ w/ CASSY)",
+                                                   n_lgbtq_not_cassy,            100 * n_lgbtq_not_cassy  / den_lgbtq_valid,
+  "Non-LGBTQ+ who are CASSY+ (within non-LGBTQ+ w/ CASSY)",
+                                                   n_non_lgbtq_cassy_plus,       rate_non_lgbtq_cassy,
+  "Non-LGBTQ+ who are NOT CASSY+ (within non-LGBTQ+ w/ CASSY)",
+                                                   n_non_lgbtq_not_cassy,        rate_non_lgbtq_not,
+  "LGBTQ+ who are CASSY+ (of treatment arm)",       n_lgbtq_cassy_plus,          pct_lgbtq_cassy_of_sample,
+  "LGBTQ+ who are NOT CASSY+ (of treatment arm)",   n_lgbtq_not_cassy,           pct_lgbtq_cassy_not_of_sample
 )
 
 lgbtq_cassy_simple_gt <- summary_tbl %>%
   gt::gt() %>%
   gt::fmt_number(columns = "Percent", decimals = 1) %>%
   gt::tab_header(
-    title = gt::md("**CASSY+ and LGBTQ+ Summary (dat_merged.csv)**")
+    title = gt::md("**CASSY+ and LGBTQ+ Summary (Treatment Arm Only)**")
   ) %>%
   gt::tab_footnote(
-    footnote = "Percent for last two rows is within LGBTQ+ youth with a non-missing CASSY result.",
-    locations = gt::cells_body(rows = 3:4, columns = "Percent")
+    footnote = "Percent for rows 3–6 is within youth with a non-missing CASSY result in that group (treatment arm only).",
+    locations = gt::cells_body(rows = 3:6, columns = "Percent")
   )
 
-# If you are using emit_gt() helper in your Rmd:
-if (exists("emit_gt")) {
-  emit_gt(lgbtq_cassy_simple_gt)
-} else {
-  lgbtq_cassy_simple_gt
-}
+lgbtq_cassy_simple_gt
+```
+```{r}
+# ========================= CASSY+ x TREATMENT (SHOW BOTH ARMS) ======================
+
+cass_treat_ct <- raw %>%
+  mutate(
+    treatment      = suppressWarnings(as.integer(as.character(treatment))),
+    cassy_result   = suppressWarnings(as.integer(as.character(cassy_result))),
+    Treatment_arm  = dplyr::case_when(
+      treatment == 0L ~ "Control",
+      treatment == 1L ~ "Treatment",
+      TRUE            ~ NA_character_
+    ),
+    cassy_flag = dplyr::case_when(
+      cassy_result == 1L                        ~ "CASSY+",
+      !is.na(cassy_result) & cassy_result != 1L ~ "Not CASSY+",
+      TRUE                                      ~ "Missing"
+    )
+  ) %>%
+  # keep only youth actually in an arm
+  filter(!is.na(Treatment_arm))
+
+# Make factors so both arms & all CASSY categories show up, even if 0
+cass_treat_counts <- cass_treat_ct %>%
+  mutate(
+    Treatment_arm = factor(Treatment_arm,
+                           levels = c("Control", "Treatment")),
+    cassy_flag    = factor(cassy_flag,
+                           levels = c("CASSY+", "Not CASSY+", "Missing"))
+  ) %>%
+  count(Treatment_arm, cassy_flag, name = "N", .drop = FALSE)
+
+cass_treat_wide <- cass_treat_counts %>%
+  tidyr::pivot_wider(
+    names_from  = cassy_flag,
+    values_from = N,
+    values_fill = 0
+  ) %>%
+  mutate(
+    Total              = `CASSY+` + `Not CASSY+` + Missing,
+    Non_missing_total  = Total - Missing,
+    `CASSY+ % (non-missing)`     = ifelse(Non_missing_total > 0,
+                                          100 * `CASSY+` / Non_missing_total, NA_real_),
+    `Not CASSY+ % (non-missing)` = ifelse(Non_missing_total > 0,
+                                          100 * `Not CASSY+` / Non_missing_total, NA_real_)
+  ) %>%
+  dplyr::select(
+    Treatment_arm, Total, Missing,
+    `CASSY+`, `CASSY+ % (non-missing)`,
+    `Not CASSY+`, `Not CASSY+ % (non-missing)`
+  )
+
+cass_treat_gt <- cass_treat_wide %>%
+  gt::gt() %>%
+  gt::fmt_number(
+    columns = c(`CASSY+ % (non-missing)`, `Not CASSY+ % (non-missing)`),
+    decimals = 1
+  ) %>%
+  gt::tab_header(
+    title = gt::md("**CASSY+ by Treatment Arm (Enrolled Youth)**")
+  ) %>%
+  gt::tab_footnote(
+    footnote = "Percent columns use only youth with non-missing CASSY in that arm.",
+    locations = gt::cells_body(
+      rows = dplyr::everything(),
+      columns = c(`CASSY+ % (non-missing)`, `Not CASSY+ % (non-missing)`)
+    )
+  )
+
+cass_treat_gt
 ```
 
 # 5) Build Tables 
@@ -832,14 +917,13 @@ build_all <- function(df,
 ```
 
 # Table Output 
-```{r warning=FALSE, message=FALSE, results='asis'}
+```{r warning=FALSE, message=FALSE, echo=FALSE}
 # ========================= RUN BUILDS =======================
 
 # Helper that ALWAYS emits a gt table
 emit_gt <- function(x) {
   if (inherits(x, "gt_tbl")) {
-    cat(gt::as_raw_html(x), sep = "\n")
-    cat("\n")
+    print(x)            # let gt/knitr handle the HTML
   }
 }
 
@@ -861,11 +945,11 @@ if (RUN_CURRENT) {
     want_enroll_weekly = SHOW_ENROLL_WEEKLY
   )
 
-  if (SHOW_ENROLL)            emit_gt(current$enroll_gt)
-  if (SHOW_FOLLOWUP)        { emit_gt(current$fu3_gt); emit_gt(current$fu6_gt) }
-  if (SHOW_OUTREACH_WEEKLY)   emit_gt(current$weekly_gt)
-  if (SHOW_ENROLL_WEEKLY)     emit_gt(current$weekly_enroll_gt)
-  if (SHOW_OUTREACH_DAILY)    for (g in current$daily_gts) emit_gt(g)
+  if (SHOW_ENROLL)          emit_gt(current$enroll_gt)
+  if (SHOW_FOLLOWUP)      { emit_gt(current$fu3_gt); emit_gt(current$fu6_gt) }
+  if (SHOW_OUTREACH_WEEKLY) emit_gt(current$weekly_gt)
+  if (SHOW_ENROLL_WEEKLY)   emit_gt(current$weekly_enroll_gt)
+  if (SHOW_OUTREACH_DAILY)  for (g in current$daily_gts) emit_gt(g)
 }
 
 if (RUN_LOCKED) {
@@ -885,11 +969,11 @@ if (RUN_LOCKED) {
     want_enroll_weekly = SHOW_ENROLL_WEEKLY
   )
 
-  if (SHOW_ENROLL)            emit_gt(locked$enroll_gt)
-  if (SHOW_FOLLOWUP)        { emit_gt(locked$fu3_gt); emit_gt(locked$fu6_gt) }
-  if (SHOW_OUTREACH_WEEKLY)   emit_gt(locked$weekly_gt)
-  if (SHOW_ENROLL_WEEKLY)     emit_gt(locked$weekly_enroll_gt)
-  if (SHOW_OUTREACH_DAILY)    for (g in locked$daily_gts) emit_gt(g)
+  if (SHOW_ENROLL)          emit_gt(locked$enroll_gt)
+  if (SHOW_FOLLOWUP)      { emit_gt(locked$fu3_gt); emit_gt(locked$fu6_gt) }
+  if (SHOW_OUTREACH_WEEKLY) emit_gt(locked$weekly_gt)
+  if (SHOW_ENROLL_WEEKLY)   emit_gt(locked$weekly_enroll_gt)
+  if (SHOW_OUTREACH_DAILY)  for (g in locked$daily_gts) emit_gt(g)
 }
 ```
 
