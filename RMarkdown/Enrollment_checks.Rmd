@@ -38,15 +38,15 @@ SHOW_OUTREACH_WEEKLY <- TRUE
 SHOW_OUTREACH_DAILY  <- TRUE
 
 # Labels / dates / targets
-DATA_LOCK  <- as.Date("2025-10-31")
-AS_OF_DATE <- as.Date("2025-11-24")
+DATA_LOCK  <- as.Date("2026-01-01")
+AS_OF_DATE <- as.Date("2026-02-17")
 
 # Weeks to include (any day inside the week is fine)
-WEEKS_INPUT <- as.Date(c("2025-10-30", "2025-11-03", "2025-11-12", "2025-11-17", "2025-11-24"))
+WEEKS_INPUT <- as.Date(c("2026-02-04", "2026-02-09", "2026-02-17"))
 
 # 3m/6m “active if unscheduled but sched_min < cutoff” (Stata td(30sep2025))
-CUTOFF_3M <- as.Date("2025-09-30")
-CUTOFF_6M <- as.Date("2025-09-30")
+CUTOFF_3M <- as.Date("2026-01-01")
+CUTOFF_6M <- as.Date("2026-01-01")
 ```
 
 # 3) Helper Functions
@@ -223,6 +223,33 @@ as_date_guess <- function(x,
   }
   d
 }
+
+parse_date_any_safe <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  x[tolower(x) %in% c("na","n/a","null",".","missing")] <- NA_character_
+
+  # keep date/time portion if timestamps exist
+  x <- ifelse(!is.na(x), substr(x, 1, 19), NA_character_)
+
+  # lubridate never throws here; it returns NA when it can’t parse
+  dt <- suppressWarnings(
+    lubridate::parse_date_time(
+      x,
+      orders = c(
+        "Ymd HMS", "Ymd HM", "Ymd",
+        "mdY HMS", "mdY HM", "mdY",
+        "mdy",
+        "Y/m/d", "m/d/Y", "m/d/y",
+        "m-d-Y", "m-d-y"
+      ),
+      tz = "UTC",
+      quiet = TRUE
+    )
+  )
+
+  lubridate::as_date(dt)
+}
 ```
 
 # Projections Table + Weekday-based target calculator 
@@ -330,11 +357,11 @@ calc_targets_asof <- function(as_of_date,
   idx_next <- which(projections$end_date == row_next$end_date)[1]
   row_prev <- if (idx_next > 1) projections[idx_next - 1, ] else projections[1, ]
 
-  start_date <- period_start_for(row_next$end_date)
+  start_date <- row_prev$end_date
 
   # business-day fractions (Mon–Fri, excluding US federal holidays)
-  num_bd <- bizdays_ex_us_holidays(start_date, as_of_date,  closed_interval = closed_interval)
-  den_bd <- bizdays_ex_us_holidays(start_date, row_next$end_date, closed_interval = TRUE)
+  num_bd <- bizdays_ex_us_holidays(start_date, as_of_date,  closed_interval = FALSE) # [start, as_of)
+  den_bd <- bizdays_ex_us_holidays(start_date, row_next$end_date, closed_interval = FALSE) # [start, end)
   frac   <- if (den_bd > 0) pmin(pmax(num_bd / den_bd, 0), 1) else 0
 
   # interpolate by site (cumulative)
@@ -709,6 +736,46 @@ count_outreach <- function(dd, var) {
     rename(Item = cat)
 }
 
+# Raw follow-up visit status counter (1–7) by site
+count_visitstatus <- function(dd, var) {
+  lvls <- 1L:7L
+  labs <- c(
+    "Completed",
+    "Scheduled",
+    "Incomplete/Call Back",
+    "Incomplete/No Contact",
+    "No Show",
+    "Withdrawal",
+    "Missed (participant is outside date range)"
+  )
+
+  tmp <- dd %>%
+    filter(!is.na(.data[[var]])) %>%
+    mutate(cat = factor(as.integer(.data[[var]]),
+                        levels = lvls, labels = labs)) %>%
+    count(cat, site_id, name = "n") %>%
+    tidyr::pivot_wider(
+      names_from  = site_id,
+      values_from = n,
+      values_fill = 0
+    )
+
+  for (nm in c("H", "K")) if (!(nm %in% names(tmp))) tmp[[nm]] <- 0L
+
+  tmp %>%
+    mutate(
+      H = coalesce(H, 0L),
+      K = coalesce(K, 0L)
+    ) %>%
+    tidyr::complete(
+      cat = factor(labs, levels = labs),
+      fill = list(H = 0L, K = 0L)
+    ) %>%
+    arrange(cat) %>%
+    mutate(Total = H + K) %>%
+    rename(Item = cat)
+}
+
 # AUTO-COMPUTE TARGETS FROM PROJECTIONS USING WEEKDAYS ONLY
 # ---------- Targets for CURRENT and for DATA LOCK ----------
 tgt_current <- calc_targets_asof(AS_OF_DATE,  closed_interval = TRUE, round_sites = TRUE)
@@ -836,13 +903,46 @@ build_all <- function(df,
   }
 
   # ----- FOLLOW-UP OUTREACH SUMMARY (3m & 6m) -----
+    # ----- FOLLOW-UP OUTREACH SUMMARY (3m & 6m) -----
   if (want_fu) {
-    dat_fu <- df %>%
+    # First: clean raw visit status + scheduled dates
+    dat_fu_status <- df %>%
       mutate(
         follow_visitstatus_3m = suppressWarnings(as.integer(as.character(follow_visitstatus_3m))),
         follow_visitstatus_6m = suppressWarnings(as.integer(as.character(follow_visitstatus_6m))),
-        follow_sch_min_3m = as_date_guess(follow_sch_min_3m),
-        follow_sch_min_6m = as_date_guess(follow_sch_min_6m),
+        follow_sch_min_3m     = as_date_guess(follow_sch_min_3m),
+        follow_sch_min_6m     = as_date_guess(follow_sch_min_6m)
+      )
+
+    # ---------- NEW: raw visit status tables (1–7) ----------
+    fu3_status_tbl <- count_visitstatus(dat_fu_status, "follow_visitstatus_3m")
+    fu6_status_tbl <- count_visitstatus(dat_fu_status, "follow_visitstatus_6m")
+
+    out$fu3_status_gt <- fu3_status_tbl %>%
+      gt(rowname_col = "Item") %>%
+      tab_header(
+        title = md(paste0(
+          "**WeCare Follow-Up Visit Status**<br>",
+          "<span style='font-size:12px'>3-month — ", label, "</span>"
+        ))
+      ) %>%
+      cols_label(H = "Harlem", K = "Kings", Total = "Total") %>%
+      fmt_number(columns = c(H, K, Total), decimals = 0)
+
+    out$fu6_status_gt <- fu6_status_tbl %>%
+      gt(rowname_col = "Item") %>%
+      tab_header(
+        title = md(paste0(
+          "**WeCare Follow-Up Visit Status**<br>",
+          "<span style='font-size:12px'>6-month — ", label, "</span>"
+        ))
+      ) %>%
+      cols_label(H = "Harlem", K = "Kings", Total = "Total") %>%
+      fmt_number(columns = c(H, K, Total), decimals = 0)
+
+    # ---------- Then: outreach recode using those cleaned vars ----------
+    dat_fu <- dat_fu_status %>%
+      mutate(
         outreach_3m = recode_outreach(follow_visitstatus_3m, follow_sch_min_3m, cutoff_3m),
         outreach_6m = recode_outreach(follow_visitstatus_6m, follow_sch_min_6m, cutoff_6m)
       )
@@ -852,15 +952,19 @@ build_all <- function(df,
 
     out$fu3_gt <- fu3_tbl %>%
       gt(rowname_col = "Item") %>%
-      tab_header(title = md(paste0("**WeCare Follow-Up Assessments**<br>",
-                                   "<span style='font-size:12px'>3-month — ", label, "</span>"))) %>%
+      tab_header(title = md(paste0(
+        "**WeCare Follow-Up Assessments**<br>",
+        "<span style='font-size:12px'>3-month — ", label, "</span>"
+      ))) %>%
       cols_label(H = "Harlem", K = "Kings", Total = "Total") %>%
       fmt_number(columns = c(H, K, Total), decimals = 0)
 
     out$fu6_gt <- fu6_tbl %>%
       gt(rowname_col = "Item") %>%
-      tab_header(title = md(paste0("**WeCare Follow-Up Assessments**<br>",
-                                   "<span style='font-size:12px'>6-month — ", label, "</span>"))) %>%
+      tab_header(title = md(paste0(
+        "**WeCare Follow-Up Assessments**<br>",
+        "<span style='font-size:12px'>6-month — ", label, "</span>"
+      ))) %>%
       cols_label(H = "Harlem", K = "Kings", Total = "Total") %>%
       fmt_number(columns = c(H, K, Total), decimals = 0)
   }
@@ -945,8 +1049,18 @@ if (RUN_CURRENT) {
     want_enroll_weekly = SHOW_ENROLL_WEEKLY
   )
 
-  if (SHOW_ENROLL)          emit_gt(current$enroll_gt)
-  if (SHOW_FOLLOWUP)      { emit_gt(current$fu3_gt); emit_gt(current$fu6_gt) }
+  if (SHOW_ENROLL) emit_gt(current$enroll_gt)
+
+  if (SHOW_FOLLOWUP) {
+    # NEW: raw visit-status tables (1–7) by site
+    emit_gt(current$fu3_status_gt)
+    emit_gt(current$fu6_status_gt)
+
+    # Existing: recoded outreach tables
+    emit_gt(current$fu3_gt)
+    emit_gt(current$fu6_gt)
+  }
+
   if (SHOW_OUTREACH_WEEKLY) emit_gt(current$weekly_gt)
   if (SHOW_ENROLL_WEEKLY)   emit_gt(current$weekly_enroll_gt)
   if (SHOW_OUTREACH_DAILY)  for (g in current$daily_gts) emit_gt(g)
@@ -969,8 +1083,18 @@ if (RUN_LOCKED) {
     want_enroll_weekly = SHOW_ENROLL_WEEKLY
   )
 
-  if (SHOW_ENROLL)          emit_gt(locked$enroll_gt)
-  if (SHOW_FOLLOWUP)      { emit_gt(locked$fu3_gt); emit_gt(locked$fu6_gt) }
+  if (SHOW_ENROLL) emit_gt(locked$enroll_gt)
+
+  if (SHOW_FOLLOWUP) {
+    # NEW: raw visit-status tables (1–7) by site
+    emit_gt(locked$fu3_status_gt)
+    emit_gt(locked$fu6_status_gt)
+
+    # Existing: recoded outreach tables
+    emit_gt(locked$fu3_gt)
+    emit_gt(locked$fu6_gt)
+  }
+
   if (SHOW_OUTREACH_WEEKLY) emit_gt(locked$weekly_gt)
   if (SHOW_ENROLL_WEEKLY)   emit_gt(locked$weekly_enroll_gt)
   if (SHOW_OUTREACH_DAILY)  for (g in locked$daily_gts) emit_gt(g)
@@ -978,260 +1102,1389 @@ if (RUN_LOCKED) {
 ```
 
 ```{r}
-# --- Inputs ---
-date_to_check <- as.Date("2025-10-28")
+library(dplyr)
+library(lubridate)
 
-ids_46 <- c(
-  "K-F0330","K-F0331","H-F0352","K-F0324","K-F0325","K-F0326","H-F0350","H-F0351",
-  "K-F0317","K-F0319","K-F0320","K-F0323","K-F0257","K-F0258","K-F0253","K-F0254",
-  "K-F0255","H-F0325","K-F0251","H-F0323","K-F0248","K-F0249","K-F0250","H-F0319",
-  "K-F0244","K-F0238","H-F0313","H-F0314","K-F0233","H-F0311","K-F0230","K-F0232",
-  "H-F0306","K-F0226","H-F0304","K-F0222","H-F0300","K-F0216","K-F0219","K-F0213",
-  "K-F0214","H-F0294","K-F0212","H-F0279","H-F0267","H-F0273"
+# Raw variable name -> stakeholder-friendly column name
+name_map <- c(
+  record_id               = "Record ID",
+  merged_date             = "Merged date",
+  first_name              = "First name",
+  last_name               = "Last name",
+  screen_age              = "Screen age",
+  treatment               = "Treatment",
+  cassy_result            = "CASSY result",
+  swdf_received_cfs       = "Did this participant receive CFS?",
+  swdf_received_cfs_texts = "Upload to Meditext for supportive texts?",
+  screen_has_cell_phone   = "Has a cell phone that receives texts?",
+  swdf_phone_primary      = "Youth phone (primary)",
+  swdf_phone_alternate    = "Youth phone (alternate)",
+  swdf_phone_reenter      = "Youth phone (re-enter)",
+  swdf_p_phone_primary    = "Parent phone (primary)",
+  swdf_p_understand_eng   = "Parent understands English?"
 )
 
-# --- Columns (exactly like your make_events) ---
-cols_3m <- intersect(
-  c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m")),
-  names(raw)
-)
-
-# --- Long frame of ALL 3m instances on the target date (no dedupe) ---
-# relies on your helpers: coalesce_chr(), as_date_guess()
-long3 <- raw %>%
+jan_enrolled_cfs_check <- raw %>%
   mutate(
-    id_full    = coalesce_chr(record_id, participant_id, p_participant_id),
-    id7        = stringr::str_sub(id_full, 1, 7),
-    sch_min_3m = as_date_guess(follow_sch_min_3m),
-    sch_max_3m = as_date_guess(follow_sch_max_3m)
+    merged_date = to_date_smart(merged_date),
+    jan_2026 = merged_date >= as.Date("2026-01-01") & merged_date <= as.Date("2026-01-31"),
+    enrolled = !is.na(treatment),
+    swdf_received_cfs = as.character(swdf_received_cfs)  # normalize
   ) %>%
-  select(id7, id_full, site_id, sch_min_3m, sch_max_3m, all_of(cols_3m)) %>%
-  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "raw") %>%
-  mutate(date = as_date_guess(raw)) %>%
-  filter(!is.na(date), date == date_to_check)
-
-# 1) TOTAL INSTANCES (cells) — should match your table number (e.g., 53)
-total_instances <- nrow(long3)
-cat("Total 3m instances on", format(date_to_check, "%Y-%m-%d"), "=", total_instances, "\n")
-
-# 2) EXTRA IDs (present in instances but not in your 46-list)
-extra_ids <- setdiff(unique(long3$id7), ids_46)
-
-# For context, gather ALL 3m dates for those extra IDs (from the wide row)
-all_dates_for_extra <- raw %>%
+  filter(jan_2026, enrolled) %>%
   mutate(
-    id_full = coalesce_chr(record_id, participant_id, p_participant_id),
-    id7     = stringr::str_sub(id_full, 1, 7)
+    swdf_received_cfs_clean = case_when(
+      swdf_received_cfs %in% c("1", 1) ~ "1",
+      swdf_received_cfs %in% c("0", 0) ~ "0",
+      is.na(swdf_received_cfs) | swdf_received_cfs == "" ~ "NA",
+      TRUE ~ paste0("OTHER:", swdf_received_cfs)
+    )
   ) %>%
-  select(id7, all_of(cols_3m)) %>%
-  filter(id7 %in% extra_ids) %>%
-  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "dt") %>%
-  mutate(dt = as_date_guess(dt)) %>%
-  filter(!is.na(dt)) %>%
-  group_by(id7) %>%
-  summarise(
-    outreach_dates_all_3m = paste(sort(unique(format(dt, "%Y-%m-%d"))), collapse = "; "),
-    .groups = "drop"
-  )
-
-# Build the extra-IDs table for the target date
-extra_table <- long3 %>%
-  filter(id7 %in% extra_ids) %>%
+  select(
+    record_id, 
+    merged_date, 
+    # first_name, 
+    # last_name, 
+    screen_age,
+    treatment,
+    cassy_result,
+    swdf_received_cfs,         # keep raw for sorting + mapping
+    swdf_received_cfs_texts,
+    screen_has_cell_phone,
+    swdf_phone_primary,
+    swdf_phone_alternate,
+    # swdf_phone_reenter,
+    swdf_p_phone_primary,
+    swdf_p_understand_eng
+  ) %>%
+  # Sort by swdf_received_cfs (0 first, then 1, then NA/other), then cassy_result, then treatment, then date/id
   mutate(
-    in_window = (is.na(sch_min_3m) | date >= sch_min_3m) &
-                (is.na(sch_max_3m) | date <= sch_max_3m)
+    swdf_received_cfs_sort = case_when(
+      swdf_received_cfs %in% c("0", 0) ~ 0L,
+      swdf_received_cfs %in% c("1", 1) ~ 1L,
+      TRUE ~ 2L
+    )
   ) %>%
-  group_by(id7, site_id, sch_min_3m, sch_max_3m) %>%
-  summarise(
-    hits_on_date  = n(),                                  # how many cells fired on this date
-    outreach_cols = paste(sort(unique(var)), collapse=", "),
-    .groups = "drop"
-  ) %>%
-  left_join(all_dates_for_extra, by = "id7") %>%
-  arrange(id7)
+  arrange(swdf_received_cfs_sort, cassy_result, treatment, merged_date, record_id) %>%
+  select(-swdf_received_cfs_sort) %>%
+  rename(any_of(name_map))
 
-extra_table
+jan_enrolled_cfs_check
 ```
 
+
+
 ```{r}
-# --- Inputs ---
-date_to_check <- as.Date("2025-10-29")
+library(dplyr)
+library(lubridate)
 
-ids_46 <- c(
-  "K-F0397","K-F0394","K-F0383","K-F0384","K-F0362","K-F0336",
-  "H-F0356","H-F0354","K-F0329","K-F0301","K-F0280","K-F0283",
-  "K-F0274","H-F0329","K-F0265","K-F0266","K-F0260","K-F0263",
-  "K-F0256","K-F0239"
+# Raw variable name -> stakeholder-friendly column name
+name_map <- c(
+  record_id               = "Record ID",
+  merged_date             = "Merged date",
+  first_name              = "First name",
+  last_name               = "Last name",
+  screen_age              = "Screen age",
+  treatment               = "Treatment",
+  cassy_result            = "CASSY result",
+  swdf_received_cfs       = "Did this participant receive CFS?",
+  swdf_received_cfs_texts = "Upload to Meditext for supportive texts?",
+  screen_has_cell_phone   = "Has a cell phone that receives texts?",
+  swdf_phone_primary      = "Youth phone (primary)",
+  swdf_phone_alternate    = "Youth phone (alternate)",
+  swdf_phone_reenter      = "Youth phone (re-enter)",
+  swdf_p_phone_primary    = "Parent phone (primary)",
+  swdf_p_understand_eng   = "Parent understands English?"
 )
 
-# --- Columns (exactly like your make_events) ---
-cols_3m <- intersect(
-  c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m")),
-  names(raw)
+# IDs from Cheryl's email (ONLY these)
+ids_focus <- c(
+  "K-F0686","K-F0664","K-F0654","K-F0653","K-F0623","K-F0636",
+  "K-F0601","K-F0613","K-F0610","K-F0596","K-F0587"
 )
 
-# --- Long frame of ALL 3m instances on the target date (no dedupe) ---
-# relies on your helpers: coalesce_chr(), as_date_guess()
-long3 <- raw %>%
+cfs_check_ids_only <- raw %>%
   mutate(
-    id_full    = coalesce_chr(record_id, participant_id, p_participant_id),
-    id7        = stringr::str_sub(id_full, 1, 7),
-    sch_min_3m = as_date_guess(follow_sch_min_3m),
-    sch_max_3m = as_date_guess(follow_sch_max_3m)
+    merged_date = to_date_smart(merged_date),
+    swdf_received_cfs = as.character(swdf_received_cfs)  # normalize
   ) %>%
-  select(id7, id_full, site_id, sch_min_3m, sch_max_3m, all_of(cols_3m)) %>%
-  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "raw") %>%
-  mutate(date = as_date_guess(raw)) %>%
-  filter(!is.na(date), date == date_to_check)
-
-# 1) TOTAL INSTANCES (cells) — should match your table number (e.g., 53)
-total_instances <- nrow(long3)
-cat("Total 3m instances on", format(date_to_check, "%Y-%m-%d"), "=", total_instances, "\n")
-
-# 2) EXTRA IDs (present in instances but not in your 46-list)
-extra_ids <- setdiff(unique(long3$id7), ids_46)
-
-# For context, gather ALL 3m dates for those extra IDs (from the wide row)
-all_dates_for_extra <- raw %>%
+  filter(record_id %in% ids_focus) %>%
   mutate(
-    id_full = coalesce_chr(record_id, participant_id, p_participant_id),
-    id7     = stringr::str_sub(id_full, 1, 7)
+    swdf_received_cfs_clean = case_when(
+      swdf_received_cfs %in% c("1", 1) ~ "1",
+      swdf_received_cfs %in% c("0", 0) ~ "0",
+      is.na(swdf_received_cfs) | swdf_received_cfs == "" ~ "NA",
+      TRUE ~ paste0("OTHER:", swdf_received_cfs)
+    )
   ) %>%
-  select(id7, all_of(cols_3m)) %>%
-  filter(id7 %in% extra_ids) %>%
-  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "dt") %>%
-  mutate(dt = as_date_guess(dt)) %>%
-  filter(!is.na(dt)) %>%
-  group_by(id7) %>%
-  summarise(
-    outreach_dates_all_3m = paste(sort(unique(format(dt, "%Y-%m-%d"))), collapse = "; "),
-    .groups = "drop"
-  )
-
-# Build the extra-IDs table for the target date
-extra_table <- long3 %>%
-  filter(id7 %in% extra_ids) %>%
+  select(
+    record_id,
+    merged_date,
+    # first_name,
+    # last_name,
+    screen_age,
+    treatment,
+    cassy_result,
+    swdf_received_cfs,         # keep raw for sorting + mapping
+    swdf_received_cfs_texts,
+    screen_has_cell_phone,
+    swdf_phone_primary,
+    swdf_phone_alternate,
+    # swdf_phone_reenter,
+    swdf_p_phone_primary,
+    swdf_p_understand_eng
+  ) %>%
   mutate(
-    in_window = (is.na(sch_min_3m) | date >= sch_min_3m) &
-                (is.na(sch_max_3m) | date <= sch_max_3m)
+    swdf_received_cfs_sort = case_when(
+      swdf_received_cfs %in% c("0", 0) ~ 0L,
+      swdf_received_cfs %in% c("1", 1) ~ 1L,
+      TRUE ~ 2L
+    )
   ) %>%
-  group_by(id7, site_id, sch_min_3m, sch_max_3m) %>%
-  summarise(
-    hits_on_date  = n(),                                  # how many cells fired on this date
-    outreach_cols = paste(sort(unique(var)), collapse=", "),
-    .groups = "drop"
-  ) %>%
-  left_join(all_dates_for_extra, by = "id7") %>%
-  arrange(id7)
+  arrange(swdf_received_cfs_sort, cassy_result, treatment, merged_date, record_id) %>%
+  select(-swdf_received_cfs_sort) %>%
+  rename(any_of(name_map))
 
-extra_table
+cfs_check_ids_only
 ```
 
+
+
+
+
+
+
+
 ```{r}
-# --- Inputs ---
-date_to_check <- as.Date("2025-10-21")
+# ========================= FOLLOW-UP RATE INCREASE (3m vs 6m) =========================
 
-ids_46 <- c(
-  "K-F0418","K-F0413","K-F0414","K-F0412","K-F0409","K-F0407","K-F0403","K-F0404",
-  "K-F0406","K-F0399","K-F0400","K-F0396","K-F0397","K-F0394","K-F0388","K-F0383",
-  "K-F0384","K-F0378","K-F0375","K-F0376","K-F0377","K-F0373","K-F0369","K-F0371",
-  "K-F0362","K-F0363","K-F0329","K-F0314","H-F0271","H-F0253"
+# ---- period definitions ----
+period_labels <- tibble::tribble(
+  ~period_code, ~period_label,                ~start,                 ~end,
+  "pre",        "Pre 08/01/2025",             as.Date("1900-01-01"),  as.Date("2025-08-01"),
+  "post",       "08/01/2025–01/01/2026",      as.Date("2025-08-01"),  as.Date("2026-01-01")
 )
 
-# --- Columns (exactly like your make_events) ---
-cols_3m <- intersect(
-  c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m")),
-  names(raw)
+# ---- sanity checks for required columns ----
+need_cols <- c(
+  "record_id", "treatment",
+  "follow_visitdate_3m", "follow_visitdate_6m",
+  "follow_visitstatus_3m", "follow_visitstatus_6m"
 )
+missing <- setdiff(need_cols, names(raw))
+if (length(missing)) stop("Missing required columns: ", paste(missing, collapse = ", "))
 
-# --- Long frame of ALL 3m instances on the target date (no dedupe) ---
-# relies on your helpers: coalesce_chr(), as_date_guess()
-long3 <- raw %>%
+# ---- clean + parse follow-up scheduling/completion fields ----
+fu <- raw %>%
   mutate(
-    id_full    = coalesce_chr(record_id, participant_id, p_participant_id),
-    id7        = stringr::str_sub(id_full, 1, 7),
-    sch_min_3m = as_date_guess(follow_sch_min_3m),
-    sch_max_3m = as_date_guess(follow_sch_max_3m)
+    record_id = as.character(record_id),
+    treatment = suppressWarnings(as.integer(as.character(treatment))),
+
+    # Parse visitdates robustly (THIS is what usually fixes the “all 0s”)
+    vd_3m = to_date_smart(follow_visitdate_3m),
+    vd_6m = to_date_smart(follow_visitdate_6m),
+
+    vs_3m = suppressWarnings(as.integer(as.character(follow_visitstatus_3m))),
+    vs_6m = suppressWarnings(as.integer(as.character(follow_visitstatus_6m)))
   ) %>%
-  select(id7, id_full, site_id, sch_min_3m, sch_max_3m, all_of(cols_3m)) %>%
-  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "raw") %>%
-  mutate(date = as_date_guess(raw)) %>%
-  filter(!is.na(date), date == date_to_check)
+  filter(!is.na(treatment))  # enrolled participants only (matches your 453 denom)
 
-# 1) TOTAL INSTANCES (cells) — should match your table number (e.g., 53)
-total_instances <- nrow(long3)
-cat("Total 3m instances on", format(date_to_check, "%Y-%m-%d"), "=", total_instances, "\n")
+n_participants <- dplyr::n_distinct(fu$record_id)
 
-# 2) EXTRA IDs (present in instances but not in your 46-list)
-extra_ids <- setdiff(unique(long3$id7), ids_46)
-
-# For context, gather ALL 3m dates for those extra IDs (from the wide row)
-all_dates_for_extra <- raw %>%
-  mutate(
-    id_full = coalesce_chr(record_id, participant_id, p_participant_id),
-    id7     = stringr::str_sub(id_full, 1, 7)
-  ) %>%
-  select(id7, all_of(cols_3m)) %>%
-  filter(id7 %in% extra_ids) %>%
-  tidyr::pivot_longer(all_of(cols_3m), names_to = "var", values_to = "dt") %>%
-  mutate(dt = as_date_guess(dt)) %>%
-  filter(!is.na(dt)) %>%
-  group_by(id7) %>%
+# ---- DEBUG: if these are ~0, your visitdate fields aren’t parsing ----
+debug_visitdates <- fu %>%
   summarise(
-    outreach_dates_all_3m = paste(sort(unique(format(dt, "%Y-%m-%d"))), collapse = "; "),
-    .groups = "drop"
+    n_participants = n_participants,
+    nonmissing_vd_3m = sum(!is.na(vd_3m)),
+    nonmissing_vd_6m = sum(!is.na(vd_6m)),
+    min_vd_3m = suppressWarnings(min(vd_3m, na.rm = TRUE)),
+    max_vd_3m = suppressWarnings(max(vd_3m, na.rm = TRUE)),
+    min_vd_6m = suppressWarnings(min(vd_6m, na.rm = TRUE)),
+    max_vd_6m = suppressWarnings(max(vd_6m, na.rm = TRUE))
+  )
+print(debug_visitdates)
+
+# If min/max show Inf or nonmissing_vd_* are 0, print some raw examples:
+if (sum(!is.na(fu$vd_3m)) == 0) {
+  cat("\nExamples of raw follow_visitdate_3m values (first 30 non-blank):\n")
+  print(head(raw$follow_visitdate_3m[raw$follow_visitdate_3m != ""], 30))
+}
+if (sum(!is.na(fu$vd_6m)) == 0) {
+  cat("\nExamples of raw follow_visitdate_6m values (first 30 non-blank):\n")
+  print(head(raw$follow_visitdate_6m[raw$follow_visitdate_6m != ""], 30))
+}
+
+# ---- long form for scheduled/completed counting (avoid pivoting mixed types) ----
+schedcomp_long <- dplyr::bind_rows(
+  fu %>% transmute(window = "3m", record_id, visitdate = vd_3m, status = vs_3m),
+  fu %>% transmute(window = "6m", record_id, visitdate = vd_6m, status = vs_6m)
+) %>%
+  mutate(
+    period_code = dplyr::case_when(
+      !is.na(visitdate) & visitdate <  as.Date("2025-08-01") ~ "pre",
+      !is.na(visitdate) & visitdate >= as.Date("2025-08-01") & visitdate < as.Date("2026-01-01") ~ "post",
+      TRUE ~ NA_character_
+    )
   )
 
-# Build the extra-IDs table for the target date
-extra_table <- long3 %>%
-  filter(id7 %in% extra_ids) %>%
-  mutate(
-    in_window = (is.na(sch_min_3m) | date >= sch_min_3m) &
-                (is.na(sch_max_3m) | date <= sch_max_3m)
-  ) %>%
-  group_by(id7, site_id, sch_min_3m, sch_max_3m) %>%
+schedcomp_metrics <- schedcomp_long %>%
+  filter(!is.na(period_code)) %>%
+  group_by(window, period_code) %>%
   summarise(
-    hits_on_date  = n(),                                  # how many cells fired on this date
-    outreach_cols = paste(sort(unique(var)), collapse=", "),
+    n_scheduled = dplyr::n_distinct(record_id), # visitdate present in period
+    n_completed = dplyr::n_distinct(record_id[!is.na(status) & status == 1L]), # status==1 and dated (already filtered by visitdate)
     .groups = "drop"
   ) %>%
-  left_join(all_dates_for_extra, by = "id7") %>%
-  arrange(id7)
+  right_join(tidyr::crossing(window = c("3m","6m"), period_labels %>% select(period_code)),
+             by = c("window","period_code")) %>%
+  mutate(
+    n_scheduled = dplyr::coalesce(n_scheduled, 0L),
+    n_completed = dplyr::coalesce(n_completed, 0L)
+  ) %>%
+  left_join(period_labels %>% select(period_code, period_label), by = "period_code")
 
-extra_table
+# ---- outreach events WITH participant ids ----
+make_events_pid <- function(df) {
+  cols_3m <- c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m"))
+  cols_6m <- paste0("follow_outreachdate_", 1:15, "_6m")
+
+  mk <- function(d, cols, lab) {
+    cols <- intersect(cols, names(d))
+    if (!length(cols)) return(tibble(record_id = character(), date = as.Date(character()), window = character()))
+    d %>%
+      transmute(record_id = as.character(record_id)) %>%
+      bind_cols(d %>% select(all_of(cols))) %>%
+      pivot_longer(cols = all_of(cols), names_to = "var", values_to = "raw") %>%
+      mutate(date = as_date_guess(raw), window = lab) %>%
+      filter(!is.na(date)) %>%
+      select(record_id, date, window)
+  }
+
+  bind_rows(
+    mk(df, cols_3m, "3m"),
+    mk(df, cols_6m, "6m")
+  )
+}
+
+events_pid <- make_events_pid(fu)
+
+events_pid <- events_pid %>%
+  mutate(
+    period_code = dplyr::case_when(
+      date <  as.Date("2025-08-01") ~ "pre",
+      date >= as.Date("2025-08-01") & date < as.Date("2026-01-01") ~ "post",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(period_code))
+
+outreach_metrics <- events_pid %>%
+  group_by(window, period_code) %>%
+  summarise(outreach_attempts = dplyr::n(), .groups = "drop") %>%
+  right_join(
+    tidyr::crossing(window = c("3m", "6m"), period_labels %>% select(period_code, period_label)),
+    by = c("window", "period_code")
+  ) %>%
+  mutate(outreach_attempts = dplyr::coalesce(outreach_attempts, 0L)) %>%
+  select(window, period_code, period_label, outreach_attempts)
+
+# ---- final table ----
+final_tbl <- schedcomp_metrics %>%
+  select(window, period_code, period_label, n_scheduled, n_completed) %>%
+  left_join(outreach_metrics, by = c("window","period_code","period_label")) %>%
+  mutate(
+    n_participants = n_participants,
+    sched_per_participant    = n_scheduled / n_participants,
+    comp_per_participant     = n_completed / n_participants,
+    outreach_per_participant = outreach_attempts / n_participants
+  ) %>%
+  select(
+    Window = window,
+    Period = period_label,
+    `N participants (denom)` = n_participants,
+    `N scheduled (visitdate present)` = n_scheduled,
+    `Scheduled / participant` = sched_per_participant,
+    `N completed (status==1, dated)` = n_completed,
+    `Completed / participant` = comp_per_participant,
+    `Outreach attempts (dated)` = outreach_attempts,
+    `Outreach / participant` = outreach_per_participant
+  ) %>%
+  arrange(Window, desc(Period))
+
+gt::gt(final_tbl) %>%
+  gt::fmt_number(
+    columns = c(`Scheduled / participant`, `Completed / participant`, `Outreach / participant`),
+    decimals = 4
+  ) %>%
+  gt::fmt_number(
+    columns = c(`N participants (denom)`, `N scheduled (visitdate present)`, `N completed (status==1, dated)`, `Outreach attempts (dated)`),
+    decimals = 0
+  ) %>%
+  gt::tab_header(title = gt::md("**Follow-up scheduling, completion, and outreach attempts per participant**"))
 ```
-
 ```{r}
-# Ethnicity counts for approached vs enrolled (screen_ethnicity == 1)
-# ---------------------------------------------------------------
+# ========================= % CHANGE SUMMARY (COUNTS ONLY) =========================
+# Assumes you already created final_tbl
 
-# 1) Unique approached base (one row per youth/site)
-approached_base <- raw %>%
-  dplyr::distinct(record_id, site_id, screen_ethnicity)
+pct_change_counts_tbl <- final_tbl %>%
+  transmute(
+    window = Window,
+    period = Period,
 
-# 2) Counts by site for approached (screen_ethnicity == 1)
-ethn_approached <- approached_base %>%
-  count_by_site(screen_ethnicity == 1)
+    n_scheduled = `N scheduled (visitdate present)`,
+    n_completed = `N completed (status==1, dated)`,
+    outreach_attempts = `Outreach attempts (dated)`
+  ) %>%
+  mutate(
+    period_code = dplyr::case_when(
+      stringr::str_detect(period, "^Pre") ~ "pre",
+      TRUE ~ "post"
+    )
+  ) %>%
+  select(-period) %>%
+  tidyr::pivot_wider(
+    names_from  = period_code,
+    values_from = c(n_scheduled, n_completed, outreach_attempts)
+  ) %>%
+  mutate(
+    # ratios + % change (guard against divide-by-zero)
+    sched_ratio = ifelse(n_scheduled_pre > 0, n_scheduled_post / n_scheduled_pre, NA_real_),
+    comp_ratio  = ifelse(n_completed_pre > 0, n_completed_post / n_completed_pre, NA_real_),
+    out_ratio   = ifelse(outreach_attempts_pre > 0, outreach_attempts_post / outreach_attempts_pre, NA_real_),
 
-# 3) Counts by site for enrolled (treatment not NA & screen_ethnicity == 1)
-ethn_enrolled <- raw %>%
-  dplyr::filter(!is.na(treatment)) %>%                 # enrolled
-  dplyr::distinct(record_id, site_id, screen_ethnicity) %>%
-  count_by_site(screen_ethnicity == 1)
+    sched_pct_change = 100 * (sched_ratio - 1),
+    comp_pct_change  = 100 * (comp_ratio  - 1),
+    out_pct_change   = 100 * (out_ratio   - 1)
+  ) %>%
+  transmute(
+    Window = window,
 
-# 4) Put in one table (same shape as your enrollment table)
-ethn_tbl <- dplyr::bind_rows(
-  tibble::tibble(Item = "screen_ethnicity = 1 — Approached") %>% dplyr::bind_cols(ethn_approached),
-  tibble::tibble(Item = "screen_ethnicity = 1 — Enrolled")   %>% dplyr::bind_cols(ethn_enrolled)
+    `Scheduled (Pre)`  = n_scheduled_pre,
+    `Scheduled (Post)` = n_scheduled_post,
+    `Scheduled % change` = sched_pct_change,
+
+    `Completed (Pre)`  = n_completed_pre,
+    `Completed (Post)` = n_completed_post,
+    `Completed % change` = comp_pct_change,
+
+    `Outreach attempts (Pre)`  = outreach_attempts_pre,
+    `Outreach attempts (Post)` = outreach_attempts_post,
+    `Outreach % change` = out_pct_change
+  ) %>%
+  arrange(Window)
+
+gt::gt(pct_change_counts_tbl) %>%
+  gt::tab_header(title = gt::md("**% Change (Counts Only): 08/01/2025–01/01/2026 vs Pre 08/01/2025**")) %>%
+  gt::fmt_number(
+    columns = c(
+      `Scheduled (Pre)`, `Scheduled (Post)`,
+      `Completed (Pre)`, `Completed (Post)`,
+      `Outreach attempts (Pre)`, `Outreach attempts (Post)`
+    ),
+    decimals = 0
+  ) %>%
+  gt::fmt_number(
+    columns = c(`Scheduled % change`, `Completed % change`, `Outreach % change`),
+    decimals = 1
+  )
+```
+# Follow Up Rate Tables 
+```{r asof_flags}
+
+# ---- CSSR item -> risk flags (mutually exclusive: high first, then med) ----
+to_01 <- function(x) {
+  x <- suppressWarnings(as.integer(as.character(x)))
+  dplyr::case_when(
+    is.na(x) ~ NA_integer_,
+    x == 1L  ~ 1L,
+    x == 0L  ~ 0L,
+    TRUE     ~ NA_integer_
+  )
+}
+
+derive_cssr_risk_flags <- function(dat) {
+
+  # helper: safe column fetch that returns all-NA vector if missing
+  get_col <- function(nm) {
+    if (nm %in% names(dat)) dat[[nm]] else rep(NA, nrow(dat))
+  }
+
+  dat %>%
+    mutate(
+      # ===== BASELINE (your item list) =====
+      cssr_high_b = as.integer(
+        to_01(get_col("cssrs_4a_b")) == 1L |
+        to_01(get_col("cssrs_5a_b")) == 1L |
+        to_01(get_col("cssrs_7b_b")) == 1L
+      ),
+      cssr_med_b_raw = as.integer(
+        to_01(get_col("cssrs_3a_b")) == 1L |
+        to_01(get_col("cssrs_7a_b")) == 1L
+      ),
+      cssr_med_b = as.integer(cssr_high_b == 0L & cssr_med_b_raw == 1L),
+
+      # ===== 3 MONTH (your item list) =====
+      cssr_high_3m = as.integer(
+        to_01(get_col("cssrs_4_3m")) == 1L |
+        to_01(get_col("cssrs_5_3m")) == 1L |
+        to_01(get_col("cssrs_7_3m")) == 1L
+      ),
+      cssr_med_3m_raw = as.integer(to_01(get_col("cssrs_3_3m")) == 1L),
+      cssr_med_3m = as.integer(cssr_high_3m == 0L & cssr_med_3m_raw == 1L),
+
+      # ===== 6 MONTH (ONLY if those columns exist; otherwise stays NA) =====
+      cssr_high_6m = as.integer(
+        to_01(get_col("cssrs_4_6m")) == 1L |
+        to_01(get_col("cssrs_5_6m")) == 1L |
+        to_01(get_col("cssrs_7_6m")) == 1L
+      ),
+      cssr_med_6m_raw = as.integer(to_01(get_col("cssrs_3_6m")) == 1L),
+      cssr_med_6m = as.integer(cssr_high_6m == 0L & cssr_med_6m_raw == 1L)
+    ) %>%
+    select(-cssr_med_b_raw, -cssr_med_3m_raw, -cssr_med_6m_raw)
+}
+
+raw <- derive_cssr_risk_flags(raw)
+
+ASOF_DATES <- as.Date(c("2025-08-01", "2026-01-01"))
+
+prep_asof <- function(df, lock_date) {
+
+  parsed <- df %>%
+    mutate(
+      # ---- lock basis date (row included only if merged before lock) ----
+      merged_date_parsed = to_date_smart(merged_date),
+
+      # ---- follow-up dates (for as-of counting) ----
+      fu3m_date_parsed = to_date_smart(follow_visitdate_3m),
+      fu6m_date_parsed = to_date_smart(follow_visitdate_6m),
+
+      # raw status flags
+      fu3m_status = suppressWarnings(as.integer(as.character(follow_visitstatus_3m))) == 1L,
+      fu6m_status = suppressWarnings(as.integer(as.character(follow_visitstatus_6m))) == 1L,
+
+      # ---- as-of completed = status==1 AND date exists and is before lock_date ----
+      fu3m_completed = fu3m_status & !is.na(fu3m_date_parsed) & fu3m_date_parsed < lock_date,
+      fu6m_completed = fu6m_status & !is.na(fu6m_date_parsed) & fu6m_date_parsed < lock_date,
+
+      # baseline sample definition
+      treatment_int  = suppressWarnings(as.integer(as.character(treatment)))
+    )
+
+  # ---- audit counts (optional but helpful) ----
+  n_total <- nrow(parsed)
+  n_bad_merged <- sum(is.na(parsed$merged_date_parsed))
+  n_after_merged_lock <- sum(!is.na(parsed$merged_date_parsed) & parsed$merged_date_parsed >= lock_date)
+
+  n_fu3_status_on <- sum(parsed$fu3m_status, na.rm = TRUE)
+  n_fu3_counted   <- sum(parsed$fu3m_completed, na.rm = TRUE)
+
+  n_fu6_status_on <- sum(parsed$fu6m_status, na.rm = TRUE)
+  n_fu6_counted   <- sum(parsed$fu6m_completed, na.rm = TRUE)
+
+  out <- parsed %>%
+  filter(!is.na(merged_date_parsed), merged_date_parsed < lock_date) %>%
+  filter(!is.na(treatment_int)) %>%
+  mutate(
+    # cssr_pos_b can now be computed because cssr_high_b/cssr_med_b exist
+    cssr_pos_b = case_when(
+      cssr_high_b == 1L ~ TRUE,
+      cssr_high_b == 0L & cssr_med_b == 1L ~ TRUE,
+      cssr_high_b == 0L & cssr_med_b == 0L ~ FALSE,
+      TRUE ~ NA
+    ),
+    cassy_pos_b = cassy_result == 1L   # per your rule: use cassy_result
+  )
+
+  cat("\nAS-OF LOCK:", format(lock_date), "\n")
+  cat("Rows total:", n_total, "\n")
+  cat("Rows with unparsed merged_date:", n_bad_merged, "\n")
+  cat("Rows with merged_date >= lock_date (dropped):", n_after_merged_lock, "\n")
+  cat("Rows kept after merged_date lock + treatment filter:", nrow(out), "\n")
+  cat("3m status==1:", n_fu3_status_on, " | 3m counted (status==1 & date<lock):", n_fu3_counted, "\n")
+  cat("6m status==1:", n_fu6_status_on, " | 6m counted (status==1 & date<lock):", n_fu6_counted, "\n\n")
+
+  out
+}
+```
+---
+
+# 2) Table: 3m, 6m, and “either” follow-up completion rates (as of Jan 1)
+
+```{r table_fu_rates_asof}
+summ_fu_rates <- function(dat, asof_date) {
+  tibble::tibble(
+    `As of` = format(asof_date, "%Y-%m-%d"),
+    N_baseline = dplyr::n_distinct(dat$record_id),
+    `3m completed (n)` = sum(dat$fu3m_completed, na.rm = TRUE),
+    `3m completed (%)` = mean(dat$fu3m_completed, na.rm = TRUE) * 100,
+    `6m completed (n)` = sum(dat$fu6m_completed, na.rm = TRUE),
+    `6m completed (%)` = mean(dat$fu6m_completed, na.rm = TRUE) * 100,
+    `Either 3m or 6m completed (n)` = sum(dat$fu3m_completed | dat$fu6m_completed, na.rm = TRUE),
+    `Either 3m or 6m completed (%)` = mean(dat$fu3m_completed | dat$fu6m_completed, na.rm = TRUE) * 100
+  )
+}
+
+df_asof_aug <- prep_asof(df, as.Date("2025-08-01"))
+df_asof_jan <- prep_asof(df, as.Date("2026-01-01"))
+
+fu_rates_compare <- dplyr::bind_rows(
+  summ_fu_rates(df_asof_aug, as.Date("2025-08-01")),
+  summ_fu_rates(df_asof_jan, as.Date("2026-01-01"))
 )
 
-ethn_gt <- ethn_tbl %>%
-  gt::gt(rowname_col = "Item") %>%
+# Optional: add change row (Jan - Aug)
+delta_row <- fu_rates_compare %>%
+  dplyr::summarise(
+    `As of` = "Δ",
+    dplyr::across(where(is.numeric), ~ .[2] - .[1])
+  )
+
+fu_rates_compare <- dplyr::bind_rows(fu_rates_compare, delta_row)
+
+gt::gt(fu_rates_compare) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::fmt_number(columns = c("N_baseline", ends_with("(n)")), decimals = 0) %>%
   gt::tab_header(
-    title = gt::md("**WeCare Youth Enrollment by Ethnicity (screen_ethnicity = 1)**")
+    title = "Follow-up completion rates: Aug 1, 2025 vs Jan 1, 2026 (as-of snapshots)"
   ) %>%
-  gt::cols_label(Harlem = "Harlem", Kings = "Kings", Total = "Total") %>%
-  gt::fmt_number(columns = c(Harlem, Kings, Total), decimals = 0)
+  gt::tab_source_note(
+    "Each 'as of' snapshot keeps participants with merged_date < the as-of date, and baseline requires treatment not NA. Δ row is Jan - Aug."
+  )
+```
+```{r eligibility_flags}
+# Uses the same date parser behavior as prep_asof (timestamps OK)
+parse_date_any_safe <- function(x) {
+  x <- as.character(x)
+  dplyr::coalesce(
+    suppressWarnings(as.Date(x)),
+    suppressWarnings(as.Date(x, format = "%m/%d/%Y")),
+    suppressWarnings(as.Date(x, format = "%m/%d/%y")),
+    suppressWarnings(as.Date(x, format = "%Y/%m/%d")),
+    suppressWarnings(as.Date(substr(x, 1, 10)))
+  )
+}
 
-ethn_gt
+add_eligibility_flags <- function(dat, lock_date) {
+  dat %>%
+    mutate(
+      # schedule windows
+      sch_min_3m = to_date_smart(follow_sch_min_3m),
+      sch_max_3m = to_date_smart(follow_sch_max_3m),
+      sch_min_6m = to_date_smart(follow_sch_min_6m),
+      sch_max_6m = to_date_smart(follow_sch_max_6m),
+
+      has_sched_3m = !is.na(sch_min_3m) & !is.na(sch_max_3m),
+      has_sched_6m = !is.na(sch_min_6m) & !is.na(sch_max_6m),
+
+      # Denominator 1: window ever opened by lock date
+      elig_3m_ever_open = has_sched_3m & (sch_min_3m <= lock_date),
+      elig_6m_ever_open = has_sched_6m & (sch_min_6m <= lock_date),
+
+      # Denominator 2: window closed by lock date
+      # If you consider max date inclusive, this is correct:
+      elig_3m_closed = has_sched_3m & (sch_max_3m <= lock_date),
+      elig_6m_closed = has_sched_6m & (sch_max_6m <= lock_date),
+
+      # Optional (not requested, but sometimes useful): currently open at lock
+      open_3m_now = has_sched_3m & lock_date >= sch_min_3m & lock_date <= sch_max_3m,
+      open_6m_now = has_sched_6m & lock_date >= sch_min_6m & lock_date <= sch_max_6m
+    )
+}
+
+```
+
+## 2) Drop-in: build the “ever opened” and “closed” rate tables (Aug vs Jan)
+
+This produces **two GT tables**:
+- Table A: completion among those whose window **ever opened**
+- Table B: completion among those whose window is **closed**
+
+```{r fu_rate_tables_open_vs_closed}
+summ_rates <- function(dat, lock_date, denom_type = c("ever_open", "closed")) {
+  denom_type <- match.arg(denom_type)
+
+  # choose eligibility flags
+  if (denom_type == "ever_open") {
+    e3 <- dat$elig_3m_ever_open
+    e6 <- dat$elig_6m_ever_open
+    denom_label <- "Window ever opened"
+  } else {
+    e3 <- dat$elig_3m_closed
+    e6 <- dat$elig_6m_closed
+    denom_label <- "Window closed"
+  }
+
+  # denominators
+  d3 <- sum(dplyr::coalesce(e3, FALSE))
+  d6 <- sum(dplyr::coalesce(e6, FALSE))
+  de <- sum(dplyr::coalesce(e3 | e6, FALSE))  # eligible for either wave
+
+  # numerators: completed by lock AND eligible
+  n3 <- sum(dplyr::coalesce(dat$fu3m_completed & e3, FALSE))
+  n6 <- sum(dplyr::coalesce(dat$fu6m_completed & e6, FALSE))
+  ne <- sum(dplyr::coalesce((dat$fu3m_completed & e3) | (dat$fu6m_completed & e6), FALSE))
+
+  tibble::tibble(
+    `As of` = format(lock_date),
+    Denominator = denom_label,
+
+    `3m eligible (n)` = d3,
+    `3m completed (n)` = n3,
+    `3m completed (%)` = ifelse(d3 > 0, 100 * n3 / d3, NA_real_),
+
+    `6m eligible (n)` = d6,
+    `6m completed (n)` = n6,
+    `6m completed (%)` = ifelse(d6 > 0, 100 * n6 / d6, NA_real_),
+
+    `Either eligible (n)` = de,
+    `Either completed (n)` = ne,
+    `Either completed (%)` = ifelse(de > 0, 100 * ne / de, NA_real_)
+  )
+}
+
+build_asof_rate_tables <- function(df, asof_dates) {
+  out <- lapply(asof_dates, function(d) {
+    dat <- prep_asof(df, d) %>% add_eligibility_flags(d)
+    dplyr::bind_rows(
+      summ_rates(dat, d, "ever_open"),
+      summ_rates(dat, d, "closed")
+    )
+  })
+  dplyr::bind_rows(out)
+}
+
+fu_rate_compare <- build_asof_rate_tables(df, ASOF_DATES)
+
+# Split into two tables (one per denominator type) for readability
+tbl_open <- fu_rate_compare %>% dplyr::filter(Denominator == "Window ever opened")
+tbl_closed <- fu_rate_compare %>% dplyr::filter(Denominator == "Window closed")
+
+gt::gt(tbl_open) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Follow-up completion among those whose window EVER OPENED (by as-of date)") %>%
+  gt::tab_source_note("Eligibility uses schedule min/max; completion requires status==1 and follow_visitdate <= lock date.")
+
+gt::gt(tbl_closed) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Follow-up completion among those whose window is CLOSED (by as-of date)") %>%
+  gt::tab_source_note("Closed means follow_sch_max_*m <= lock date. Completion requires status==1 and follow_visitdate <= lock date.")
+```
+
+```{r diagnostic_denoms_only}
+diagnose_denoms <- function(df, lock_date) {
+  dat <- prep_asof(df, lock_date) %>% add_eligibility_flags(lock_date)
+
+  tibble::tibble(
+    `As of` = format(lock_date),
+    N_baseline = n_distinct(dat$record_id),
+
+    `3m ever-open (n)` = sum(coalesce(dat$elig_3m_ever_open, FALSE)),
+    `3m closed (n)`    = sum(coalesce(dat$elig_3m_closed, FALSE)),
+
+    `6m ever-open (n)` = sum(coalesce(dat$elig_6m_ever_open, FALSE)),
+    `6m closed (n)`    = sum(coalesce(dat$elig_6m_closed, FALSE))
+  )
+}
+
+den_diag <- dplyr::bind_rows(lapply(ASOF_DATES, function(d) diagnose_denoms(df, d)))
+
+gt::gt(den_diag) %>%
+  gt::tab_header(title = "Diagnostic: denominator sizes (ever-open vs closed) at each as-of date")
+```
+
+```{r baseline_date_detect}
+# If you already have pick_by_regex from earlier, keep yours. Otherwise:
+pick_by_regex <- function(df, regex_vec) {
+  nms <- names(df)
+  for (rx in regex_vec) {
+    hit <- nms[stringr::str_detect(nms, stringr::regex(rx, ignore_case = TRUE))]
+    if (length(hit)) return(hit[[1]])
+  }
+  NA_character_
+}
+
+# Reuse the same parser behavior
+parse_date_any_safe <- function(x) {
+  x <- as.character(x)
+  dplyr::coalesce(
+    suppressWarnings(as.Date(x)),
+    suppressWarnings(as.Date(x, format = "%m/%d/%Y")),
+    suppressWarnings(as.Date(x, format = "%m/%d/%y")),
+    suppressWarnings(as.Date(x, format = "%Y/%m/%d")),
+    suppressWarnings(as.Date(substr(x, 1, 10)))
+  )
+}
+
+baseline_date_col <- pick_by_regex(df, c(
+  "^baseline_date$",
+  "baseline.*date",
+  "^enroll_date$",
+  "enroll.*date",
+  "^icf_date$",
+  "consent.*date",
+  "^screen_date$",
+  "screen.*date",
+  "^visit_date$"
+))
+
+if (is.na(baseline_date_col)) {
+  message("⚠️ Could not auto-detect a baseline date column. Falling back to merged_date.")
+  baseline_date_col <- "merged_date"
+}
+
+message("Using baseline date column: ", baseline_date_col)
+```
+
+---
+
+## Drop-in 2 — build Adam’s headline metric (Either completed among those with ≥1 window closed)
+
+**This gives Aug 1, 2025 vs Jan 1, 2026 in one table**.
+```{r either_closed_headline_table}
+# Build as-of datasets for each lock date, add eligibility flags, add baseline_date_parsed,
+# and compute "closed-either" denominator + "either completed" numerator.
+
+prep_for_adam <- function(df, lock_date) {
+  dat <- prep_asof(df, lock_date) %>%
+    add_eligibility_flags(lock_date) %>%
+    dplyr::mutate(
+      baseline_date_parsed = to_date_smart(.data[[baseline_date_col]]),
+
+      # Denominator: at least one FU window is closed (wave-specific max dates)
+      elig_closed_either = dplyr::coalesce(elig_3m_closed, FALSE) | dplyr::coalesce(elig_6m_closed, FALSE),
+
+      # Numerator: completed either by lock date (as-of strict completion from prep_asof)
+      completed_either = dplyr::coalesce(fu3m_completed, FALSE) | dplyr::coalesce(fu6m_completed, FALSE),
+
+      # Helpful decomposition (for storytelling/debug)
+      completed_3m_only = dplyr::coalesce(fu3m_completed, FALSE) & !dplyr::coalesce(fu6m_completed, FALSE),
+      completed_6m_only = !dplyr::coalesce(fu3m_completed, FALSE) & dplyr::coalesce(fu6m_completed, FALSE),
+      completed_both    = dplyr::coalesce(fu3m_completed, FALSE) & dplyr::coalesce(fu6m_completed, FALSE)
+    )
+  dat
+}
+
+headline_rows <- lapply(ASOF_DATES, function(d) {
+  dat <- prep_for_adam(df, d)
+
+  denom <- sum(dat$elig_closed_either, na.rm = TRUE)
+  num   <- sum(dat$elig_closed_either & dat$completed_either, na.rm = TRUE)
+
+  tibble::tibble(
+    `As of` = format(d),
+    `Eligible (≥1 window closed) N` = denom,
+    `Either completed (n)` = num,
+    `Either completed (%)` = ifelse(denom > 0, 100 * num / denom, NA_real_),
+    `3m only (n)` = sum(dat$elig_closed_either & dat$completed_3m_only, na.rm = TRUE),
+    `6m only (n)` = sum(dat$elig_closed_either & dat$completed_6m_only, na.rm = TRUE),
+    `Both (n)`    = sum(dat$elig_closed_either & dat$completed_both, na.rm = TRUE)
+  )
+})
+
+headline_tbl <- dplyr::bind_rows(headline_rows)
+
+gt::gt(headline_tbl) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Either follow-up completed among participants with ≥1 follow-up window closed (as-of comparison)") %>%
+  gt::tab_source_note("Denominator: follow_sch_max_3m <= lock OR follow_sch_max_6m <= lock (non-missing schedules). Numerator: follow_visitstatus==1 AND follow_visitdate <= lock (3m or 6m).")
+```
+
+---
+
+## Drop-in 3 — “evidence we can reach 50%”: cohort trends (baseline month + year) using the Jan 1 lock
+
+This is the single strongest evidence structure for DSMB: **later baseline cohorts show higher matured-cohort follow-up success**.
+```{r cohort_trends_month_year}
+LOCK_MAIN <- as.Date("2026-01-01")
+dat_main <- prep_for_adam(df, LOCK_MAIN)
+
+# keep only eligible matured sample for Adam’s headline metric
+dat_mature <- dat_main %>%
+  dplyr::filter(elig_closed_either) %>%
+  dplyr::filter(!is.na(baseline_date_parsed))
+
+# Cohort by baseline month
+cohort_month <- dat_mature %>%
+  dplyr::mutate(baseline_month = lubridate::floor_date(baseline_date_parsed, "month")) %>%
+  dplyr::group_by(baseline_month) %>%
+  dplyr::summarise(
+    `Eligible N (≥1 window closed)` = dplyr::n(),
+    `Either completed (n)` = sum(completed_either, na.rm = TRUE),
+    `Either completed (%)` = 100 * mean(completed_either, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(baseline_month)
+
+gt::gt(cohort_month) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Cohort trend (baseline month): Either completed among matured eligible (as of Jan 1, 2026)") %>%
+  gt::tab_source_note("This is the matured-cohort metric: among those with ≥1 FU window closed by Jan 1, what % completed either 3m or 6m by Jan 1.")
+
+# Cohort by baseline year (nice, simple DSMB framing)
+cohort_year <- dat_mature %>%
+  dplyr::mutate(baseline_year = lubridate::year(baseline_date_parsed)) %>%
+  dplyr::group_by(baseline_year) %>%
+  dplyr::summarise(
+    `Eligible N (≥1 window closed)` = dplyr::n(),
+    `Either completed (n)` = sum(completed_either, na.rm = TRUE),
+    `Either completed (%)` = 100 * mean(completed_either, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(baseline_year)
+
+gt::gt(cohort_year) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Cohort trend (baseline year): Either completed among matured eligible (as of Jan 1, 2026)")
+```
+
+---
+
+## Drop-in 4 — “best evidence toward 50%”: show the *best recent cohorts* and what rate they hit
+
+This gives you an evidence snippet like: “Recent cohorts have reached X% → plausibly improvable toward 50%.”
+```{r evidence_recent_cohorts}
+# Define "recent cohorts" window however you want. Here: last 6 baseline months present in the matured sample.
+recent_months <- dat_mature %>%
+  dplyr::mutate(baseline_month = lubridate::floor_date(baseline_date_parsed, "month")) %>%
+  dplyr::distinct(baseline_month) %>%
+  dplyr::arrange(dplyr::desc(baseline_month)) %>%
+  dplyr::slice_head(n = 6) %>%
+  dplyr::pull(baseline_month)
+
+recent_summary <- dat_mature %>%
+  dplyr::mutate(baseline_month = lubridate::floor_date(baseline_date_parsed, "month")) %>%
+  dplyr::filter(baseline_month %in% recent_months) %>%
+  dplyr::summarise(
+    `Eligible N (recent months)` = dplyr::n(),
+    `Either completed (n)` = sum(completed_either, na.rm = TRUE),
+    `Either completed (%)` = 100 * mean(completed_either, na.rm = TRUE)
+  )
+
+best_months <- cohort_month %>%
+  dplyr::filter(`Eligible N (≥1 window closed)` >= 20) %>%  # avoid tiny denominators
+  dplyr::arrange(dplyr::desc(`Either completed (%)`)) %>%
+  dplyr::slice_head(n = 6)
+
+gt::gt(recent_summary) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Recent-cohort performance (last 6 baseline months in matured eligible sample)")
+
+gt::gt(best_months) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Best baseline-month cohorts (≥20 eligible): Evidence of achievable follow-up performance")
+```
+
+---
+
+## Drop-in 5 — “what would it take to reach 50%”: gap-to-target calculation (actionable DSMB framing)
+
+This turns the story into: “We’re at X%. To reach 50%, we need Y additional follow-ups among those already matured-eligible.”
+```{r gap_to_50}
+LOCK_MAIN <- as.Date("2026-01-01")
+dat_main <- prep_for_adam(df, LOCK_MAIN)
+
+denom <- sum(dat_main$elig_closed_either, na.rm = TRUE)
+num   <- sum(dat_main$elig_closed_either & dat_main$completed_either, na.rm = TRUE)
+
+target_rate <- 0.50
+target_n <- ceiling(target_rate * denom)
+gap_n <- max(0, target_n - num)
+
+gap_tbl <- tibble::tibble(
+  `As of` = format(LOCK_MAIN),
+  `Eligible (≥1 window closed) N` = denom,
+  `Either completed (n)` = num,
+  `Current rate (%)` = 100 * num / denom,
+  `Target rate (%)` = 100 * target_rate,
+  `Target completions needed (n)` = target_n,
+  `Additional completions needed to reach target (n)` = gap_n
+)
+
+gt::gt(gap_tbl) %>%
+  gt::fmt_number(columns = c(`Current rate (%)`, `Target rate (%)`), decimals = 1) %>%
+  gt::tab_header(title = "Gap-to-50%: How many additional follow-ups are needed among matured-eligible participants?")
+```
+
+
+
+
+
+
+---
+
+# 3) Table: “Either 3m or 6m completed” by baseline CSSR+ vs baseline CASSY- (two groups)
+
+Interpretation: compare **baseline CSSR positive** vs **baseline CASSY negative** (two separate baseline-defined groups).
+
+```{r table_either_by_cssrpos_vs_cassyneg}
+either_tbl <- df_lock %>%
+  mutate(
+    group = case_when(
+      cssr_pos_b == TRUE  ~ "Baseline CSSR+",
+      cassy_pos_b == FALSE ~ "Baseline CASSY-",
+      TRUE ~ NA_character_
+    ),
+    either_completed = fu3m_completed | fu6m_completed
+  ) %>%
+  filter(!is.na(group)) %>%
+  group_by(group) %>%
+  summarise(
+    `Baseline group N` = n(),
+    `Either 3m or 6m completed (n)` = sum(either_completed, na.rm = TRUE),
+    `Either 3m or 6m completed (%)` = mean(either_completed, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+gt::gt(either_tbl) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Either follow-up completion by baseline group (CSSR+ vs CASSY-), as of Jan 1, 2026")
+```
+
+
+---
+# NEW TABLES
+
+```{r}
+# --- drop-in: attempt counts + completion flags as-of ---
+ASOF_DATES <- as.Date(c("2025-08-01", "2026-01-01"))
+
+# assumes you already have:
+# - prep_asof(df, lock_date) that parses merged_date, follow_visitdate_3m/6m, follow_visitstatus_3m/6m
+# - make_events_pid(df) that returns record_id, date, window
+
+attempts_asof <- function(df_in, lock_date) {
+  # events from *full* raw-ish df (must include outreach date fields)
+  events <- make_events_pid(df_in) %>%
+    mutate(date = as.Date(date)) %>%
+    filter(!is.na(date), date < lock_date)
+
+  # count attempts per participant-window
+  att <- events %>%
+    count(record_id, window, name = "outreach_attempts") %>%
+    tidyr::pivot_wider(
+      names_from = window,
+      values_from = outreach_attempts,
+      values_fill = 0
+    ) %>%
+    rename(att_3m = `3m`, att_6m = `6m`) %>%
+    mutate(att_either = att_3m + att_6m)
+
+  att
+}
+
+add_attempts_and_completions <- function(df_lock, df_in, lock_date) {
+  att <- attempts_asof(df_in, lock_date)
+
+  df_lock %>%
+    mutate(record_id = as.character(record_id)) %>%
+    left_join(att, by = "record_id") %>%
+    mutate(
+      att_3m = dplyr::coalesce(att_3m, 0L),
+      att_6m = dplyr::coalesce(att_6m, 0L),
+      att_either = dplyr::coalesce(att_either, 0L),
+
+      completed_either = (fu3m_completed | fu6m_completed),
+
+      any_outreach_3m = att_3m > 0,
+      any_outreach_6m = att_6m > 0,
+      any_outreach_either = att_either > 0
+    )
+}
+```
+
+```{r funnel table}
+
+# --- drop-in: funnel as-of for matured-eligible ---
+eligible_closed_flag <- function(dat, lock_date) {
+  # expects follow_sch_max_3m / follow_sch_max_6m already parsed as Date (or parse here)
+
+  dat %>%
+    mutate(
+      sch_max_3m = to_date_smart(follow_sch_max_3m),
+      sch_max_6m = to_date_smart(follow_sch_max_6m),
+
+      eligible_closed_3m = !is.na(sch_max_3m) & sch_max_3m < lock_date,
+      eligible_closed_6m = !is.na(sch_max_6m) & sch_max_6m < lock_date,
+      eligible_closed_either = eligible_closed_3m | eligible_closed_6m
+    )
+}
+
+funnel_tbl_asof <- function(df_in, lock_date) {
+  df_lock <- prep_asof(df_in, lock_date) %>%
+    eligible_closed_flag(lock_date)
+
+  df_lock2 <- add_attempts_and_completions(df_lock, df_in, lock_date) %>%
+    filter(eligible_closed_either)
+
+  tibble::tibble(
+    as_of = format(lock_date),
+    eligible_closed_N = n_distinct(df_lock2$record_id),
+    any_outreach_n = sum(df_lock2$any_outreach_either, na.rm = TRUE),
+    any_outreach_pct = 100 * mean(df_lock2$any_outreach_either, na.rm = TRUE),
+    completed_n = sum(df_lock2$completed_either, na.rm = TRUE),
+    completed_pct = 100 * mean(df_lock2$completed_either, na.rm = TRUE),
+    completions_per_10_attempts = 10 * (sum(df_lock2$completed_either, na.rm = TRUE) / sum(df_lock2$att_either, na.rm = TRUE))
+  )
+}
+
+funnel_all <- dplyr::bind_rows(lapply(ASOF_DATES, function(d) funnel_tbl_asof(raw, d)))
+
+gt::gt(funnel_all) %>%
+  gt::fmt_number(columns = c(any_outreach_pct, completed_pct, completions_per_10_attempts), decimals = 1) %>%
+  gt::tab_header(title = "As-of funnel (matured eligible): outreach coverage + completion (Aug 1 vs Jan 1)")
+```
+
+```{r dose reponse}
+dose_response_asof <- function(df_in, lock_date) {
+  df_lock <- prep_asof(df_in, lock_date) %>%
+    eligible_closed_flag(lock_date)
+
+  df_lock2 <- add_attempts_and_completions(df_lock, df_in, lock_date) %>%
+    filter(eligible_closed_either) %>%
+    mutate(
+      att_bin = case_when(
+        att_either == 0 ~ "0",
+        att_either %in% 1:2 ~ "1–2",
+        att_either %in% 3:5 ~ "3–5",
+        att_either >= 6 ~ "6+",
+        TRUE ~ NA_character_
+      )
+    )
+
+  df_lock2 %>%
+    group_by(att_bin) %>%
+    summarise(
+      N = n_distinct(record_id),
+      completed_n = sum(completed_either, na.rm = TRUE),
+      completed_pct = 100 * mean(completed_either, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      noncompleted_n   = N - completed_n,
+      noncompleted_pct = 100 - completed_pct,
+      as_of = format(lock_date)
+    ) %>%
+    select(as_of, att_bin, N, completed_n, noncompleted_n, completed_pct, noncompleted_pct)
+}
+
+dose_tbl <- bind_rows(
+  dose_response_asof(raw, as.Date("2025-08-01")),
+  dose_response_asof(raw, as.Date("2026-01-01"))
+)
+
+gt::gt(dose_tbl) %>%
+  gt::fmt_number(columns = c(completed_pct, noncompleted_pct), decimals = 1) %>%
+  gt::tab_header(title = "Completion vs non-completion by outreach attempt intensity (matured eligible)")
+```
+
+```{r outreach and completion table}
+diag_outreach_missingness <- function(df_in, lock_date) {
+  df_lock <- prep_asof(df_in, lock_date) %>%
+    eligible_closed_flag(lock_date)
+
+  df_lock2 <- add_attempts_and_completions(df_lock, df_in, lock_date) %>%
+    filter(eligible_closed_either)
+
+  df_lock2 %>%
+    summarise(
+      eligible_N = n_distinct(record_id),
+      noncompleters_N = sum(!completed_either, na.rm = TRUE),
+      noncompleters_with_any_outreach_pct = 100 * mean(any_outreach_either[!completed_either], na.rm = TRUE),
+      completers_with_any_outreach_pct = 100 * mean(any_outreach_either[completed_either], na.rm = TRUE)
+    )
+}
+
+print(diag_outreach_missingness(raw, as.Date("2026-01-01")))
+```
+
+
+```{r outreach + completed flags}
+# =======================
+# Outreach + completion prep (3m/6m)
+# Requires: to_date_smart() already defined in your helpers
+# =======================
+
+get_outreach_cols <- function(dat, window) {
+  stopifnot(window %in% c("3m","6m"))
+
+  if (window == "3m") {
+    # 3m has follow_outreach_1_3m plus outreachdate_2..15_3m
+    cand <- c("follow_outreach_1_3m", paste0("follow_outreachdate_", 2:15, "_3m"))
+  } else {
+    # 6m has outreachdate_1..15_6m
+    cand <- paste0("follow_outreachdate_", 1:15, "_6m")
+  }
+
+  intersect(cand, names(dat))
+}
+
+# --- Column lists from you ---
+OUTREACH_COLS_3M <- c(
+  "follow_outreach_1_3m",
+  paste0("follow_outreachdate_", 2:15, "_3m")
+)
+
+OUTREACH_COLS_6M <- paste0("follow_outreachdate_", 1:15, "_6m")
+
+# --- Build a long table of outreach attempts (dated) ---
+outreach_long <- function(dat, window = c("3m","6m")) {
+  window <- match.arg(window)
+
+  cols <- if (window == "3m") OUTREACH_COLS_3M else OUTREACH_COLS_6M
+  cols <- intersect(cols, names(dat))
+  if (!length(cols)) {
+    stop("No outreach columns found for window=", window,
+         ". Check names(dat) and OUTREACH_COLS_*.")
+  }
+
+  dat %>%
+    dplyr::transmute(record_id = as.character(record_id)) %>%
+    dplyr::bind_cols(dat %>% dplyr::select(dplyr::all_of(cols))) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(cols), names_to = "var", values_to = "raw") %>%
+    dplyr::mutate(
+      date = to_date_smart(raw),
+      window = window
+    ) %>%
+    dplyr::filter(!is.na(date)) %>%
+    dplyr::select(record_id, window, var, date)
+}
+
+# --- Turn outreach_long into attempt #1..#15 dates per participant, as-of lock_date ---
+attempt_dates_wide <- function(dat, lock_date, window = c("3m","6m")) {
+  window <- match.arg(window)
+
+  ol <- outreach_long(dat, window) %>%
+    dplyr::filter(date < lock_date) %>%
+    dplyr::arrange(record_id, date) %>%
+    dplyr::group_by(record_id) %>%
+    dplyr::mutate(attempt_num = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(attempt_num <= 15)
+
+  # attempt count as-of lock date
+  attempt_count <- ol %>%
+    dplyr::count(record_id, name = "attempts_asof")
+
+  # wide attempt dates (may have only some attempt_date_k columns)
+  wide <- ol %>%
+    dplyr::mutate(attempt_col = paste0("attempt_date_", attempt_num)) %>%
+    dplyr::select(record_id, attempt_col, date) %>%
+    tidyr::pivot_wider(names_from = attempt_col, values_from = date)
+
+  # ✅ FORCE all attempt_date_1..15 to exist
+  for (k in 1:15) {
+    nm <- paste0("attempt_date_", k)
+    if (!nm %in% names(wide)) wide[[nm]] <- as.Date(NA)
+  }
+
+  # order columns nicely
+  wide <- wide %>%
+    dplyr::select(record_id, dplyr::all_of(paste0("attempt_date_", 1:15)))
+
+  wide %>%
+    dplyr::left_join(attempt_count, by = "record_id") %>%
+    dplyr::mutate(attempts_asof = dplyr::coalesce(attempts_asof, 0L))
+}
+
+# --- Completion flag/date for a window (uses visitstatus==1, and visitdate<lock_date) ---
+completion_asof <- function(dat, lock_date, window = c("3m","6m")) {
+  window <- match.arg(window)
+
+  if (window == "3m") {
+    vd <- "follow_visitdate_3m"; vs <- "follow_visitstatus_3m"
+  } else {
+    vd <- "follow_visitdate_6m"; vs <- "follow_visitstatus_6m"
+  }
+
+  stopifnot(vd %in% names(dat), vs %in% names(dat))
+
+  dat %>%
+    dplyr::transmute(
+      record_id = as.character(record_id),
+      visit_date = to_date_smart(.data[[vd]]),
+      visit_status = suppressWarnings(as.integer(as.character(.data[[vs]]))),
+      completed_asof = (visit_status == 1L) & !is.na(visit_date) & (visit_date < lock_date)
+      # If you truly want "status==1 regardless of date", use:
+      # completed_asof = (visit_status == 1L)
+    )
+}
+
+```
+
+```{r}
+build_outreach_long <- function(dat, lock_date, window) {
+  cols <- get_outreach_cols(dat, window)
+  if (!length(cols)) {
+    return(tibble::tibble(record_id = character(), attempt_date = as.Date(character()), attempt = integer()))
+  }
+
+  dat %>%
+    dplyr::transmute(record_id = as.character(record_id)) %>%
+    dplyr::bind_cols(dat %>% dplyr::select(dplyr::all_of(cols))) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(cols), names_to = "var", values_to = "raw") %>%
+    dplyr::mutate(attempt_date = to_date_smart(raw)) %>%
+    dplyr::filter(!is.na(attempt_date), attempt_date < lock_date) %>%
+    dplyr::group_by(record_id) %>%
+    dplyr::arrange(attempt_date, .by_group = TRUE) %>%
+    dplyr::mutate(attempt = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(record_id, attempt_date, attempt)
+}
+```
+
+
+
+```{r}
+# =======================
+# Marginal completion yield by attempt number
+# =======================
+
+marginal_yield_by_attempt <- function(dat, lock_date, window,
+                                      restrict_matured_eligible = TRUE) {
+  stopifnot(window %in% c("3m","6m"))
+
+  # prep_asof() should already:
+  # - filter merged_date < lock
+  # - filter treatment not NA
+  # - parse fu visit dates
+  df_lock <- prep_asof(dat, lock_date)
+
+  # wave-specific "window closed" eligibility
+  sch_max_col <- if (window == "3m") "follow_sch_max_3m" else "follow_sch_max_6m"
+  df_lock <- df_lock %>%
+    dplyr::mutate(
+      sch_max = to_date_smart(.data[[sch_max_col]]),
+      eligible_closed = !is.na(sch_max) & sch_max < lock_date
+    )
+
+  if (restrict_matured_eligible) df_lock <- df_lock %>% dplyr::filter(eligible_closed)
+
+  # completion status (status==1 defines completed; still apply visit_date<lock)
+  visit_date <- if (window == "3m") df_lock$fu3m_date_parsed else df_lock$fu6m_date_parsed
+  status_ok  <- if (window == "3m") df_lock$fu3m_status       else df_lock$fu6m_status
+
+  df_lock <- df_lock %>%
+    dplyr::mutate(
+      visit_date = visit_date,
+      completed_asof = status_ok & !is.na(visit_date) & visit_date < lock_date
+    )
+
+  eligible_ids <- df_lock %>% dplyr::distinct(record_id)
+  eligible_N   <- nrow(eligible_ids)
+
+  # outreach attempts long (as-of)
+  out_long <- build_outreach_long(dat, lock_date, window)
+  # expects: record_id, attempt (int), attempt_date (Date)
+
+  # attempts as-of per eligible person (0 if none)
+  attempts_asof <- eligible_ids %>%
+    dplyr::left_join(
+      out_long %>%
+        dplyr::group_by(record_id) %>%
+        dplyr::summarise(attempts_asof = max(attempt, na.rm = TRUE), .groups="drop"),
+      by = "record_id"
+    ) %>%
+    dplyr::mutate(attempts_asof = dplyr::coalesce(attempts_asof, 0L))
+
+  # completers
+  completers <- df_lock %>%
+    dplyr::filter(completed_asof) %>%
+    dplyr::select(record_id, visit_date)
+
+  # attempt-at-completion = max attempt_date <= visit_date
+  attempt_at_completion <- completers %>%
+    dplyr::left_join(out_long, by = "record_id") %>%
+    dplyr::filter(!is.na(attempt_date) & attempt_date <= visit_date) %>%
+    dplyr::group_by(record_id) %>%
+    dplyr::summarise(attempt_at_completion = max(attempt, na.rm = TRUE), .groups="drop")
+
+  # default to 0 if no outreach attempt before the visit date
+  completers2 <- completers %>%
+    dplyr::left_join(attempt_at_completion, by = "record_id") %>%
+    dplyr::mutate(attempt_at_completion = dplyr::coalesce(attempt_at_completion, 0L))
+
+  # ----- marginal table (safe even if 0 eligible or 0 completers) -----
+  if (eligible_N == 0L) {
+    tab <- tibble::tibble(
+      window = window,
+      as_of = format(lock_date),
+      completion_bucket = character(),
+      eligible_N = integer(),
+      completed_n = integer(),
+      completed_pct_of_eligible = double()
+    )
+  } else {
+    tab <- completers2 %>%
+      dplyr::count(attempt_at_completion, name = "completed_n") %>%
+      dplyr::mutate(
+        eligible_N = eligible_N,
+        completed_pct_of_eligible = 100 * completed_n / eligible_N,
+        completion_bucket = dplyr::if_else(
+          attempt_at_completion == 0L, "0 attempts", paste0("Attempt ", attempt_at_completion)
+        ),
+        window = window,
+        as_of = format(lock_date)
+      ) %>%
+      dplyr::arrange(attempt_at_completion) %>%
+      dplyr::select(window, as_of, completion_bucket, eligible_N, completed_n, completed_pct_of_eligible)
+  }
+
+  # ---- diagnostic: does marginal sum to total completions? ----
+  total_completed <- sum(df_lock$completed_asof, na.rm = TRUE)
+  summed <- sum(tab$completed_n, na.rm = TRUE)
+  if (eligible_N > 0L && !identical(as.integer(total_completed), as.integer(summed))) {
+    message("⚠️ Diagnostic: total completions=", total_completed,
+            " but marginal buckets sum to ", summed,
+            ". (Often means missing visit_date or outreach logged after visit.)")
+  }
+
+  list(
+    summary = tab,
+    detail_completers = completers2,
+    detail_attempts_asof = attempts_asof
+  )
+}
+```
+
+
+```{r}
+ASOF_DATES <- as.Date(c("2025-08-01", "2026-01-01"))
+
+run_marginal_tables <- function(raw, window = c("3m","6m"), restrict_matured_eligible = TRUE) {
+  window <- match.arg(window)
+
+  res <- lapply(ASOF_DATES, function(d) {
+
+    tmp <- marginal_yield_by_attempt(
+      dat = raw,
+      lock_date = d,
+      window = window,
+      restrict_matured_eligible = restrict_matured_eligible
+    )
+
+    # The table is returned in tmp$summary
+    out <- tmp$summary
+    if (is.null(out)) out <- tibble::tibble()
+
+    # Ensure stable columns even if empty
+    if (!("window" %in% names(out))) out$window <- window
+    if (!("as_of" %in% names(out))) out$as_of <- format(d)
+    if (!("completion_bucket" %in% names(out))) out$completion_bucket <- NA_character_
+    if (!("eligible_N" %in% names(out))) out$eligible_N <- NA_integer_
+    if (!("completed_n" %in% names(out))) out$completed_n <- NA_integer_
+    if (!("completed_pct_of_eligible" %in% names(out))) out$completed_pct_of_eligible <- NA_real_
+
+    out %>%
+      dplyr::select(window, as_of, completion_bucket, eligible_N, completed_n, completed_pct_of_eligible)
+  })
+
+  dplyr::bind_rows(res)
+}
+
+marg_3m <- run_marginal_tables(raw, "3m", restrict_matured_eligible = TRUE)
+marg_6m <- run_marginal_tables(raw, "6m", restrict_matured_eligible = TRUE)
+
+gt::gt(marg_3m) %>% gt::tab_header(title = "3m: Marginal completion yield by outreach attempt (matured eligible)")
+gt::gt(marg_6m) %>% gt::tab_header(title = "6m: Marginal completion yield by outreach attempt (matured eligible)")
 ```

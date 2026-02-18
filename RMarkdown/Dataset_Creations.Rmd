@@ -1,0 +1,79 @@
+---
+title: "Create Adam_12192025.csv (Baseline filtered)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(readr)
+library(dplyr)
+
+`%||%` <- function(x, y) if (!is.null(x) && length(x) > 0 && !is.na(x)) x else y
+```
+
+# Adam_12192025: Enrolled Youth Baseline Data (no Caregiver)
+```{r filter-and-export}
+# If OUT_DIR isn't set elsewhere, default to current directory
+OUT_DIR  <- OUT_DIR %||% "."
+
+# Input path
+csv_path <- file.path(OUT_DIR, "youth_baseline_clean.csv")
+
+# Output folder + file
+out_dir  <- file.path(OUT_DIR, "Datasets for Analysis")
+out_file <- file.path(out_dir, "Adam_12192025.csv")
+
+# Read -> filter -> write
+df <- read_csv(csv_path, show_col_types = FALSE)
+
+df_out <- df %>%
+  mutate(treatment = na_if(trimws(as.character(treatment)), "")) %>%  # treat "" as missing
+  filter(!is.na(treatment))                                           # drop missing treatment
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+write_csv(df_out, out_file, na = "")
+
+cat("Wrote:", out_file, "\n")
+cat("Rows in:", nrow(df), "\n")
+cat("Rows out:", nrow(df_out), "\n")
+```
+
+```{r consent-check-ps-hear-more, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(gt)
+
+# --- Consent / "hear more" flag (ps_hear_more is already 0/1 integer) ---
+dat <- dat |>
+  mutate(
+    merged_hear_more = replace_na(ps_hear_more, 0L)
+  ) |>
+  mutate(
+    # Manual fixes
+    merged_hear_more = if_else(
+      record_id %in% c("K-F0006","H-F0115","K-F0250"),
+      1L,
+      merged_hear_more
+    )
+  )
+
+# Counts (optional)
+consented_to_hear_more_n    <- sum(dat$merged_hear_more == 1L, na.rm = TRUE)
+did_not_consent_hear_more_n <- sum(dat$merged_hear_more == 0L, na.rm = TRUE)
+
+cat("Consent (hear more) == 1:", consented_to_hear_more_n, "\n")
+cat("Consent (hear more) == 0:", did_not_consent_hear_more_n, "\n\n")
+
+# Check: anyone with treatment assigned but not interested in hearing more?
+chk_treat_but_no_interest <- dat |>
+  filter(!is.na(treatment), merged_hear_more == 0L) |>
+  select(record_id, treatment, ps_hear_more, merged_hear_more)
+
+gt(chk_treat_but_no_interest) |>
+  tab_header(title = "Check: Treatment present but ps_hear_more (consent) == 0")
+
+# Keep only those interested
+dat <- dat |>
+  filter(merged_hear_more == 1L)
+```

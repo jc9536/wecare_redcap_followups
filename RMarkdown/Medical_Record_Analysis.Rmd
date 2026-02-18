@@ -1,0 +1,1643 @@
+---
+title: "WeCare Medical Record Data — Descriptive Statistics"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  xlsx_path: /Users/jaimiechin/Desktop/WeCare_Project_Edit/data/raw/medical_records_02042026.xlsx
+  export_csv: true
+  csv_dir: /Users/jaimiechin/Desktop/WeCare_Project_Edit/data/out/
+  sample_roster_csv: data/sample_roster.csv
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(purrr)
+library(readr)
+library(readxl)
+
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+```
+
+# 1) Import/Export
+```{r export-xlsx-to-csv}
+xlsx_path <- params$xlsx_path
+csv_dir   <- params$csv_dir
+
+sheets <- excel_sheets(xlsx_path)
+
+if (isTRUE(params$export_csv)) {
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+
+  walk(sheets, function(sh) {
+    df <- read_excel(xlsx_path, sheet = sh, guess_max = 50000)
+    out_name <- str_replace_all(sh, "[^A-Za-z0-9_\\-]+", "_")
+    out_path <- file.path(csv_dir, paste0(out_name, ".csv"))
+    write_csv(df, out_path, na = "")
+  })
+}
+
+sheets
+```
+
+```{r load-sheets}
+# ---- CHANGE THESE if needed ----
+matched_participants_sheet <- sheets[1]
+encounters_sheet           <- sheets[2]
+
+participants <- read_excel(xlsx_path, sheet = matched_participants_sheet, guess_max = 50000)
+encounters   <- read_excel(xlsx_path, sheet = encounters_sheet, guess_max = 50000)
+
+list(
+  participants_cols = names(participants),
+  encounters_cols   = names(encounters)
+)
+```
+
+# 2) Standardize Core Tables
+```{r standardize}
+participants_std <- participants %>%
+  transmute(
+    participant_id      = as.character(PARTICIPANT_ID),
+    original_ehr_pt_id  = as.character(ORIGINAL_EHR_PT_ID),
+    empi                = as.character(EMPI),
+    match_comment       = as.character(MATCH_COMMENT),
+    last_name           = as.character(LAST_NAME),
+    first_name          = as.character(FIRST_NAME),
+    name                = str_squish(paste(first_name, last_name)),
+    dob                 = as_date(DOB),
+    gender_at_birth     = as.character(GENDER_AT_BIRTH),
+    enrollment_date     = as_date(DATE_OF_ENROLLMENT)
+  )
+
+encounters_std <- encounters %>%
+  transmute(
+    participant_id       = as.character(PARTICIPANT_ID),
+    visit_date           = as_date(ENC_DATE),
+    csn                  = as.character(CSN),
+    facility             = as.character(FACILITY),
+    department           = as.character(DEPARTMENT),
+    specialty            = as.character(SPECIALTY),
+    patient_class        = as.character(PATIENT_CLASS),
+    encounter_type       = as.character(ENCOUNTER_TYPE),
+    provider_name        = as.character(PROVIDER_NAME),
+    primary_ins_type     = as.character(PRIMARY_INSURANCE_TYPE),
+    payor_name           = as.character(PAYOR_NAME),
+    subscriber_id        = as.character(SUBSCRIBER_ID),
+    diagnoses_raw        = as.character(DIAGNOSES),
+    procedures_raw       = as.character(PROCEDURES)
+  )
+```
+
+# 2B) Apply 12-month-from-enrollment restriction (use these downstream)
+```{r apply-12m-window}
+# Define the allowed MR window per participant:
+# - start: enrollment_date
+# - end: enrollment_date + 12 months (exclusive)
+#   (Using exclusive end avoids edge-case double counting if you later chain windows)
+participants_window <- participants_std %>%
+  mutate(
+    window_start = enrollment_date,
+    window_end   = enrollment_date %m+% months(12)   # exclusive upper bound
+  )
+
+# Encounters restricted to within 12 months of enrollment
+encounters_std_12m <- encounters_std %>%
+  left_join(
+    participants_window %>% select(participant_id, window_start, window_end),
+    by = "participant_id"
+  ) %>%
+  mutate(
+    in_12m_window =
+      !is.na(window_start) &
+      !is.na(window_end) &
+      !is.na(visit_date) &
+      visit_date >= window_start &
+      visit_date <  window_end
+  ) %>%
+  filter(in_12m_window) %>%
+  select(-in_12m_window)
+
+# Optional: participants who have at least one encounter in-window (sometimes useful)
+participants_std_12m <- participants_std %>%
+  semi_join(encounters_std_12m %>% distinct(participant_id), by = "participant_id")
+
+# Quick QC counts (overall vs windowed)
+tibble(
+  n_participants_total        = n_distinct(participants_std$participant_id),
+  n_participants_with_any_enc = n_distinct(encounters_std$participant_id),
+  n_encounters_total          = nrow(encounters_std),
+  n_participants_with_enc_12m = n_distinct(encounters_std_12m$participant_id),
+  n_encounters_12m            = nrow(encounters_std_12m)
+)
+```
+
+# 3) Quick Coverage Counts
+```{r quick-coverage-counts}
+coverage_counts <- tibble(
+  n_participants_table = n_distinct(participants_std$participant_id),
+  n_participants_with_any_encounter = n_distinct(encounters_std$participant_id),
+  n_encounters_total = nrow(encounters_std)
+)
+
+coverage_counts
+```
+The medical record extract includes *332 unique participants*, and all *332 have at least one recorded encounter* in the encounters table (consistent with everyone having an enrollment/baseline visit). Across these participants, there are *1,678 total encounters*
+
+# 3B) Quick Coverage Counts (12-month restricted)
+```{r quick-coverage-counts-12m}
+coverage_counts_12m <- tibble(
+  n_participants_table = n_distinct(participants_std$participant_id),
+  n_participants_with_any_encounter_12m = n_distinct(encounters_std_12m$participant_id),
+  n_encounters_total_12m = nrow(encounters_std_12m)
+)
+
+coverage_counts_12m
+```
+
+```{r qc-who-lost-all-encounters-in-12m}
+ids_any <- encounters_std %>% distinct(participant_id)
+ids_12m <- encounters_std_12m %>% distinct(participant_id)
+
+anti_join(ids_any, ids_12m, by = "participant_id") %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id")
+```
+
+```{r qc-before-after-window}
+lost_ids <- anti_join(
+  encounters_std %>% distinct(participant_id),
+  encounters_std_12m %>% distinct(participant_id),
+  by = "participant_id"
+)
+
+encounters_std %>%
+  semi_join(lost_ids, by = "participant_id") %>%
+  left_join(
+    participants_std %>%
+      transmute(
+        participant_id,
+        enrollment_date,
+        window_end = enrollment_date %m+% months(12)
+      ),
+    by = "participant_id"
+  ) %>%
+  mutate(
+    timing = case_when(
+      is.na(visit_date) ~ "missing visit_date",
+      visit_date < enrollment_date ~ "pre-enrollment",
+      visit_date >= window_end ~ ">=12 months after enrollment",
+      TRUE ~ "in window (shouldn't happen)"
+    )
+  ) %>%
+  count(timing)
+```
+
+
+# 4) Medicaid Summary & Line Lists 
+
+```{r medicaid-summary}
+is_medicaid <- function(primary_ins_type, payor_name) {
+  x <- str_to_lower(paste(primary_ins_type %||% "", payor_name %||% ""))
+  str_detect(x, "medicaid|medi-cal|chip|mmc")
+}
+
+encounters_medicaid <- encounters_std_12m %>%
+  mutate(on_medicaid_encounter = is_medicaid(primary_ins_type, payor_name))
+
+medicaid_person_level <- encounters_medicaid %>%
+  group_by(participant_id) %>%
+  summarise(on_medicaid = any(on_medicaid_encounter, na.rm = TRUE), .groups = "drop")
+
+medicaid_summary <- medicaid_person_level %>%
+  summarise(
+    n_with_any_encounter = n(),
+    n_medicaid = sum(on_medicaid, na.rm = TRUE),
+    pct_medicaid = 100 * mean(on_medicaid, na.rm = TRUE)
+  )
+
+medicaid_summary
+```
+Using insurance fields on encounters (primary insurance type and payor name), *234 of 332 participants (70.48%)* are flagged as having Medicaid coverage on at least one recorded encounter (“ever Medicaid” in this extract).
+
+
+```{r medicaid-line-list-all-encounters}
+medicaid_encounter_list <- encounters_medicaid %>%
+  filter(on_medicaid_encounter) %>%
+  left_join(participants_std %>% select(participant_id, name, dob), by = "participant_id") %>%
+  arrange(participant_id, visit_date) %>%
+  select(
+    participant_id, name, dob, visit_date,
+    facility, department, patient_class, encounter_type,
+    primary_ins_type, payor_name, subscriber_id
+  )
+
+medicaid_encounter_list
+```
+
+```{r medicaid-line-list-per-participant}
+medicaid_participant_list <- medicaid_encounter_list %>%
+  group_by(participant_id, name, dob) %>%
+  summarise(
+    last_medicaid_visit = max(visit_date, na.rm = TRUE),
+    n_medicaid_encounters = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(last_medicaid_visit))
+
+medicaid_participant_list
+```
+```{r medicaid-summary-12m-strict}
+# Strict Medicaid definition based on known value sets
+is_medicaid_strict <- function(primary_ins_type, payor_name) {
+  primary_ok <- primary_ins_type %in% c("Medicaid", "Medicaid Managed Care")
+  payor_ok   <- payor_name %in% c("EMERGENCY MEDICAID", "NEW YORK MEDICAID")
+  primary_ok | payor_ok
+}
+
+encounters_medicaid <- encounters_std_12m %>%
+  mutate(
+    primary_ins_type = str_squish(primary_ins_type),
+    payor_name       = str_squish(payor_name),
+    on_medicaid_encounter = is_medicaid_strict(primary_ins_type, payor_name)
+  )
+
+# Encounter-level totals
+medicaid_encounter_summary <- encounters_medicaid %>%
+  summarise(
+    n_encounters_12m = n(),
+    n_medicaid_encounters_12m = sum(on_medicaid_encounter, na.rm = TRUE),
+    pct_encounters_medicaid_12m = 100 * mean(on_medicaid_encounter, na.rm = TRUE)
+  )
+
+# Participant-level totals
+medicaid_person_level <- encounters_medicaid %>%
+  group_by(participant_id) %>%
+  summarise(
+    any_medicaid_12m = any(on_medicaid_encounter, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+medicaid_participant_summary <- medicaid_person_level %>%
+  summarise(
+    n_participants_with_any_enc_12m = n(),
+    n_participants_with_any_medicaid_12m = sum(any_medicaid_12m, na.rm = TRUE),
+    pct_participants_with_any_medicaid_12m = 100 * mean(any_medicaid_12m, na.rm = TRUE)
+  )
+
+list(
+  medicaid_encounter_summary = medicaid_encounter_summary,
+  medicaid_participant_summary = medicaid_participant_summary
+)
+```
+
+# 5) Post-Enrollment "hospital enocunters"
+```{r}
+enc_post_enroll <- encounters_std_12m %>%
+  distinct(participant_id, csn, visit_date) %>%  # one row per unique encounter
+  left_join(
+    participants_std %>% select(participant_id, enrollment_date),
+    by = "participant_id"
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    enrollment_date = first(enrollment_date),
+    n_encounters = n(),
+    first_encounter_date = min(visit_date, na.rm = TRUE),
+    last_encounter_date  = max(visit_date, na.rm = TRUE),
+
+    # count encounters strictly AFTER enrollment date
+    n_post_enroll_encounters = sum(!is.na(visit_date) & !is.na(enrollment_date) & visit_date > enrollment_date),
+    has_post_enroll_encounter = n_post_enroll_encounters >= 1,
+
+    # earliest post-enrollment encounter date (if any)
+    first_post_enroll_date = suppressWarnings(min(visit_date[!is.na(enrollment_date) & visit_date > enrollment_date], na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    first_post_enroll_date = if_else(is.infinite(first_post_enroll_date), as.Date(NA), first_post_enroll_date)
+  )
+
+# Summary for Adam
+enc_post_enroll %>%
+  summarise(
+    n_with_any_encounter = n(),
+    n_with_post_enroll_encounter = sum(has_post_enroll_encounter, na.rm = TRUE),
+    pct_with_post_enroll_encounter = 100 * mean(has_post_enroll_encounter, na.rm = TRUE)
+  )
+```
+
+```{r post-enrollment-encounters-summary}
+# Summary for Adam (now includes total post-enrollment encounters)
+enc_post_enroll %>%
+  summarise(
+    n_with_any_encounter = n(),
+    n_with_post_enroll_encounter = sum(has_post_enroll_encounter, na.rm = TRUE),
+    pct_with_post_enroll_encounter = 100 * mean(has_post_enroll_encounter, na.rm = TRUE),
+
+    # NEW: total number of encounters strictly after enrollment (across all participants)
+    total_post_enroll_encounters = sum(n_post_enroll_encounters, na.rm = TRUE),
+
+    # Optional: average # of post-enroll encounters per participant (overall)
+    mean_post_enroll_encounters_all = mean(n_post_enroll_encounters, na.rm = TRUE),
+
+    # Optional: average # of post-enroll encounters among those who had any
+    mean_post_enroll_encounters_among_any = mean(n_post_enroll_encounters[has_post_enroll_encounter], na.rm = TRUE)
+  )
+```
+
+```{r post-enrollment-encounters-distribution}
+enc_post_enroll %>%
+  count(n_post_enroll_encounters, name = "n_participants") %>%
+  arrange(n_post_enroll_encounters)
+```
+
+
+
+
+```{r post-enrollment-hospital-visits}
+hospital_patient_classes <- c(
+  "Emergency",
+  "Psych Emergency",
+  "Observation",
+  "Psych Observation",
+  "Inpatient",
+  "Inpatient Psych"
+)
+
+post_enroll_hosp_both <- encounters_std %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id") %>%
+  mutate(
+    patient_class = str_squish(patient_class),
+    hospital_visit = patient_class %in% hospital_patient_classes,
+    on_or_after = !is.na(enrollment_date) & !is.na(visit_date) & (visit_date >= enrollment_date),
+    after_only  = !is.na(enrollment_date) & !is.na(visit_date) & (visit_date >  enrollment_date)
+  )
+
+tibble(
+  n_on_or_after = post_enroll_hosp_both %>% filter(hospital_visit, on_or_after) %>% distinct(participant_id) %>% nrow(),
+  n_after_only  = post_enroll_hosp_both %>% filter(hospital_visit, after_only)  %>% distinct(participant_id) %>% nrow()
+)
+```
+
+```{r post-enrollment-hospital-visits-excluded-qc}
+excluded_rows <- encounters_std %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id") %>%
+  mutate(
+    patient_class  = str_squish(patient_class),
+    encounter_type = str_squish(encounter_type),
+    post_enroll = !is.na(enrollment_date) & !is.na(visit_date) & (visit_date >= enrollment_date),
+    flagged_by_encounter_type = encounter_type == "Hospital Encounter",
+    flagged_by_patient_class = patient_class %in% hospital_patient_classes
+  ) %>%
+  filter(post_enroll, flagged_by_encounter_type, !flagged_by_patient_class)
+
+excluded_rows %>%
+  count(patient_class, sort = TRUE)
+```
+
+```{r post-enrollment-encounters-two-definitions}
+hospital_patient_classes <- c(
+  "Emergency", "Psych Emergency",
+  "Observation", "Psych Observation",
+  "Inpatient", "Inpatient Psych"
+)
+
+enc_definitions <- encounters_std %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id") %>%
+  mutate(
+    patient_class  = str_squish(patient_class),
+    encounter_type = str_squish(encounter_type),
+
+    # Definition A: acute/hospital-type (ED/Obs/Inpatient)
+    acute_hosp = patient_class %in% hospital_patient_classes,
+
+    # Definition B: any "Hospital Encounter" in the system (includes outpatient/therapy)
+    any_hosp_system = encounter_type == "Hospital Encounter",
+
+    on_or_after = !is.na(enrollment_date) & !is.na(visit_date) & visit_date >= enrollment_date,
+    after_only  = !is.na(enrollment_date) & !is.na(visit_date) & visit_date >  enrollment_date
+  )
+
+tibble(
+  acute_on_or_after = enc_definitions %>% filter(acute_hosp, on_or_after) %>% distinct(participant_id) %>% nrow(),
+  acute_after_only  = enc_definitions %>% filter(acute_hosp, after_only)  %>% distinct(participant_id) %>% nrow(),
+  system_on_or_after = enc_definitions %>% filter(any_hosp_system, on_or_after) %>% distinct(participant_id) %>% nrow(),
+  system_after_only  = enc_definitions %>% filter(any_hosp_system, after_only)  %>% distinct(participant_id) %>% nrow()
+)
+```
+
+- `patient_class` in acute list **OR**
+- (`encounter_type == “Hospital Encounter” AND patient_class in {Outpatient, Therapies Series}`)
+
+```{r post-enrollment-hospital-visits-expanded}
+hospital_patient_classes <- c(
+  "Emergency", "Psych Emergency",
+  "Observation", "Psych Observation",
+  "Inpatient", "Inpatient Psych"
+)
+
+include_nonacute_patient_classes <- c("Outpatient", "Therapies Series")
+
+post_enroll_hosp_expanded <- encounters_std %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id") %>%
+  mutate(
+    patient_class  = str_squish(patient_class),
+    encounter_type = str_squish(encounter_type),
+
+    hospital_visit_expanded =
+      patient_class %in% hospital_patient_classes |
+      (encounter_type == "Hospital Encounter" & patient_class %in% include_nonacute_patient_classes),
+
+    on_or_after = !is.na(enrollment_date) & !is.na(visit_date) & (visit_date >= enrollment_date),
+    after_only  = !is.na(enrollment_date) & !is.na(visit_date) & (visit_date >  enrollment_date)
+  )
+
+tibble(
+  n_on_or_after = post_enroll_hosp_expanded %>% filter(hospital_visit_expanded, on_or_after) %>% distinct(participant_id) %>% nrow(),
+  n_after_only  = post_enroll_hosp_expanded %>% filter(hospital_visit_expanded, after_only)  %>% distinct(participant_id) %>% nrow()
+)
+```
+
+```{r post-enrollment-hospital-visits-per-person}
+post_enroll_hosp_counts <- post_enroll_hosp %>%
+  count(participant_id, name = "n_post_enroll_hosp_visits") %>%
+  arrange(desc(n_post_enroll_hosp_visits))
+
+post_enroll_hosp_counts
+```
+```{r post-enrollment-hospital-visits-per-person}
+
+# Per-person counts (acute definition)
+post_enroll_hosp_counts_acute <- post_enroll_hosp %>%
+  count(participant_id, name = "n_post_enroll_hosp_visits_acute") %>%
+  arrange(desc(n_post_enroll_hosp_visits_acute))
+
+# Per-person counts (expanded definition)
+post_enroll_hosp_counts_expanded <- post_enroll_hosp_expanded %>%
+  count(participant_id, name = "n_post_enroll_hosp_visits_expanded") %>%
+  arrange(desc(n_post_enroll_hosp_visits_expanded))
+
+# Combine side-by-side (include participants with 0 in either definition)
+post_enroll_hosp_counts <- full_join(
+  post_enroll_hosp_counts_acute,
+  post_enroll_hosp_counts_expanded,
+  by = "participant_id"
+) %>%
+  mutate(
+    n_post_enroll_hosp_visits_acute = coalesce(n_post_enroll_hosp_visits_acute, 0L),
+    n_post_enroll_hosp_visits_expanded = coalesce(n_post_enroll_hosp_visits_expanded, 0L)
+  ) %>%
+  left_join(
+    participants_std %>% select(participant_id, name, dob, enrollment_date),
+    by = "participant_id"
+  ) %>%
+  arrange(desc(n_post_enroll_hosp_visits_expanded), desc(n_post_enroll_hosp_visits_acute), participant_id)
+
+post_enroll_hosp_counts
+```
+```{r any-post-enroll-vs-system-after-only}
+any_after_ids <- enc_post_enroll %>%
+  filter(has_post_enroll_encounter) %>%
+  distinct(participant_id)
+
+system_after_ids <- enc_definitions %>%
+  filter(any_hosp_system, after_only) %>%
+  distinct(participant_id)
+
+missing_from_system <- anti_join(any_after_ids, system_after_ids, by = "participant_id")
+
+# What encounter types do these "missing" participants have after enrollment?
+encounters_std %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id") %>%
+  semi_join(missing_from_system, by = "participant_id") %>%
+  filter(!is.na(visit_date), !is.na(enrollment_date), visit_date > enrollment_date) %>%
+  mutate(encounter_type = str_squish(encounter_type)) %>%
+  count(encounter_type, sort = TRUE)
+```
+
+```{r any-post-enroll-vs-acute-after-only}
+acute_after_ids <- enc_definitions %>%
+  filter(acute_hosp, after_only) %>%
+  distinct(participant_id)
+
+missing_from_acute <- anti_join(any_after_ids, acute_after_ids, by = "participant_id")
+
+encounters_std %>%
+  left_join(participants_std %>% select(participant_id, enrollment_date), by = "participant_id") %>%
+  semi_join(missing_from_acute, by = "participant_id") %>%
+  filter(!is.na(visit_date), !is.na(enrollment_date), visit_date > enrollment_date) %>%
+  mutate(patient_class = str_squish(patient_class)) %>%
+  count(patient_class, sort = TRUE)
+```
+### Post-enrollment encounters (acute/hospital-type vs any follow-up care)
+
+**Hospital-type encounters (acute settings).** We defined “hospital-type encounters” using explicit **`patient_class`** categories intended to reflect acute/hospital settings: **Emergency, Psych Emergency, Observation, Psych Observation, Inpatient, and Inpatient Psych**. Using this definition, **324 of 332 participants** have at least one hospital-type encounter **on or after** their enrollment date (including the enrollment-day encounter). When restricting to encounters **strictly after** enrollment (excluding enrollment day), **139 of 332 participants** have at least one subsequent acute/hospital-type encounter.
+
+**Any post-enrollment encounter (broader follow-up care).** To contextualize medical record availability after enrollment regardless of setting, **215 of 332 participants (64.76%)** have **any** encounter of any type **after** enrollment. The gap between “any post-enrollment encounter” (215) and “post-enrollment hospital-type encounter” (139) is primarily driven by follow-up encounters classified as **Outpatient** (and a small number of **Psych Series**) in `patient_class`.
+
+**What the “non-hospital” post-enrollment encounters look like.** Among participants with post-enrollment encounters that were not captured by the acute/hospital-type definition, the most common `encounter_type` values were **Office Visit (108)**, **Behavioral Health (22)**, **Lab (21)**, and **Telehealth/BH Telehealth (16 combined)**, along with smaller counts of procedure/clinical support visit types—patterns consistent with outpatient/ambulatory follow-up care rather than ED/inpatient utilization.
+
+**Quality check / definitional note.** We observed that some encounters labeled **“Hospital Encounter”** in `encounter_type` are classified as **Outpatient** (and other non-acute classes) in `patient_class`. For the acute/hospital-type definition, we intentionally rely on `patient_class` and exclude outpatient-classified encounters to avoid conflating outpatient follow-up care (office visits, therapy, labs, telehealth) with ED/inpatient/observation utilization. If the analytic goal is instead to capture **any post-enrollment care within the health system** (including outpatient and therapy visits), we can report a separate “in-system encounter” metric using an encounter-type-based definition.
+
+# 6) Diagnoses: Extract ICD Codes
+```{r diagnoses-extract}
+extract_icd10_parentheses <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  x2 <- str_replace_all(x, "\\s+", " ")
+
+  m <- str_match_all(
+    x2,
+    "\\(([A-TV-Z][0-9][0-9A-Z](?:\\.[0-9A-Z]{1,4})?)\\)"
+  )[[1]]
+
+  if (nrow(m) == 0) return(character(0))
+  unique(str_to_upper(m[, 2]))
+}
+
+diagnoses_long <- encounters_std %>%
+  select(participant_id, visit_date, diagnoses_raw) %>%
+  filter(!is.na(diagnoses_raw), diagnoses_raw != "") %>%
+  mutate(codes = map(diagnoses_raw, extract_icd10_parentheses)) %>%
+  unnest(codes) %>%
+  transmute(
+    participant_id,
+    dx_date = visit_date,
+    diagnosis_code = str_trim(codes)
+  ) %>%
+  filter(diagnosis_code != "") %>%
+  distinct(participant_id, dx_date, diagnosis_code)
+
+# Quick check
+diagnoses_long
+```
+
+```{r diagnoses-code-per-participant}
+dx_by_participant <- diagnoses_long %>%
+  group_by(participant_id) %>%
+  summarise(
+    diagnosis_codes = paste(sort(unique(diagnosis_code)), collapse = ", "),
+    n_unique_dx_codes = n_distinct(diagnosis_code),
+    .groups = "drop"
+  ) %>%
+  arrange(participant_id)
+
+dx_by_participant
+```
+
+# 7) Suicidality Flags + Summaries + Line List
+```{r suicidality-flags-summary-with-timing}
+# dx_flagged already created above; add enrollment_date for timing
+dx_flagged_timed <- dx_flagged %>%
+  left_join(
+    participants_std %>% select(participant_id, enrollment_date),
+    by = "participant_id"
+  ) %>%
+  filter(!is.na(dx_date), !is.na(enrollment_date)) %>%
+  mutate(
+    on_enrollment = dx_date == enrollment_date,
+    after_enrollment = dx_date > enrollment_date
+  )
+
+# Person-level timing flags
+suicidality_person_timing <- dx_flagged_timed %>%
+  group_by(participant_id) %>%
+  summarise(
+    any_suicidality_anytime = any(suicidality_flag, na.rm = TRUE),
+    any_suicidality_on_enrollment = any(suicidality_flag & on_enrollment, na.rm = TRUE),
+    any_suicidality_after_enrollment = any(suicidality_flag & after_enrollment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Overall + timing summaries
+suicidality_summary_with_timing <- suicidality_person_timing %>%
+  summarise(
+    n_with_any_dx_dates = n(),
+
+    n_flag_anytime = sum(any_suicidality_anytime),
+    pct_flag_anytime = 100 * mean(any_suicidality_anytime),
+
+    n_flag_on_enrollment = sum(any_suicidality_on_enrollment),
+    pct_flag_on_enrollment = 100 * mean(any_suicidality_on_enrollment),
+
+    n_flag_after_enrollment = sum(any_suicidality_after_enrollment),
+    pct_flag_after_enrollment = 100 * mean(any_suicidality_after_enrollment)
+  )
+
+suicidality_summary_with_timing
+```
+
+Among the 324 participants with diagnosis records that could be dated relative to enrollment, *11 (3.40%) had at least one flagged suicidality/self-harm ICD-10 code at any time in the extract*. Most of these flags occurred on the enrollment date: *8 participants (2.47%) had a flagged code documented during the enrollment-day encounter*. A smaller subset had flagged codes strictly after enrollment: *3 participants (0.93%) had a flagged code on a later date.*
+
+```{r suicidality-line-list-by-participant}
+suicidality_linelist_by_participant <- dx_flagged %>%
+  filter(suicidality_flag) %>%
+  left_join(
+    participants_std %>% select(participant_id, name, dob, enrollment_date),
+    by = "participant_id"
+  ) %>%
+  mutate(
+    on_enrollment = !is.na(enrollment_date) & !is.na(dx_date) & dx_date == enrollment_date
+  ) %>%
+  group_by(participant_id, name, dob, enrollment_date, diagnosis_code) %>%
+  summarise(
+    code_dates = paste(sort(unique(dx_date)), collapse = ", "),
+    any_on_enrollment_for_code = any(on_enrollment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(participant_id, name, dob, enrollment_date) %>%
+  summarise(
+    n_unique_flagged_codes = n_distinct(diagnosis_code),
+    flagged_visit_dates = paste(sort(unique(unlist(strsplit(paste(code_dates, collapse = ", "), ",\\s*")))), collapse = ", "),
+    any_on_enrollment = any(any_on_enrollment_for_code, na.rm = TRUE),
+    any_after_enrollment = TRUE, # will refine below
+    flagged_codes_with_dates = paste0(diagnosis_code, " [", code_dates, "]") %>% paste(collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  # compute after_enrollment from the date list vs enrollment_date
+  mutate(
+    any_after_enrollment = if_else(
+      is.na(enrollment_date) | flagged_visit_dates == "",
+      NA,
+      any(as_date(strsplit(flagged_visit_dates, ",\\s*")[[1]]) > enrollment_date)
+    )
+  ) %>%
+  arrange(desc(any_after_enrollment), participant_id)
+
+suicidality_linelist_by_participant
+```
+
+
+# 8) Link to randomized roster (treatment, CASSY, enrollment/follow-up dates)
+
+```{r roster-load}
+roster <- read_csv(
+  "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New ETL Output/dat_merged.csv",
+  show_col_types = FALSE
+) %>%
+  transmute(
+    participant_id = as.character(record_id),
+    treatment      = treatment,
+    cassy_result   = cassy_result,
+    merged_date    = as_date(merged_date),
+    follow_visitdate_3m = as_date(follow_visitdate_3m),
+    follow_visitdate_6m = as_date(follow_visitdate_6m)
+  )
+
+# Restrict to randomized for hypothesis checks (optional but recommended)
+roster_rand <- roster %>% filter(!is.na(treatment))
+
+roster_rand %>%
+  summarise(
+    roster_n = n_distinct(participant_id),
+    n_missing_merged_date = sum(is.na(merged_date)),
+    n_missing_cassy = sum(is.na(cassy_result))
+  )
+```
+
+# 9) Match rates (randomized roster -> MR participants + MR encounters)
+
+```{r match-rates-randomized}
+match_rates <- tibble(
+  roster_n = n_distinct(roster_rand$participant_id),
+  n_in_participants = sum(roster_rand$participant_id %in% participants_std$participant_id),
+  pct_in_participants = 100 * mean(roster_rand$participant_id %in% participants_std$participant_id),
+  n_with_any_encounter = sum(roster_rand$participant_id %in% encounters_std$participant_id),
+  pct_with_any_encounter = 100 * mean(roster_rand$participant_id %in% encounters_std$participant_id)
+)
+
+match_rates
+```
+This table summarizes linkage coverage between the **randomized study roster** and the **medical record (MR) extract**. `roster_n` is the number of unique randomized participants in the roster. `n_in_participants` / `pct_in_participants` indicate how many of those roster participants appear in the MR **participants** table (i.e., have a matched MR identity record). `n_with_any_encounter` / `pct_with_any_encounter` indicate how many roster participants have **at least one encounter** in the MR encounters table. When these two percentages are similar, it suggests that most roster participants who are present in the MR participants table also have encounter data available in the extract.
+
+# 10) Key feasibility: do we observe any post-enrollment MR encounters?
+
+```{r post-enrollment-encounter-availability}
+enc_post <- encounters_std %>%
+  distinct(participant_id, csn, visit_date) %>%
+  left_join(roster_rand %>% select(participant_id, merged_date), by = "participant_id") %>%
+  filter(!is.na(visit_date), !is.na(merged_date)) %>%
+  mutate(
+    on_enrollment   = visit_date == merged_date,
+    after_enrollment = visit_date > merged_date
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    n_encounters_total = n(),
+    n_encounters_on_enroll = sum(on_enrollment),
+    n_encounters_after_enroll = sum(after_enrollment),
+    any_after_enroll = n_encounters_after_enroll >= 1,
+    first_after_enroll_date = suppressWarnings(min(visit_date[after_enrollment], na.rm = TRUE)),
+    last_after_enroll_date  = suppressWarnings(max(visit_date[after_enrollment], na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    first_after_enroll_date = if_else(is.infinite(first_after_enroll_date), as.Date(NA), first_after_enroll_date),
+    last_after_enroll_date  = if_else(is.infinite(last_after_enroll_date),  as.Date(NA), last_after_enroll_date)
+  )
+
+enc_post %>%
+  summarise(
+    n_with_any_encounter = n(),
+    n_with_post_enroll_encounter = sum(any_after_enroll, na.rm = TRUE),
+    pct_with_post_enroll_encounter = 100 * mean(any_after_enroll, na.rm = TRUE),
+    median_post_enroll_encounters = median(n_encounters_after_enroll, na.rm = TRUE)
+  )
+```
+
+# 11) "Expected window" check: any encounters on/after planned 3m / 6m follow-up dates?
+
+```{r post-enrollment-expected-windows-refined-no-medians}
+enc_follow_windows <- encounters_std %>%
+  distinct(participant_id, csn, visit_date) %>%
+  left_join(
+    roster_rand %>% select(participant_id, follow_visitdate_3m, follow_visitdate_6m),
+    by = "participant_id"
+  ) %>%
+  filter(!is.na(visit_date)) %>%
+  mutate(
+    # 3m window = [3m, 6m) so we don't double-count encounters that are 6m+
+    in_3m_window = !is.na(follow_visitdate_3m) &
+      !is.na(follow_visitdate_6m) &
+      visit_date >= follow_visitdate_3m &
+      visit_date <  follow_visitdate_6m,
+
+    # 6m+ window = [6m, +inf)
+    in_6m_plus_window = !is.na(follow_visitdate_6m) &
+      visit_date >= follow_visitdate_6m
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    n_enc_3m_window = sum(in_3m_window, na.rm = TRUE),
+    any_3m_window = n_enc_3m_window > 0,
+
+    n_enc_6m_plus = sum(in_6m_plus_window, na.rm = TRUE),
+    any_6m_plus = n_enc_6m_plus > 0,
+    .groups = "drop"
+  )
+
+roster_rand %>%
+  left_join(enc_follow_windows, by = "participant_id") %>%
+  mutate(
+    n_enc_3m_window = coalesce(n_enc_3m_window, 0L),
+    any_3m_window = coalesce(any_3m_window, FALSE),
+    n_enc_6m_plus = coalesce(n_enc_6m_plus, 0L),
+    any_6m_plus = coalesce(any_6m_plus, FALSE)
+  ) %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n_distinct(participant_id),
+
+    n_any_3m_window = sum(any_3m_window),
+    pct_any_3m_window = 100 * mean(any_3m_window),
+    total_enc_3m_window = sum(n_enc_3m_window),
+
+    n_any_6m_plus = sum(any_6m_plus),
+    pct_any_6m_plus = 100 * mean(any_6m_plus),
+    total_enc_6m_plus = sum(n_enc_6m_plus),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+```
+`n_any_Xm_window` is a *participant-level count*: how many unique participants had at least one encounter in the Xm window.
+
+`total_enc_3m_window` is an *encounter-level count*: the total number of distinct encounters that occurred in the Xm window across all participants. One participant can contribute multiple encounters.
+
+This table checks whether the medical record extract contains encounters that fall within participants’ **planned 3-month and 6-month follow-up windows** (based on roster follow-up dates). To avoid double-counting the same encounter across windows, we define the **3-month window** as encounters occurring **between the planned 3m date and before the planned 6m date** (`[follow_visitdate_3m, follow_visitdate_6m)`), and the **6-month window** as encounters occurring **on or after the planned 6m date** (`>= follow_visitdate_6m`).  
+
+Across treatment/CASSY subgroups, the share of participants with **any encounter in the 3m window** is low (about **4–6%**), and the share with **any encounter in the 6m+ window** is also low (about **6–8%**). Although most participants do not have observable MR utilization in these later windows, the table also reports the **total number of encounters captured** among those who do (e.g., treatment/CASSY+ has 6 encounters in the 3m window and 12 encounters in the 6m+ window). 
+
+```{r expected-windows-treatment-vs-control}
+# Strictly compare Treatment vs Control (ignore cassy_result strata)
+# Uses the refined window definitions produced by enc_follow_windows:
+# - any_3m_window / n_enc_3m_window
+# - any_6m_plus / n_enc_6m_plus
+
+treat_vs_control_windows <- roster_rand %>%
+  left_join(enc_follow_windows, by = "participant_id") %>%
+  mutate(
+    any_3m_window = coalesce(any_3m_window, FALSE),
+    n_enc_3m_window = coalesce(n_enc_3m_window, 0L),
+    any_6m_plus = coalesce(any_6m_plus, FALSE),
+    n_enc_6m_plus = coalesce(n_enc_6m_plus, 0L)
+  ) %>%
+  group_by(treatment) %>%
+  summarise(
+    n = n_distinct(participant_id),
+
+    n_any_3m_window = sum(any_3m_window),
+    pct_any_3m_window = 100 * mean(any_3m_window),
+    total_enc_3m_window = sum(n_enc_3m_window),
+
+    n_any_6m_plus = sum(any_6m_plus),
+    pct_any_6m_plus = 100 * mean(any_6m_plus),
+    total_enc_6m_plus = sum(n_enc_6m_plus),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1))
+
+treat_vs_control_windows
+```
+
+# 12A) Define adjacent bucket map (exclude direct suicidality bucket for "adjacent" section)
+This section defines a set of **“adjacent” mental health diagnosis buckets** using ICD-10 code prefixes and then maps each extracted diagnosis code (`diagnoses_long`) into one or more of these buckets. These buckets are intentionally **broader and more prevalent** than the direct suicidality/self-harm screen, and are meant to characterize **comorbid mental health and behavioral health context** in the medical record extract (e.g., depression, anxiety, substance use). Direct self-harm/suicidality codes are excluded from this “adjacent” set so they can be reported separately.
+
+```{r adjacent-mh-buckets}
+mh_bucket_map_adjacent <- tibble::tribble(
+  ~bucket, ~pattern,
+  "Depressive disorders (F32–F33)",       "^F3[23]",
+  "Anxiety disorders (F40–F41)",          "^F4[01]",
+  "PTSD/trauma-related (F43.1)",          "^F43\\.1",
+  "Adjustment disorders (F43.2)",         "^F43\\.2",
+  "Bipolar & manic disorders (F30–F31)",  "^F3[01]",
+  "Psychotic disorders (F20–F29)",        "^F2[0-9]",
+  "Substance use disorders (F10–F19)",    "^F1[0-9]",
+  "Eating disorders (F50)",              "^F50",
+  "Sleep-wake disorders (F51/G47)",       "^(F51|G47)",
+  "ADHD (F90)",                           "^F90",
+  "Conduct/ODD (F91)",                    "^F91",
+  "Autism spectrum (F84)",                "^F84",
+  "Personality disorders (F60–F69)",      "^F6[0-9]"
+)
+
+dx_buckets_adj_long <- diagnoses_long %>%
+  tidyr::crossing(mh_bucket_map_adjacent) %>%
+  filter(str_detect(diagnosis_code, pattern)) %>%
+  select(participant_id, dx_date, diagnosis_code, bucket) %>%
+  distinct()
+
+head(dx_buckets_adj_long, 50)
+```
+
+# 12B) Overall bucket prevalence (participants per bucket)
+
+```{r adjacent-mh-bucket-summary-overall}
+adj_bucket_summary <- dx_buckets_adj_long %>%
+  group_by(bucket) %>%
+  summarise(
+    n_participants = n_distinct(participant_id),
+    n_dx_rows = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_participants), bucket)
+
+adj_bucket_summary
+```
+`n_participants` reflects **how many unique participants** ever had a code in each **“adjacent” mental health diagnosis buckets** 
+`n_dx_rows` reflects **how many bucket-coded diagnosis rows** were observed in total
+**Interpretation.** 
+
+# 12C) Join roster (treatment / CASSY / merged_date) for subgroup reporting
+# Assumes roster_rand exists; if not, create it like:
+# roster_rand <- roster %>% filter(!is.na(treatment))
+
+```{r adjacent-mh-buckets-join-roster}
+dx_buckets_adj_long2 <- dx_buckets_adj_long %>%
+  left_join(roster_rand %>% select(participant_id, treatment, cassy_result, merged_date), by = "participant_id") %>%
+  filter(!is.na(treatment)) # keep randomized only for subgroup tables
+```
+
+# 12D) Bucket prevalence by treatment × CASSY
+# (Counts unique participants who ever had a code in that bucket anywhere in the extract.)
+
+```{r adjacent-mh-bucket-summary-by-2x2}
+adj_bucket_2x2 <- dx_buckets_adj_long2 %>%
+  group_by(treatment, cassy_result, bucket) %>%
+  summarise(
+    n_participants = n_distinct(participant_id),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1), desc(n_participants), bucket)
+
+adj_bucket_2x2
+```
+This section links the “adjacent” mental health diagnosis buckets to the **randomized roster** (treatment assignment, CASSY result where applicable, and enrollment/merged date) and then reports **bucket prevalence by subgroup**. Each row in the 2×2 table answers: *“Among participants in this subgroup, how many unique participants ever had at least one diagnosis code in this bucket anywhere in the medical record extract?”* (i.e., this is **ever/anywhere in extract**, not restricted to post-enrollment or follow-up windows).
+
+Across subgroups, the most commonly observed adjacent buckets remain **Substance use disorders**, **Anxiety disorders**, and **Depressive disorders**, consistent with the overall prevalence results. For example, among **treatment participants who were CASSY positive** (treatment=1, cassy_result=1), **6 participants** have depressive-disorder codes and **6 participants** have substance-use codes, with smaller counts for anxiety (4) and ADHD/conduct-related buckets (3 each). Among **treatment participants who were CASSY negative** (treatment=1, cassy_result=0), substance-use (13), anxiety (7), and depressive (6) codes are again the most frequent. In the **control arm** (treatment=0), CASSY is not administered in this dataset (cassy_result=NA), and the largest counts appear in substance-use (16), anxiety (11), adjustment disorders (10), and depressive disorders (9).
+
+These subgroup counts should be interpreted as **descriptive prevalence within the observed medical record extract**, not as causal effects of WeCare. In particular, (a) CASSY results are only available for treatment participants in this roster (control is NA), and (b) the extract reflects who has observable diagnosis coding rather than a complete capture of all follow-up care. The subgroup tables are therefore best used to **characterize baseline clinical context and comorbidity patterns** and to motivate later analyses that focus specifically on **post-enrollment timing** and **new-onset or changing codes** after enrollment.
+
+# 12E) Timing: on enrollment vs after enrollment, by bucket and 2×2 groups
+# "On enrollment" = dx_date == merged_date
+# "After enrollment" = dx_date > merged_date
+# We summarize *participant-level* presence (not dx rows), to be interpretable.
+
+```{r adjacent-mh-bucket-timing-by-2x2}
+adj_bucket_timing_2x2 <- dx_buckets_adj_long2 %>%
+  filter(!is.na(merged_date), !is.na(dx_date)) %>%
+  mutate(
+    on_enrollment = dx_date == merged_date,
+    after_enrollment = dx_date > merged_date
+  ) %>%
+  group_by(treatment, cassy_result, participant_id, bucket) %>%
+  summarise(
+    any_on_enrollment = any(on_enrollment),
+    any_after_enrollment = any(after_enrollment),
+    .groups = "drop"
+  ) %>%
+  group_by(treatment, cassy_result, bucket) %>%
+  summarise(
+    n_participants_any = n_distinct(participant_id),
+    n_participants_on_enrollment = sum(any_on_enrollment),
+    n_participants_after_enrollment = sum(any_after_enrollment),
+    pct_after_among_any = 100 * (n_participants_after_enrollment / n_participants_any),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1), desc(n_participants_any), bucket)
+
+adj_bucket_timing_2x2
+```
+This table adds **timing** to the adjacent mental health buckets by comparing diagnosis dates to each participant’s enrollment anchor (`merged_date`). For each treatment/CASSY subgroup and bucket, it reports participant-level counts for: (1) **any** presence of a bucket code anywhere in the extract (`n_participants_any`), (2) presence **on the enrollment date** (`n_participants_on_enrollment`, where `dx_date == merged_date`), and (3) presence **after enrollment** (`n_participants_after_enrollment`, where `dx_date > merged_date`). `pct_after_among_any` is the share of participants in that subgroup who had the bucket **at any time** and who also had the bucket **after enrollment** (i.e., follow-up presence among those ever observed with the bucket).
+
+Across most buckets and subgroups, a substantial fraction of participants with a given bucket have that bucket documented **after enrollment** (often **~60–100%**). For example, in the treatment/CASSY+ subgroup, participants with anxiety or ADHD bucket codes are all observed **after enrollment** (100%), while depressive and substance use buckets show both enrollment-day and post-enrollment documentation (each **66.7%** after among those with any). In the treatment/CASSY− subgroup, substance use disorders are observed for 13 participants overall, with **11 (84.6%)** appearing after enrollment; depressive disorders show **6/6 (100%)** after enrollment; and several other buckets (sleep-wake, adjustment, PTSD, personality, bipolar, psychotic) are observed only in a small number of participants but are predominantly post-enrollment when present.
+
+In the control arm (treatment=0; CASSY not administered, so cassy_result=NA), the same pattern holds: for common buckets such as substance use, anxiety, adjustment, and depressive disorders, **~62–82%** of participants with any bucket evidence also have evidence **after enrollment**. Several lower-frequency buckets (e.g., PTSD, personality, sleep-wake, bipolar) show **100%** after enrollment, but these should be interpreted cautiously due to small counts.
+
+**Important note.** This table reflects **presence/absence** of bucket codes after enrollment, not whether the bucket is “new” after enrollment. A participant can be counted in both `n_participants_on_enrollment` and `n_participants_after_enrollment` if the bucket appears at both time points. Also, because the MR extract has limited capture in later follow-up windows for many participants, these timing results should be interpreted as describing the subset with observable coded encounters after enrollment rather than definitive estimates for the full randomized sample.
+
+# 12F) Participant-level adjacent MH summary with dates + codes (report appendix / QA)
+# One row per participant: which adjacent buckets, codes, and whether codes are on vs after enrollment.
+
+```{r adjacent-mh-by-participant-xref}
+collapse_codes <- function(x) {
+  x <- sort(unique(na.omit(x)))
+  if (length(x) == 0) "" else paste(x, collapse = ", ")
+}
+collapse_dates <- function(x) {
+  x <- sort(unique(na.omit(x)))
+  if (length(x) == 0) "" else paste(x, collapse = ", ")
+}
+
+adj_by_participant <- dx_buckets_adj_long2 %>%
+  # dx_buckets_adj_long2 already includes treatment/cassy/merged_date and is filtered to randomized
+  filter(!is.na(merged_date), !is.na(dx_date)) %>%
+  mutate(
+    on_enrollment = dx_date == merged_date,
+    after_enrollment = dx_date > merged_date
+  ) %>%
+  group_by(participant_id, treatment, cassy_result, merged_date, bucket) %>%
+  summarise(
+    codes_on_enrollment   = collapse_codes(diagnosis_code[on_enrollment]),
+    dates_on_enrollment   = collapse_dates(dx_date[on_enrollment]),
+    codes_after_enrollment = collapse_codes(diagnosis_code[after_enrollment]),
+    dates_after_enrollment = collapse_dates(dx_date[after_enrollment]),
+    any_on_enrollment     = codes_on_enrollment != "",
+    any_after_enrollment  = codes_after_enrollment != "",
+    .groups = "drop"
+  ) %>%
+  group_by(participant_id, treatment, cassy_result, merged_date) %>%
+  summarise(
+    n_adj_buckets = n_distinct(bucket),
+    adj_buckets = paste(sort(unique(bucket)), collapse = " | "),
+
+    # Split details into two separate fields so it's easier to scan
+    adj_bucket_details_on_enrollment = paste0(
+      bucket, ": ",
+      if_else(any_on_enrollment,
+              paste0(codes_on_enrollment,
+                     if_else(dates_on_enrollment != "", paste0(" (", dates_on_enrollment, ")"), "")),
+              "none"
+      )
+    ) %>% paste(collapse = " || "),
+
+    adj_bucket_details_after_enrollment = paste0(
+      bucket, ": ",
+      if_else(any_after_enrollment,
+              paste0(codes_after_enrollment,
+                     if_else(dates_after_enrollment != "", paste0(" (", dates_after_enrollment, ")"), "")),
+              "none"
+      )
+    ) %>% paste(collapse = " || "),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1), participant_id)
+
+adj_by_participant
+```
+# 12G) 
+```{r adjacent-mh-by-participant-xref-summary}
+# Summaries of the per-participant adjacent-bucket timing table (adj_by_participant)
+
+adj_by_participant_summary <- adj_by_participant %>%
+  mutate(
+    any_adj_on_enrollment  = !is.na(adj_bucket_details_on_enrollment)  & adj_bucket_details_on_enrollment  != "" &
+      !str_detect(adj_bucket_details_on_enrollment,  "^($|none$)"),
+    any_adj_after_enrollment = !is.na(adj_bucket_details_after_enrollment) & adj_bucket_details_after_enrollment != "" &
+      !str_detect(adj_bucket_details_after_enrollment, "^($|none$)")
+  )
+
+# Participant-level summary by treatment x cassy_result
+adj_participant_2x2_summary <- adj_by_participant %>%
+  mutate(
+    # approximate "any on/after" flags based on bucket count + details strings
+    any_adj_on_enrollment = n_adj_buckets > 0 & !str_detect(adj_bucket_details_on_enrollment, "(: none)( \\|\\| |$)"),
+    any_adj_after_enrollment = n_adj_buckets > 0 & !str_detect(adj_bucket_details_after_enrollment, "(: none)( \\|\\| |$)")
+  ) %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n_distinct(participant_id),
+    
+    n_any_adj_on_enrollment = sum(any_adj_on_enrollment),
+    pct_any_adj_on_enrollment = 100 * mean(any_adj_on_enrollment),
+
+    n_any_adj_after_enrollment = sum(any_adj_after_enrollment),
+    pct_any_adj_after_enrollment = 100 * mean(any_adj_after_enrollment),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+
+adj_participant_2x2_summary
+```
+
+Timing-wise, the table shows how often adjacent-bucket codes appear **on the enrollment date** versus **after enrollment**:
+- **Treatment, CASSY+ (n=13):** 6 (46.2%) had an adjacent-bucket code on enrollment, and 8 (61.5%) had an adjacent-bucket code after enrollment. (**+15.4 pp**, +33.3% relative)
+- **Treatment, CASSY− (n=25):** 7 (28.0%) on enrollment; 20 (80.0%) after enrollment. (**+52.0 pp**, +185.7% relative)
+- **Control (n=33):** 11 (33.3%) on enrollment; 23 (69.7%) after enrollment. (**+36.4 pp**, +109.1% relative)
+
+Because participants can have codes both on enrollment and after enrollment, the “on enrollment” and “after enrollment” percentages do not sum to 100%. Overall, adjacent mental health buckets are frequently observed **after enrollment** (roughly ~62–80% across groups), suggesting that when these codes are present in the MR extract, they are often documented during subsequent encounters as well as (or instead of) the enrollment-day encounter.
+
+# 12H)
+```{r adjacent-mh-new-onset-summary}
+# Inputs assumed to exist:
+# - dx_buckets_adj_long2 with columns:
+#   participant_id, bucket, diagnosis_code, dx_date, treatment, cassy_result, merged_date
+# - roster_rand (optional; only needed if you want to ensure full denominators)
+
+# 1) Per-participant, per-bucket timing flags
+adj_bucket_flags_by_person <- dx_buckets_adj_long2 %>%
+  filter(!is.na(merged_date), !is.na(dx_date)) %>%
+  mutate(
+    on_enrollment = dx_date == merged_date,
+    after_enrollment = dx_date > merged_date
+  ) %>%
+  group_by(participant_id, treatment, cassy_result, merged_date, bucket) %>%
+  summarise(
+    any_on_enrollment = any(on_enrollment, na.rm = TRUE),
+    any_after_enrollment = any(after_enrollment, na.rm = TRUE),
+    # New-onset after enrollment: after == TRUE and on == FALSE
+    any_new_onset_after = any(after_enrollment, na.rm = TRUE) & !any(on_enrollment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2) Collapse to participant-level indicators (across all adjacent buckets)
+adj_person_level <- adj_bucket_flags_by_person %>%
+  group_by(participant_id, treatment, cassy_result, merged_date) %>%
+  summarise(
+    # has any adjacent bucket anywhere in extract (within dated rows)
+    any_adj_bucket_anytime = n_distinct(bucket) > 0,
+
+    # Participant has at least one adjacent bucket ON enrollment date
+    any_adj_on_enrollment = any(any_on_enrollment, na.rm = TRUE),
+
+    # Participant has at least one adjacent bucket AFTER enrollment date
+    any_adj_after_enrollment = any(any_after_enrollment, na.rm = TRUE),
+
+    # Participant has at least one adjacent bucket that is NEW after enrollment
+    any_adj_new_onset_after = any(any_new_onset_after, na.rm = TRUE),
+
+    # Optional: how many new-onset buckets (count, not just flag)
+    n_new_onset_buckets_after = sum(any_new_onset_after, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 3) Summarise by treatment x cassy_result
+adj_person_2x2_summary <- adj_person_level %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n_distinct(participant_id),
+
+    # Definitions you asked for:
+    n_any_adj_on_enrollment = sum(any_adj_on_enrollment),
+    pct_any_adj_on_enrollment = 100 * mean(any_adj_on_enrollment),
+
+    n_any_adj_after_enrollment = sum(any_adj_after_enrollment),
+    pct_any_adj_after_enrollment = 100 * mean(any_adj_after_enrollment),
+
+    # Fairer "change" metric:
+    n_any_adj_new_onset_after = sum(any_adj_new_onset_after),
+    pct_any_adj_new_onset_after = 100 * mean(any_adj_new_onset_after),
+
+    # Optional intensity metric:
+    total_new_onset_buckets_after = sum(n_new_onset_buckets_after),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+
+adj_person_2x2_summary
+```
+
+- **`n_any_adj_on_enrollment`**: number of participants who had **≥1 adjacent bucket** documented on the **enrollment date** (`dx_date == merged_date`).
+- **`n_any_adj_after_enrollment`**: number of participants who had **≥1 adjacent bucket** documented on a date **after enrollment** (`dx_date > merged_date`).
+- **`n_any_adj_new_onset_after`**: number of participants who had **≥1 adjacent bucket appear after enrollment that was not present on enrollment day** (after == TRUE and on == FALSE at the **bucket** level).
+
+---
+This table summarizes adjacent mental health bucket activity relative to enrollment (`merged_date`) at the **participant level**, within treatment/CASSY subgroups. 
+
+- `n_any_adj_on_enrollment` / `pct_any_adj_on_enrollment` counts participants who had **at least one adjacent-bucket diagnosis code on the enrollment date**.
+- `n_any_adj_after_enrollment` / `pct_any_adj_after_enrollment` counts participants who had **at least one adjacent-bucket diagnosis code after enrollment**.
+- `n_any_adj_new_onset_after` / `pct_any_adj_new_onset_after` counts participants who had **at least one “new-onset” adjacent bucket after enrollment** (i.e., a bucket that appears after enrollment but **was not present on enrollment day**).
+- `total_new_onset_buckets_after` is the **total number of new-onset buckets** summed across participants in that subgroup (so one participant can contribute multiple new-onset buckets).
+
+**Treatment, CASSY+ (n=13).**  
+- **61.5% (8/13)** had any adjacent-bucket code on enrollment and **61.5% (8/13)** had any adjacent-bucket code after enrollment.  
+- **53.8% (7/13)** had at least one **new-onset bucket** after enrollment, with **14 total new-onset buckets** across the subgroup (≈ **2.0** new-onset buckets per affected participant: 14/7).
+
+**Treatment, CASSY− (n=25).**  
+- **36.0% (9/25)** had any adjacent-bucket code on enrollment, while **80.0% (20/25)** had adjacent-bucket codes after enrollment.  
+- **72.0% (18/25)** had at least one **new-onset bucket** after enrollment, with **33 total new-onset buckets** (≈ **1.8** new-onset buckets per affected participant: 33/18).  
+This indicates that, among treatment participants who were CASSY negative, adjacent mental health coding is much more often observed **post-enrollment** than on the enrollment day, and many participants have buckets that emerge only after enrollment.
+
+**Control (n=33; CASSY not administered → NA).**  
+- **48.5% (16/33)** had adjacent-bucket codes on enrollment and **69.7% (23/33)** had codes after enrollment.  
+- **66.7% (22/33)** had at least one **new-onset bucket** after enrollment, with **51 total new-onset buckets** (≈ **2.3** new-onset buckets per affected participant: 51/22).  
+
+- **Any post-enrollment adjacent coding** means a participant has **≥1 adjacent bucket diagnosis recorded after enrollment** (`dx_date > merged_date`).
+- **New-onset adjacent bucket after enrollment** means a participant has **≥1 adjacent bucket that appears after enrollment but was not recorded on the enrollment day** (bucket present after, **not** on enrollment day).
+- **New-onset bucket intensity** is the average number of **distinct new-onset buckets per participant among those with any new-onset**.
+
+Across participants with any adjacent MH coding observed, **post-enrollment adjacent coding and new-onset buckets are common in all groups**. Descriptively, **Treatment/CASSY−** has the highest share with **any post-enrollment adjacent coding** (80%), while **Control** shows the highest **new-onset bucket intensity** among those with new onset (~2.3 distinct new-onset buckets per affected participant). These patterns should be interpreted cautiously because they likely reflect **differences in follow-up encounter capture and diagnosis coding opportunity** (i.e., who has post-enrollment encounters in the MR extract), in addition to any true clinical change.
+
+# 12I)
+```{r adjacent-mh-new-onset-summary-full-denominator}
+# 1) Per-person, per-bucket timing flags (only where we have dated dx + merged_date)
+adj_bucket_flags_by_person <- dx_buckets_adj_long2 %>%
+  filter(!is.na(merged_date), !is.na(dx_date)) %>%
+  mutate(
+    on_enrollment = dx_date == merged_date,
+    after_enrollment = dx_date > merged_date
+  ) %>%
+  group_by(participant_id, treatment, cassy_result, merged_date, bucket) %>%
+  summarise(
+    any_on_enrollment = any(on_enrollment, na.rm = TRUE),
+    any_after_enrollment = any(after_enrollment, na.rm = TRUE),
+    any_new_onset_after = any(after_enrollment, na.rm = TRUE) & !any(on_enrollment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2) Collapse to participant-level indicators across all adjacent buckets
+adj_person_level <- adj_bucket_flags_by_person %>%
+  group_by(participant_id, treatment, cassy_result, merged_date) %>%
+  summarise(
+    any_adj_on_enrollment = any(any_on_enrollment, na.rm = TRUE),
+    any_adj_after_enrollment = any(any_after_enrollment, na.rm = TRUE),
+    any_adj_new_onset_after = any(any_new_onset_after, na.rm = TRUE),
+    n_new_onset_buckets_after = sum(any_new_onset_after, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 3) Join back to FULL randomized roster denominator and coalesce missing -> FALSE/0
+adj_person_level_full <- roster_rand %>%
+  select(participant_id, treatment, cassy_result, merged_date) %>%
+  left_join(
+    adj_person_level %>%
+      select(participant_id,
+             any_adj_on_enrollment,
+             any_adj_after_enrollment,
+             any_adj_new_onset_after,
+             n_new_onset_buckets_after),
+    by = "participant_id"
+  ) %>%
+  mutate(
+    any_adj_on_enrollment = coalesce(any_adj_on_enrollment, FALSE),
+    any_adj_after_enrollment = coalesce(any_adj_after_enrollment, FALSE),
+    any_adj_new_onset_after = coalesce(any_adj_new_onset_after, FALSE),
+    n_new_onset_buckets_after = coalesce(n_new_onset_buckets_after, 0L)
+  )
+
+# 4) Summarise by treatment x cassy_result (full denominator)
+adj_person_2x2_summary_full <- adj_person_level_full %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n_distinct(participant_id),
+
+    n_any_adj_on_enrollment = sum(any_adj_on_enrollment),
+    pct_any_adj_on_enrollment = 100 * mean(any_adj_on_enrollment),
+
+    n_any_adj_after_enrollment = sum(any_adj_after_enrollment),
+    pct_any_adj_after_enrollment = 100 * mean(any_adj_after_enrollment),
+
+    n_any_adj_new_onset_after = sum(any_adj_new_onset_after),
+    pct_any_adj_new_onset_after = 100 * mean(any_adj_new_onset_after),
+
+    total_new_onset_buckets_after = sum(n_new_onset_buckets_after),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+
+adj_person_2x2_summary_full
+```
+**(full randomized denominator).** This table reports adjacent mental health bucket activity relative to enrollment (`merged_date`) using the **entire randomized roster** as the denominator (including participants with *no* adjacent-bucket diagnosis codes observed in the MR extract). As a result, these percentages are smaller than the earlier “conditional” table because they reflect both (a) true diagnosis presence and (b) whether the MR extract contains coded diagnoses for that participant after enrollment.
+
+Columns:
+- `n_any_adj_on_enrollment` / `pct_any_adj_on_enrollment`: participants with **≥1 adjacent-bucket code on the enrollment date**.
+- `n_any_adj_after_enrollment` / `pct_any_adj_after_enrollment`: participants with **≥1 adjacent-bucket code after enrollment**.
+- `n_any_adj_new_onset_after` / `pct_any_adj_new_onset_after`: participants with **≥1 new-onset adjacent bucket after enrollment** (bucket appears after enrollment but **not** on enrollment day).
+- `total_new_onset_buckets_after`: total count of **new-onset buckets** summed across participants (one participant can contribute multiple new-onset buckets).
+
+**Treatment, CASSY+ (n=48).**
+- **16.7% (8/48)** have any adjacent-bucket code on enrollment and **16.7% (8/48)** have any adjacent-bucket code after enrollment.
+- **14.6% (7/48)** have at least one **new-onset** adjacent bucket after enrollment, with **14 total new-onset buckets** (≈2.0 new-onset buckets per affected participant: 14/7).
+
+**Treatment, CASSY− (n=203).**
+- **4.4% (9/203)** have any adjacent-bucket code on enrollment.
+- **9.9% (20/203)** have any adjacent-bucket code after enrollment.
+- **8.9% (18/203)** show at least one **new-onset** bucket after enrollment, with **33 total new-onset buckets** (≈1.8 per affected participant: 33/18).
+
+**Treatment, CASSY missing (n=3).**
+- No adjacent-bucket codes observed on or after enrollment in this extract (all zeros).
+
+**Control (n=241; CASSY not administered → NA).**
+- **6.6% (16/241)** have adjacent-bucket codes on enrollment.
+- **9.5% (23/241)** have adjacent-bucket codes after enrollment.
+- **9.1% (22/241)** show at least one **new-onset** bucket after enrollment, with **51 total new-onset buckets** (≈2.3 per affected participant: 51/22).
+
+Using the full randomized denominator, only a small fraction of participants in each arm have observable adjacent-bucket diagnosis coding in the MR extract on/after enrollment (roughly ~4–17% depending on subgroup). Among those who *do* have post-enrollment adjacent coding, most are classified as “new-onset after enrollment” because the bucket was not documented on the enrollment day. 
+
+# 12J) Treatment vs Control risk difference + Fisher/chi-square
+
+```{r risk-diff-treatment-vs-control-adjacent}
+# Requires: adj_person_level_full with columns:
+#   treatment (0/1), any_adj_new_onset_after, any_adj_after_enrollment
+# and treatment==1 is Treatment, 0 is Control.
+
+analysis_df <- adj_person_level_full %>%
+  filter(treatment %in% c(0, 1)) %>%
+  mutate(
+    arm = if_else(treatment == 1, "Treatment", "Control"),
+    any_adj_new_onset_after   = coalesce(any_adj_new_onset_after, FALSE),
+    any_adj_after_enrollment  = coalesce(any_adj_after_enrollment, FALSE)
+  )
+
+risk_diff_one <- function(df, outcome_col) {
+  # Ensure a stable 2x2 layout even if one level is absent
+  tab <- df %>%
+    transmute(
+      arm = factor(arm, levels = c("Control", "Treatment")),
+      y   = factor(.data[[outcome_col]], levels = c(FALSE, TRUE))
+    ) %>%
+    count(arm, y) %>%
+    tidyr::complete(arm, y, fill = list(n = 0)) %>%
+    tidyr::pivot_wider(names_from = y, values_from = n) %>%
+    tibble::column_to_rownames("arm") %>%
+    as.matrix()
+
+  # Proportions (participant-level)
+  p_treat <- mean(df %>% filter(arm == "Treatment") %>% pull(.data[[outcome_col]]))
+  p_ctrl  <- mean(df %>% filter(arm == "Control")   %>% pull(.data[[outcome_col]]))
+  rd_pp   <- 100 * (p_treat - p_ctrl)  # percentage-point difference
+
+  # If table is degenerate, tests may fail -> return NA p-value
+  p_value <- NA_real_
+  test_name <- NA_character_
+
+  # Try chi-square expected counts to decide Fisher vs chi-square
+  # Wrap in tryCatch to avoid breaking on edge cases
+  expected <- tryCatch(chisq.test(tab)$expected, error = function(e) NULL)
+
+  if (!is.null(expected)) {
+    use_fisher <- any(expected < 5)
+
+    if (use_fisher) {
+      test_name <- "Fisher exact"
+      p_value <- tryCatch(fisher.test(tab)$p.value, error = function(e) NA_real_)
+    } else {
+      test_name <- "Chi-square"
+      p_value <- tryCatch(chisq.test(tab, correct = FALSE)$p.value, error = function(e) NA_real_)
+    }
+  } else {
+    # fallback attempt Fisher (still may fail)
+    test_name <- "Fisher exact"
+    p_value <- tryCatch(fisher.test(tab)$p.value, error = function(e) NA_real_)
+  }
+
+  tibble::tibble(
+    outcome = outcome_col,
+    n_treat = sum(df$arm == "Treatment"),
+    n_ctrl  = sum(df$arm == "Control"),
+    p_treat = 100 * p_treat,
+    p_ctrl  = 100 * p_ctrl,
+    risk_diff_pp = rd_pp,
+    test = test_name,
+    p_value = p_value
+  )
+}
+
+rd_results <- dplyr::bind_rows(
+  risk_diff_one(analysis_df, "any_adj_new_onset_after"),
+  risk_diff_one(analysis_df, "any_adj_after_enrollment")
+)
+
+rd_results
+```
+
+```{r build-dx-bucket-timing-adj}
+# 1) Participant × bucket timing (uses dx_buckets_adj_long2, which already has merged_date joined)
+dx_bucket_timing_adj <- dx_buckets_adj_long2 %>%
+  filter(treatment == 1, cassy_result %in% c(0, 1)) %>%  # treatment only, CASSY strata only
+  filter(!is.na(merged_date), !is.na(dx_date)) %>%
+  mutate(
+    on_enrollment = dx_date == merged_date,
+    after_enrollment = dx_date > merged_date
+  ) %>%
+  group_by(participant_id, bucket) %>%
+  summarise(
+    any_on_enrollment_bucket = any(on_enrollment, na.rm = TRUE),
+    any_after_enrollment_bucket = any(after_enrollment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    new_onset_bucket_after = any_after_enrollment_bucket & !any_on_enrollment_bucket
+  ) %>%
+  group_by(participant_id) %>%
+  summarise(
+    any_adj_on_enrollment   = any(any_on_enrollment_bucket, na.rm = TRUE),
+    any_adj_after_enrollment = any(any_after_enrollment_bucket, na.rm = TRUE),
+    any_adj_new_onset_after  = any(new_onset_bucket_after, na.rm = TRUE),
+    n_new_onset_buckets_after = sum(new_onset_bucket_after, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Quick sanity check
+dx_bucket_timing_adj %>% count(any_adj_on_enrollment, any_adj_after_enrollment, any_adj_new_onset_after)
+```
+
+```{r cassy-stratified-treatment-only-risk-diff}
+pick_test <- function(tab) {
+  expected <- suppressWarnings(chisq.test(tab)$expected)
+  if (any(expected < 5)) {
+    list(test = "Fisher exact", obj = fisher.test(tab))
+  } else {
+    list(test = "Chi-square", obj = chisq.test(tab, correct = FALSE))
+  }
+}
+
+risk_diff_cassy_within_treatment <- function(df, outcome_col) {
+  d <- df %>%
+    filter(treatment == 1, cassy_result %in% c(0, 1)) %>%
+    mutate(
+      cassy_group = if_else(cassy_result == 1, "CASSY+", "CASSY-"),
+      outcome = coalesce(.data[[outcome_col]], FALSE)
+    ) %>%
+    distinct(participant_id, cassy_group, outcome)
+
+  summ <- d %>%
+    group_by(cassy_group) %>%
+    summarise(
+      n = n(),
+      n_outcome = sum(outcome),
+      p = 100 * mean(outcome),
+      .groups = "drop"
+    )
+
+  tab <- d %>%
+    count(cassy_group, outcome) %>%
+    pivot_wider(names_from = outcome, values_from = n, values_fill = 0) %>%
+    select(cassy_group, `FALSE`, `TRUE`) %>%
+    tibble::column_to_rownames("cassy_group") %>%
+    as.matrix()
+
+  test_res <- pick_test(tab)
+
+  p_plus  <- summ$p[summ$cassy_group == "CASSY+"]
+  p_minus <- summ$p[summ$cassy_group == "CASSY-"]
+  n_plus  <- summ$n[summ$cassy_group == "CASSY+"]
+  n_minus <- summ$n[summ$cassy_group == "CASSY-"]
+
+  tibble(
+    outcome = outcome_col,
+    n_cassy_plus = n_plus,
+    n_cassy_minus = n_minus,
+    p_cassy_plus = p_plus,
+    p_cassy_minus = p_minus,
+    risk_diff_pp = p_plus - p_minus,   # CASSY+ minus CASSY-
+    test = test_res$test,
+    p_value = unname(test_res$obj$p.value)
+  )
+}
+
+analysis_df_treat <- roster_rand %>%
+  filter(!is.na(treatment)) %>%
+  left_join(dx_bucket_timing_adj, by = "participant_id") %>%
+  mutate(
+    any_adj_on_enrollment    = coalesce(any_adj_on_enrollment, FALSE),
+    any_adj_after_enrollment = coalesce(any_adj_after_enrollment, FALSE),
+    any_adj_new_onset_after  = coalesce(any_adj_new_onset_after, FALSE)
+  )
+
+cassy_treat_only_results <- bind_rows(
+  risk_diff_cassy_within_treatment(analysis_df_treat, "any_adj_new_onset_after"),
+  risk_diff_cassy_within_treatment(analysis_df_treat, "any_adj_after_enrollment"),
+  risk_diff_cassy_within_treatment(analysis_df_treat, "any_adj_on_enrollment")
+)
+
+cassy_treat_only_results
+```
+
+# 13) 2×2 summary table: Treatment × CASSY status (feasibility + change signals)
+
+```{r summary-2x2}
+summary_2x2 <- roster_rand %>%
+  left_join(enc_post, by = "participant_id") %>%
+  left_join(dx_bucket_timing, by = "participant_id") %>%
+  mutate(
+    any_after_enroll = coalesce(any_after_enroll, FALSE),
+    n_encounters_after_enroll = coalesce(n_encounters_after_enroll, 0L),
+    any_bucket_after_enrollment = coalesce(any_bucket_after_enrollment, FALSE),
+    any_new_bucket_after_enrollment = coalesce(any_new_bucket_after_enrollment, FALSE)
+  ) %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n_distinct(participant_id),
+
+    # Feasibility: post-enrollment MR exposure
+    n_any_after_enroll_enc = sum(any_after_enroll),
+    pct_any_after_enroll_enc = 100 * mean(any_after_enroll),
+    median_n_after_enroll_enc = median(n_encounters_after_enroll, na.rm = TRUE),
+
+    # Outcomes we can observe (given the extract)
+    n_any_bucket_after = sum(any_bucket_after_enrollment),
+    pct_any_bucket_after = 100 * mean(any_bucket_after_enrollment),
+
+    n_any_new_bucket_after = sum(any_new_bucket_after_enrollment),
+    pct_any_new_bucket_after = 100 * mean(any_new_bucket_after_enrollment),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+
+summary_2x2
+```
+
+# 14) Interpretability refinement: bucket outcomes conditional on having post-enrollment encounters
+
+```{r conditional-on-observed}
+summary_2x2_observed <- roster_rand %>%
+  left_join(enc_post, by = "participant_id") %>%
+  left_join(dx_bucket_timing, by = "participant_id") %>%
+  mutate(
+    any_after_enroll = coalesce(any_after_enroll, FALSE),
+    any_bucket_after_enrollment = coalesce(any_bucket_after_enrollment, FALSE),
+    any_new_bucket_after_enrollment = coalesce(any_new_bucket_after_enrollment, FALSE)
+  ) %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n(),
+    n_observed_post = sum(any_after_enroll),
+    pct_observed_post = 100 * mean(any_after_enroll),
+
+    # Among those with post-enrollment MR exposure:
+    pct_any_bucket_after_among_observed =
+      if_else(n_observed_post == 0, NA_real_,
+              100 * mean(any_bucket_after_enrollment[any_after_enroll])),
+    pct_any_new_bucket_after_among_observed =
+      if_else(n_observed_post == 0, NA_real_,
+              100 * mean(any_new_bucket_after_enrollment[any_after_enroll])),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+
+summary_2x2_observed
+```
+
+# 15) Direct suicidality codes: participant-level frequency + roster cross-reference
+
+```{r suicidality-by-participant-frequency-xref}
+suicidality_by_participant <- dx_flagged %>%
+  filter(suicidality_flag) %>%
+  group_by(participant_id, diagnosis_code) %>%
+  summarise(
+    n_times_code_flagged = n(),
+    code_dates = paste(sort(unique(dx_date)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  # Collapse to one row per participant
+  group_by(participant_id) %>%
+  summarise(
+    n_flagged_rows = sum(n_times_code_flagged),
+    n_unique_flagged_codes = n_distinct(diagnosis_code),
+    flagged_codes_with_counts_and_dates = paste(
+      paste0(diagnosis_code, " (", n_times_code_flagged, ") [", code_dates, "]"),
+      collapse = ", "
+    ),
+    flagged_visit_dates = paste(
+      sort(unique(unlist(strsplit(code_dates, ",\\s*")))),
+      collapse = ", "
+    ),
+    .groups = "drop"
+  ) %>%
+  # Bring in randomization vars, but prefer enrollment_date over merged_date
+  left_join(
+    roster_rand %>% select(participant_id, treatment, cassy_result),
+    by = "participant_id"
+  ) %>%
+  left_join(
+    participants_std %>% select(participant_id, enrollment_date),
+    by = "participant_id"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1), participant_id)
+
+suicidality_by_participant
+```
+
+```{r suicidality-timing-summary-2x2}
+
+# Build a dx-level suicidality table with enrollment timing flags
+suicidality_dx_timing <- dx_flagged %>%
+  filter(suicidality_flag) %>%
+  left_join(
+    participants_std %>% select(participant_id, enrollment_date),
+    by = "participant_id"
+  ) %>%
+  left_join(
+    roster_rand %>% select(participant_id, treatment, cassy_result),
+    by = "participant_id"
+  ) %>%
+  filter(!is.na(enrollment_date)) %>%   # required for timing
+  mutate(
+    on_enrollment = !is.na(dx_date) & dx_date == enrollment_date,
+    after_enrollment = !is.na(dx_date) & dx_date > enrollment_date
+  )
+
+# Participant-level indicators (avoid counting multiple dx rows per person)
+suicidality_person_timing <- suicidality_dx_timing %>%
+  group_by(participant_id, treatment, cassy_result) %>%
+  summarise(
+    any_flag_anytime = TRUE,
+    any_flag_on_enrollment = any(on_enrollment, na.rm = TRUE),
+    any_flag_after_enrollment = any(after_enrollment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Summarize by treatment x CASSY (control will be cassy_result = NA)
+suicidality_timing_summary_2x2 <- roster_rand %>%
+  filter(!is.na(treatment)) %>%
+  left_join(suicidality_person_timing, by = c("participant_id", "treatment", "cassy_result")) %>%
+  mutate(
+    any_flag_anytime = coalesce(any_flag_anytime, FALSE),
+    any_flag_on_enrollment = coalesce(any_flag_on_enrollment, FALSE),
+    any_flag_after_enrollment = coalesce(any_flag_after_enrollment, FALSE)
+  ) %>%
+  group_by(treatment, cassy_result) %>%
+  summarise(
+    n = n(),
+    n_flag_anytime = sum(any_flag_anytime),
+    pct_flag_anytime = 100 * mean(any_flag_anytime),
+
+    n_flag_on_enrollment = sum(any_flag_on_enrollment),
+    pct_flag_on_enrollment = 100 * mean(any_flag_on_enrollment),
+
+    n_flag_after_enrollment = sum(any_flag_after_enrollment),
+    pct_flag_after_enrollment = 100 * mean(any_flag_after_enrollment),
+
+    # optional: "new onset after" at the participant level
+    n_new_onset_after = sum(any_flag_after_enrollment & !any_flag_on_enrollment),
+    pct_new_onset_after = 100 * mean(any_flag_after_enrollment & !any_flag_on_enrollment),
+
+    .groups = "drop"
+  ) %>%
+  arrange(desc(treatment == 1), desc(cassy_result == 1))
+
+suicidality_timing_summary_2x2
+```
+Using the suicidality-flag definition (R45.851, T14.91, X60–X84), we summarize **participant-level presence** by timing relative to **enrollment_date**:
+
+- **Anytime:** participant has ≥1 flagged diagnosis date anywhere in the extract.  
+- **On enrollment:** participant has ≥1 flagged diagnosis date where `dx_date == enrollment_date`.  
+- **After enrollment:** participant has ≥1 flagged diagnosis date where `dx_date > enrollment_date`.  
+- **New-onset after:** participant has ≥1 flagged diagnosis date **after enrollment** *and none on enrollment* (`after == TRUE` and `on == FALSE`).
+
+**Results by randomized group (full denominators):**
+
+- **Treatment, CASSY+ (n=48):**  
+  - **Anytime:** 4 participants (**8.33%**) had ≥1 suicidality-flag code.  
+  - **On enrollment:** 3 participants (**6.25%**) had a flagged code on the enrollment date.  
+  - **After enrollment:** 1 participant (**2.08%**) had a flagged code after enrollment.  
+  - **New-onset after:** 1 participant (**2.08%**) had a flagged code after enrollment with none on enrollment.
+
+- **Treatment, CASSY− (n=203):**  
+  - **Anytime:** 1 participant (**0.49%**) had ≥1 suicidality-flag code.  
+  - **On enrollment:** 0 participants (**0.00%**).  
+  - **After enrollment:** 1 participant (**0.49%**).  
+  - **New-onset after:** 1 participant (**0.49%**) (i.e., the post-enrollment flag was not present on enrollment day).
+
+- **Control (n=241; CASSY not administered → NA):**  
+  - **Anytime:** 6 participants (**2.49%**) had ≥1 suicidality-flag code.  
+  - **On enrollment:** 5 participants (**2.07%**) had a flagged code on the enrollment date.  
+  - **After enrollment:** 1 participant (**0.41%**) had a flagged code after enrollment.  
+  - **New-onset after:** 1 participant (**0.41%**) had a post-enrollment flag with none on enrollment.
+
+**Takeaway:** Suicidality-flag codes are **rare overall** in the MR diagnosis extract, and when they are present, they are **more commonly documented on the enrollment date** than as new-onset after enrollment. In this snapshot, the highest flagged rate appears in **Treatment/CASSY+ (8.33%)**, while **Control** shows a smaller but non-zero flagged rate (**2.49%**). Given the low counts, these differences should be treated as **descriptive** and likely sensitive to encounter capture/coding opportunity.

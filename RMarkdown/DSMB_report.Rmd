@@ -23,7 +23,7 @@ theme_set(theme_minimal(base_size = 13))
 # ---------- USER INPUTS ----------
 OUT_DIR   <- OUT_DIR %||% "."   # if OUT_DIR not set
 csv_path  <- file.path(OUT_DIR, "dat_merged.csv")
-DATA_LOCK <- as.Date("2025-11-20")  # used in some filters; update as needed
+DATA_LOCK <- as.Date("2026-01-01")  # used in some filters; update as needed
 
 # ---------- HELPERS ----------
 na_empty <- function(x) replace(x, is.na(x) | x %in% c("NA",""), NA)
@@ -617,7 +617,7 @@ summary(rand$min3); summary(rand$max3); summary(rand$min6); summary(rand$max6)
 # 9.5) Stage Counts
 ```{r warning=FALSE, message=FALSE}
 # 9.5) Stage Counts  -----------------------------------------------------------
-LOCK <- as.Date("2025-10-20")   # data-lock date for window logic
+LOCK <- as.Date("2026-01-01")   # data-lock date for window logic
 
 # ---------------- A0–A4 (unchanged from your working code) -------------------
 youth_approached_n <- n_distinct_na(raw$record_id)
@@ -1191,3 +1191,1958 @@ qc_tbl |>
   gt::tab_header(title = "CONSORT: Count Summary (Source of Truth)") |>
   gt::fmt_number(columns = "n", decimals = 0)
 ```
+# Table 3.2 Enrollment by Site and Treatment Group
+```{r}
+# --- Table 3.2: side-by-side versions (WITH drop vs WITHOUT drop) ------------
+LOCK <- as.Date("2026-01-01")
+
+# 0) Source: full randomized sample (rows with treatment assigned)
+enroll_src <- if (exists("rand")) {
+  rand
+} else if (exists("s8")) {
+  s8 |> dplyr::filter(!is.na(treatment))
+} else {
+  stop("Need `rand` (preferred) or `s8` with treatment assigned.")
+}
+
+# 1) Person-level base (distinct record_id) + site/arm + parsed min6 + numeric visit6
+base <- enroll_src |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+    treatment_int = as.integer(readr::parse_number(as.character(treatment))),
+    arm = dplyr::case_when(
+      treatment_int == 1L ~ "Treatment Group",
+      treatment_int == 0L ~ "Control Group",
+      TRUE ~ NA_character_
+    ),
+
+    # Site: prefer site_id if present, else infer from record_id
+    site_raw = dplyr::case_when(
+      "site_id" %in% names(enroll_src) & !is.na(site_id) ~ as.character(site_id),
+      stringr::str_starts(record_id, "H-") ~ "Harlem Hospital",
+      stringr::str_starts(record_id, "K-") ~ "Kings County Hospital",
+      TRUE ~ "Unknown"
+    ),
+    site = dplyr::case_when(
+      site_raw %in% c("Harlem","H","1","Harlem Hospital") ~ "Harlem Hospital",
+      site_raw %in% c("Kings","K","2","Kings County Hospital") ~ "Kings County Hospital",
+      TRUE ~ site_raw
+    ),
+
+    min6 = suppressWarnings(lubridate::ymd(as.character(follow_sch_min_6m))),
+    min6 = dplyr::if_else(is.na(min6) & exists("parse_any_datetime"),
+                          as.Date(parse_any_datetime(follow_sch_min_6m)),
+                          min6),
+
+    visit6 = suppressWarnings(as.integer(readr::parse_number(as.character(follow_visitstatus_6m))))
+  ) |>
+  dplyr::filter(!is.na(arm)) |>
+  dplyr::distinct(record_id, .keep_all = TRUE)
+
+# 2) Enrollment status (UPDATED definitions; mutually exclusive; no double counting)
+
+base <- base |>
+  dplyr::mutate(
+    # --- parse visit status codes ---
+    visit3 = suppressWarnings(as.integer(readr::parse_number(as.character(follow_visitstatus_3m)))),
+    visit6 = suppressWarnings(as.integer(readr::parse_number(as.character(follow_visitstatus_6m)))),
+
+    # --- parse 3m/6m assessment windows ---
+    min3 = suppressWarnings(lubridate::ymd(as.character(follow_sch_min_3m))),
+    max3 = suppressWarnings(lubridate::ymd(as.character(follow_sch_max_3m))),
+    min6 = suppressWarnings(lubridate::ymd(as.character(follow_sch_min_6m))),
+    max6 = suppressWarnings(lubridate::ymd(as.character(follow_sch_max_6m))),
+
+    # fallback parse if helper exists
+    min3 = dplyr::if_else(is.na(min3) & exists("parse_any_datetime"),
+                          as.Date(parse_any_datetime(follow_sch_min_3m)),
+                          min3),
+    max3 = dplyr::if_else(is.na(max3) & exists("parse_any_datetime"),
+                          as.Date(parse_any_datetime(follow_sch_max_3m)),
+                          max3),
+    min6 = dplyr::if_else(is.na(min6) & exists("parse_any_datetime"),
+                          as.Date(parse_any_datetime(follow_sch_min_6m)),
+                          min6),
+    max6 = dplyr::if_else(is.na(max6) & exists("parse_any_datetime"),
+                          as.Date(parse_any_datetime(follow_sch_max_6m)),
+                          max6),
+
+    # --- window checks (LOCK inside each participant’s window?) ---
+    in_3m_window = !is.na(min3) & !is.na(max3) & (LOCK >= min3) & (LOCK <= max3),
+    in_6m_window = !is.na(min6) & !is.na(max6) & (LOCK >= min6) & (LOCK <= max6),
+
+    # --- Completed (OR logic) ---
+    is_completed = (visit3 == 1L) | (visit6 == 1L),
+
+    # --- Active ---
+    # still able to provide data after baseline if:
+    #   - any in-progress status (2–5) at either wave OR
+    #   - LOCK is inside either follow-up window
+    is_active = (visit3 %in% 2:5) |
+                (visit6 %in% 2:5) |
+                in_3m_window |
+                in_6m_window,
+
+    # --- Exited ---
+    # no post-baseline data after baseline if:
+    #   - withdrew at 3m (visit3 == 6), OR
+    #   - missed both windows explicitly (7 at both),
+    #   - OR LOCK is NOT in either window (and not completed), meaning there is no current opportunity to collect data
+    is_exited = (visit3 == 6L) |
+                ((visit3 == 7L) & (visit6 == 7L)) |
+                (!in_3m_window & !in_6m_window & !is_completed),
+
+    # --- Final mutually exclusive label ---
+    enroll_status_3_2 = dplyr::case_when(
+      is_completed ~ "Completed",
+      is_exited    ~ "Exited",
+      is_active    ~ "Still active",
+      TRUE         ~ "Still active"
+    )
+  )
+
+# 3) Targets (edit if needed)
+targets <- tibble::tribble(
+  ~arm,              ~target_total, ~target_harlem, ~target_kings,
+  "Treatment Group",          386L,         137L,          248L,
+  "Control Group",            386L,         138L,          249L
+)
+
+# 4) Summarizer -> DSMB-style table
+make_32_table <- function(df, title) {
+
+  summ_arm <- function(arm_label) {
+    t <- targets |> dplyr::filter(arm == arm_label)
+
+    d <- df |>
+      dplyr::filter(arm == arm_label, site %in% c("Harlem Hospital","Kings County Hospital"))
+
+    count_cell <- function(site_name, status = NULL) {
+      dd <- if (!is.null(site_name)) d[d$site == site_name, ] else d
+      if (!is.null(status)) dd <- dd[dd$enroll_status_3_2 == status, ]
+      dplyr::n_distinct(dd$record_id)
+    }
+
+    entered_total <- count_cell(NULL)
+    active_total  <- count_cell(NULL, "Still active")
+    comp_total    <- count_cell(NULL, "Completed")
+    exit_total    <- count_cell(NULL, "Exited")
+
+    entered_h <- count_cell("Harlem Hospital")
+    active_h  <- count_cell("Harlem Hospital", "Still active")
+    comp_h    <- count_cell("Harlem Hospital", "Completed")
+    exit_h    <- count_cell("Harlem Hospital", "Exited")
+
+    entered_k <- count_cell("Kings County Hospital")
+    active_k  <- count_cell("Kings County Hospital", "Still active")
+    comp_k    <- count_cell("Kings County Hospital", "Completed")
+    exit_k    <- count_cell("Kings County Hospital", "Exited")
+
+    tibble::tibble(
+      Group  = arm_label,
+      Metric = c("Target\u00B9", "Entered", "\u00BB Still active", "\u00BB Completed", "\u00BB Exited"),
+      Total = c(t$target_total, entered_total, active_total, comp_total, exit_total),
+      `Harlem Hospital` = c(t$target_harlem, entered_h, active_h, comp_h, exit_h),
+      `Kings County Hospital` = c(t$target_kings, entered_k, active_k, comp_k, exit_k)
+    )
+  }
+
+  out <- dplyr::bind_rows(summ_arm("Treatment Group"), summ_arm("Control Group"))
+
+  out |>
+    gt::gt(rowname_col = "Metric", groupname_col = "Group") |>
+    gt::tab_header(title = title) |>
+    gt::fmt_number(columns = c("Total","Harlem Hospital","Kings County Hospital"), decimals = 0) |>
+    gt::tab_style(
+      style = gt::cell_text(weight = "bold"),
+      locations = gt::cells_stub(rows = c("Target\u00B9", "Entered"))
+    ) |>
+    gt::opt_row_striping()
+}
+
+# 5) WITH drop (STATA “recreate consort_status_6m” drop rules)
+base_with_drop <- base |>
+  dplyr::filter(!is.na(min6)) |>
+  dplyr::filter(min6 <= LOCK)
+
+# 6) WITHOUT drop (full randomized sample; NA counts as Active)
+base_no_drop <- base
+
+# 7) Print both tables
+tbl_with_drop <- make_32_table(
+  base_with_drop,
+  glue::glue("Table 3.2 (WITH drop): min6 present AND min6 <= {LOCK}")
+)
+tbl_no_drop <- make_32_table(
+  base_no_drop,
+  "Table 3.2 (NO drop): Full randomized sample (NA visitstatus counted as Active)"
+)
+
+tbl_with_drop
+tbl_no_drop
+```
+
+# 3.3 Enrollment by Site and Gender, Race/Ethnicity
+```{r}
+# 3.3 Enrollment by Site and Demographics -------------------------------------
+LOCK <- as.Date("2026-01-01")
+
+# ---- source: full randomized sample (treatment assigned) ----
+src <- if (exists("rand")) {
+  rand
+} else if (exists("s8")) {
+  s8 |> dplyr::filter(!is.na(treatment))
+} else {
+  stop("Need `rand` (preferred) or `s8` with treatment assigned.")
+}
+
+# ---- person-level base ----
+base33 <- src |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+
+    # Site: prefer site_id if present; else infer from record_id
+    site_raw = dplyr::case_when(
+      "site_id" %in% names(src) & !is.na(site_id) ~ as.character(site_id),
+      stringr::str_starts(record_id, "H-") ~ "Harlem Hospital",
+      stringr::str_starts(record_id, "K-") ~ "Kings County Hospital",
+      TRUE ~ "Unknown"
+    ),
+    site = dplyr::case_when(
+      site_raw %in% c("Harlem","H","1","Harlem Hospital") ~ "Harlem Hospital",
+      site_raw %in% c("Kings","K","2","Kings County Hospital") ~ "Kings County Hospital",
+      TRUE ~ site_raw
+    ),
+
+    # 6m visit status numeric
+    visit6 = suppressWarnings(as.integer(readr::parse_number(as.character(follow_visitstatus_6m)))),
+
+    # Consort status per STATA (NA => active)
+    consort_completed = (visit6 == 1L),
+    consort_exited    = (visit6 %in% c(6L, 7L)),
+    consort_active    = !(consort_completed | consort_exited)  # includes NA and 2–5
+  ) |>
+  dplyr::distinct(record_id, .keep_all = TRUE)
+
+# =============================================================================
+# Helpers to build tables
+# =============================================================================
+count_by_site <- function(df, condition) {
+  d <- df |> dplyr::filter({{ condition }})
+  c(
+    Total = dplyr::n_distinct(d$record_id),
+    `Harlem Hospital` = dplyr::n_distinct(d$record_id[d$site == "Harlem Hospital"]),
+    `Kings County Hospital` = dplyr::n_distinct(d$record_id[d$site == "Kings County Hospital"])
+  )
+}
+
+mk_simple_section <- function(df, section_name, var, levels_map, include_zeros = TRUE) {
+  # levels_map: named vector (names=labels, values=codes)
+  rows <- lapply(names(levels_map), function(lbl) {
+    code <- levels_map[[lbl]]
+    cts <- count_by_site(df, .data[[var]] == code)
+    tibble::tibble(Section = section_name, Row = lbl, !!!as.list(cts))
+  }) |> dplyr::bind_rows()
+
+  if (!include_zeros) {
+    rows <- rows |> dplyr::filter(Total > 0)
+  }
+  rows
+}
+
+mk_status_block <- function(df, section_name, category_label, in_cat, target_vec = c(Total=0, `Harlem Hospital`=0, `Kings County Hospital`=0)) {
+  entered   <- count_by_site(df, {{ in_cat }})
+  completed <- count_by_site(df, {{ in_cat }} & consort_completed)
+  exited    <- count_by_site(df, {{ in_cat }} & consort_exited)
+
+  # STATA note: still active is subtraction (forces add-up)
+  active <- entered - completed - exited
+
+  out <- tibble::tibble(
+    Section = section_name,
+    Row = c(category_label, "  Entered", "  \u00BB Still active", "  \u00BB Completed", "  \u00BB Exited"),
+    Total = c(target_vec[["Total"]], entered[["Total"]], active[["Total"]], completed[["Total"]], exited[["Total"]]),
+    `Harlem Hospital` = c(target_vec[["Harlem Hospital"]], entered[["Harlem Hospital"]], active[["Harlem Hospital"]], completed[["Harlem Hospital"]], exited[["Harlem Hospital"]]),
+    `Kings County Hospital` = c(target_vec[["Kings County Hospital"]], entered[["Kings County Hospital"]], active[["Kings County Hospital"]], completed[["Kings County Hospital"]], exited[["Kings County Hospital"]])
+  )
+
+  # Enforce add-up for the three status rows
+  stopifnot(out$Total[out$Row=="  Entered"] ==
+              out$Total[out$Row=="  \u00BB Still active"] +
+              out$Total[out$Row=="  \u00BB Completed"] +
+              out$Total[out$Row=="  \u00BB Exited"])
+  stopifnot(out$`Harlem Hospital`[out$Row=="  Entered"] ==
+              out$`Harlem Hospital`[out$Row=="  \u00BB Still active"] +
+              out$`Harlem Hospital`[out$Row=="  \u00BB Completed"] +
+              out$`Harlem Hospital`[out$Row=="  \u00BB Exited"])
+  stopifnot(out$`Kings County Hospital`[out$Row=="  Entered"] ==
+              out$`Kings County Hospital`[out$Row=="  \u00BB Still active"] +
+              out$`Kings County Hospital`[out$Row=="  \u00BB Completed"] +
+              out$`Kings County Hospital`[out$Row=="  \u00BB Exited"])
+
+  out
+}
+
+# =============================================================================
+# 1) Sex assigned at birth (STATA: screen_sex 1 male, 2 female)
+# =============================================================================
+sex_map <- c("Male" = 1L, "Female" = 2L)
+sex_tbl <- mk_simple_section(base33, "Sex assigned at birth", "screen_sex", sex_map, include_zeros = TRUE)
+
+# =============================================================================
+# 2) Gender identity (STATA codes)
+# =============================================================================
+gender_map <- c(
+  "Boy or man" = 2L,
+  "Girl or woman" = 1L,
+  "Nonbinary" = 3L,
+  "Genderfluid" = 4L,
+  "Genderqueer" = 5L,
+  "I am not sure or questioning" = 66L,
+  "I don't know what this question means" = 77L,
+  "I do not identify as any of these options" = 88L,   # STATA label said self-describe; screenshot uses this phrasing
+  "I do not want to answer" = 99L
+)
+
+gender_tbl <- mk_simple_section(base33, "Gender", "giso_gender_identity_b", gender_map, include_zeros = TRUE)
+
+# =============================================================================
+# 3) Race/Ethnicity
+#    Rebuild merge_black if not already present (matches your earlier approach)
+# =============================================================================
+if (!("merge_black" %in% names(base33))) {
+  # Treat any of screen_race_1..4 == 1 as "Black" (as in your earlier composite)
+  race_cols <- intersect(c("screen_race_1","screen_race_2","screen_race_3","screen_race_4"), names(base33))
+  if (length(race_cols) > 0) {
+    base33 <- base33 |>
+      dplyr::mutate(
+        merge_black = dplyr::if_else(
+          rowSums(dplyr::across(dplyr::all_of(race_cols), ~ .x == 1), na.rm = TRUE) >= 1,
+          1L, 0L
+        )
+      )
+  } else {
+    base33$merge_black <- NA_integer_
+  }
+}
+
+# Race flags (STATA used screen_race_5..8 and screen_race_99; also referenced screen_race_9 in rowtotal)
+flag <- function(x) dplyr::coalesce(as.integer(x) == 1L, FALSE)
+
+base33 <- base33 |>
+  dplyr::mutate(
+    r_black   = flag(merge_black),
+    r_aian    = if ("screen_race_5"  %in% names(base33)) flag(screen_race_5)  else FALSE,
+    r_asian   = if ("screen_race_6"  %in% names(base33)) flag(screen_race_6)  else FALSE,
+    r_nhpi    = if ("screen_race_7"  %in% names(base33)) flag(screen_race_7)  else FALSE,
+    r_white   = if ("screen_race_8"  %in% names(base33)) flag(screen_race_8)  else FALSE,
+    r_unknown = if ("screen_race_99" %in% names(base33)) flag(screen_race_99) else FALSE,
+
+    # Single reporting category (mirrors intent of STATA + adds White/Unknown buckets seen in your screenshot)
+    race_cat = dplyr::case_when(
+      r_black & r_aian  ~ "Black &\nAmerican Indian and Alaska Native (target)",
+      r_black & r_asian ~ "Black &\nAsian (target)",
+      r_black & r_nhpi  ~ "Native Hawaiian\nOr Other Pacific Islander & Black (target)",
+      r_black & r_white ~ "Black &\nWhite (target)",
+      r_black & r_unknown ~ "Black &\nUnknown (target)",
+      r_black           ~ "Black (target)",
+      (!r_black) & r_white ~ "White (target)",
+      (!r_black) & (!r_white) & (r_unknown | TRUE) ~ "Unknown or not reported (target)",
+      TRUE ~ "Unknown or not reported (target)"
+    )
+  )
+
+# ---- Targets for Race categories (from your screenshot; edit as needed) ----
+race_targets <- list(
+  "Black (target)" = c(Total=772L, `Harlem Hospital`=275L, `Kings County Hospital`=497L),
+  "Black &\nAmerican Indian and Alaska Native (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Black &\nAsian (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Native Hawaiian\nOr Other Pacific Islander & Black (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Black &\nWhite (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Black &\nUnknown (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "White (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Unknown or not reported (target)" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+)
+
+race_levels <- names(race_targets)
+
+race_tbl <- dplyr::bind_rows(lapply(race_levels, function(lbl) {
+  mk_status_block(
+    df = base33,
+    section_name = "RACE",
+    category_label = lbl,
+    in_cat = (race_cat == lbl),
+    target_vec = race_targets[[lbl]]
+  )
+}))
+
+# =============================================================================
+# 4) Ethnicity (STATA screen_ethnicity: 1 Hispanic/Latino, 2 Not Hispanic/Latino, 99 Unknown)
+# =============================================================================
+base33 <- base33 |>
+  dplyr::mutate(
+    eth_cat = dplyr::case_when(
+      screen_ethnicity == 1 ~ "Hispanic/Latino",
+      screen_ethnicity == 2 ~ "Not Hispanic/Latino",
+      screen_ethnicity == 99 ~ "Unknown",
+      TRUE ~ "Unknown"
+    )
+  )
+
+eth_levels <- c("Hispanic/Latino", "Not Hispanic/Latino", "Unknown")
+
+# (Targets not provided in your screenshot; set 0s but keep the “(target)” style if you want)
+eth_targets <- list(
+  "Hispanic/Latino" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Not Hispanic/Latino" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L),
+  "Unknown" = c(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+)
+
+eth_tbl <- dplyr::bind_rows(lapply(eth_levels, function(lbl) {
+  mk_status_block(
+    df = base33,
+    section_name = "ETHNICITY",
+    category_label = lbl,
+    in_cat = (eth_cat == lbl),
+    target_vec = eth_targets[[lbl]]
+  )
+}))
+
+# =============================================================================
+# Combine + Render (gt)
+# =============================================================================
+tbl_33 <- dplyr::bind_rows(
+  sex_tbl,
+  gender_tbl,
+  race_tbl,
+  eth_tbl
+) |>
+  dplyr::mutate(
+    Row = dplyr::if_else(grepl("^  ", Row), Row, Row),   # keep indentation as-is
+    Row = dplyr::if_else(Section %in% c("RACE","ETHNICITY") & !grepl("^  ", Row),
+                         paste0(Row), Row)
+  )
+
+tbl_33 |>
+  gt::gt(rowname_col = "Row", groupname_col = "Section") |>
+  gt::tab_header(title = "3.3 Enrollment by Site and Demographics") |>
+  gt::fmt_number(columns = c("Total","Harlem Hospital","Kings County Hospital"), decimals = 0) |>
+  gt::tab_style(
+    style = gt::cell_text(weight = "bold"),
+    locations = gt::cells_row_groups(groups = c("RACE","ETHNICITY"))
+  ) |>
+  gt::opt_row_striping()
+```
+
+# 3.4 Enrollment Table: Projected vs. Actual by Time
+```{r}
+# 3.4 Enrollment Table: Projected vs. Actual by Time --------------------------
+
+LOCK <- as.Date("2026-01-01")  # not directly used here, but kept for consistency
+
+# ---- Ensure we have a dataset to work from ----
+df0 <- if (exists("raw")) raw else readr::read_csv(csv_path, show_col_types = FALSE) |> janitor::clean_names()
+
+# ---- Ensure merged_date exists (robust) ----
+if (!("merged_date" %in% names(df0))) {
+  # expects parse_any_datetime + na_empty already defined in your setup
+  df0 <- df0 |>
+    dplyr::mutate(
+      ps_date_dt         = parse_any_datetime(ps_date),
+      p_ps_date_dt       = parse_any_datetime(p_ps_date),
+      screen_doe_dt      = parse_any_datetime(screen_doe),
+      date_baseline_dt   = parse_any_datetime(date_baseline),
+      p_date_baseline_dt = parse_any_datetime(p_date_baseline),
+
+      merged_datetime = dplyr::coalesce(
+        ps_date_dt, p_ps_date_dt, screen_doe_dt, date_baseline_dt, p_date_baseline_dt
+      ),
+      merged_date = as.Date(merged_datetime)
+    )
+}
+
+# ---- Person-level randomized sample (matches STATA: tab treatment site_id) ----
+rand_person <- df0 |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+    treatment_int = suppressWarnings(as.integer(readr::parse_number(as.character(treatment)))),
+    site_raw = dplyr::case_when(
+      "site_id" %in% names(df0) & !is.na(site_id) ~ as.character(site_id),
+      stringr::str_starts(record_id, "H-") ~ "Harlem Hospital",
+      stringr::str_starts(record_id, "K-") ~ "Kings County Hospital",
+      TRUE ~ NA_character_
+    ),
+    site = dplyr::case_when(
+      site_raw %in% c("1","H","Harlem","Harlem Hospital") ~ "Harlem Hospital",
+      site_raw %in% c("2","K","Kings","Kings County Hospital") ~ "Kings County Hospital",
+      TRUE ~ site_raw
+    )
+  ) |>
+  dplyr::filter(!is.na(treatment_int)) |>
+  dplyr::group_by(record_id) |>
+  dplyr::summarise(
+    merged_date = min(merged_date, na.rm = TRUE),
+    site = dplyr::first(na.omit(site)),
+    .groups = "drop"
+  )
+
+# ---- Target template (from your screenshots) ----
+targets_34 <- tibble::tribble(
+  ~report_month, ~total_target, ~harlem_target, ~kings_target,
+  "2024-09-01", 140,  30, 110,
+  "2024-10-01", 180,  45, 135,
+  "2024-11-01", 220,  60, 160,
+  "2024-12-01", 269,  79, 190,
+  "2025-01-01", 318,  98, 220,
+  "2025-02-01", 367, 117, 250,
+  "2025-03-01", 415, 135, 280,
+  "2025-04-01", 504, 170, 334,
+  "2025-05-01", 593, 205, 388,
+  "2025-06-01", 682, 240, 442,
+  "2025-07-01", 772, 275, 497,
+  "2025-08-01", 861, 310, 551,
+
+  "2025-09-01",  950, 345, 605,
+  "2025-10-01", 1039, 380, 659,
+  "2025-11-01", 1129, 415, 714,
+  "2025-12-01", 1208, 450, 768,
+  "2026-01-01", 1307, 485, 822,
+  "2026-02-01", 1396, 520, 876,
+  "2026-03-01", 1486, 555, 931,
+  "2026-04-01", 1575, 590, 985,
+  "2026-05-01", 1664, 625, 1039,
+  "2026-06-01", 1753, 660, 1093,
+  "2026-07-01", 1843, 695, 1148,
+  "2026-08-01", 1932, 730, 1202
+) |>
+  dplyr::mutate(
+    report_month = as.Date(report_month),
+    reporting_period = format(report_month, "%B %Y"),
+    cutoff_next_month = lubridate::ceiling_date(report_month, unit = "month")
+  )
+
+# ---- Compute cumulative actuals for each reporting period ----
+actuals_34 <- targets_34 |>
+  dplyr::select(report_month, cutoff_next_month) |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    total_actual = dplyr::n_distinct(rand_person$record_id[!is.na(rand_person$merged_date) & rand_person$merged_date < cutoff_next_month]),
+    harlem_actual = dplyr::n_distinct(rand_person$record_id[!is.na(rand_person$merged_date) & rand_person$merged_date < cutoff_next_month & rand_person$site == "Harlem Hospital"]),
+    kings_actual  = dplyr::n_distinct(rand_person$record_id[!is.na(rand_person$merged_date) & rand_person$merged_date < cutoff_next_month & rand_person$site == "Kings County Hospital"])
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(report_month, total_actual, harlem_actual, kings_actual)
+
+tbl_34 <- targets_34 |>
+  dplyr::left_join(actuals_34, by = "report_month") |>
+  dplyr::select(
+    reporting_period,
+    total_target, total_actual,
+    harlem_target, harlem_actual,
+    kings_target, kings_actual
+  ) |>
+  dplyr::rename(
+    `Reporting Period` = reporting_period,
+    `Total Target` = total_target,
+    `Total Actual` = total_actual,
+    `Harlem Hospital Target` = harlem_target,
+    `Harlem Hospital Actual` = harlem_actual,
+    `Kings County Hospital Target` = kings_target,
+    `Kings County Hospital Actual` = kings_actual
+  )
+
+# ---- Print Year 3 and Year 4 separately (like your screenshot) ----
+year3 <- tbl_34 |> dplyr::filter(`Reporting Period` %in% format(seq.Date(as.Date("2024-09-01"), as.Date("2025-08-01"), by = "month"), "%B %Y"))
+year4 <- tbl_34 |> dplyr::filter(`Reporting Period` %in% format(seq.Date(as.Date("2025-09-01"), as.Date("2026-08-01"), by = "month"), "%B %Y"))
+
+year3 |>
+  gt::gt() |>
+  gt::tab_header(title = "Year 3") |>
+  gt::fmt_number(columns = where(is.numeric), decimals = 0)
+
+year4 |>
+  gt::gt() |>
+  gt::tab_header(title = "Year 4") |>
+  gt::fmt_number(columns = where(is.numeric), decimals = 0)
+
+# ---- If you ONLY want Aug 2025 through Dec 2025 to paste into the report: ----
+tbl_34 |>
+  dplyr::filter(`Reporting Period` %in% c("August 2025","September 2025","October 2025","November 2025","December 2025")) |>
+  gt::gt() |>
+  gt::tab_header(title = "Table 3.4 (Aug 2025–Dec 2025)") |>
+  gt::fmt_number(columns = where(is.numeric), decimals = 0)
+```
+
+# 3.5 Enrollment Graph: Projected vs. Actual by Time
+```{r}
+# 3.5 Enrollment Graph: Projected vs. Actual by Time (Updated Years 1–5) ------
+LOCK <- as.Date("2026-01-01")
+
+# ---- Build full projection schedule (from your Year 1/2/3/4/5 tables) ----
+targets_full <- tibble::tribble(
+  ~report_month, ~total_target, ~harlem_target, ~kings_target,
+
+  # Year 1 (Sep 2022–Aug 2023): all 0
+  "2022-09-01", 0, 0, 0,
+  "2022-10-01", 0, 0, 0,
+  "2022-11-01", 0, 0, 0,
+  "2022-12-01", 0, 0, 0,
+  "2023-01-01", 0, 0, 0,
+  "2023-02-01", 0, 0, 0,
+  "2023-03-01", 0, 0, 0,
+  "2023-04-01", 0, 0, 0,
+  "2023-05-01", 0, 0, 0,
+  "2023-06-01", 0, 0, 0,
+  "2023-07-01", 0, 0, 0,
+  "2023-08-01", 0, 0, 0,
+
+  # Year 2 (Sep 2023–Mar 2024): 0
+  "2023-09-01", 0, 0, 0,
+  "2023-10-01", 0, 0, 0,
+  "2023-11-01", 0, 0, 0,
+  "2023-12-01", 0, 0, 0,
+  "2024-01-01", 0, 0, 0,
+  "2024-02-01", 0, 0, 0,
+  "2024-03-01", 0, 0, 0,
+
+  # Year 2 continued (Apr–Aug 2024): from your screenshot
+  "2024-04-01", 15,  0, 15,
+  "2024-05-01", 30,  0, 30,
+  "2024-06-01", 45,  0, 45,
+  "2024-07-01", 60,  0, 60,
+  "2024-08-01", 100, 15, 85,
+
+  # Year 3 (Sep 2024–Aug 2025)
+  "2024-09-01", 140,  30, 110,
+  "2024-10-01", 180,  45, 135,
+  "2024-11-01", 220,  60, 160,
+  "2024-12-01", 269,  79, 190,
+  "2025-01-01", 318,  98, 220,
+  "2025-02-01", 367, 117, 250,
+  "2025-03-01", 415, 135, 280,
+  "2025-04-01", 504, 170, 334,
+  "2025-05-01", 593, 205, 388,
+  "2025-06-01", 682, 240, 442,
+  "2025-07-01", 772, 275, 497,
+  "2025-08-01", 861, 310, 551,
+
+  # Year 4 (Sep 2025–Aug 2026)
+  "2025-09-01",  950, 345, 605,
+  "2025-10-01", 1039, 380, 659,
+  "2025-11-01", 1129, 415, 714,
+  "2025-12-01", 1208, 450, 768,
+  "2026-01-01", 1307, 485, 822,
+  "2026-02-01", 1396, 520, 876,
+  "2026-03-01", 1486, 555, 931,
+  "2026-04-01", 1575, 590, 985,
+  "2026-05-01", 1664, 625, 1039,
+  "2026-06-01", 1753, 660, 1093,
+  "2026-07-01", 1843, 695, 1148,
+  "2026-08-01", 1932, 730, 1202,
+
+  # Year 5 (Sep 2026–Apr 2027)
+  "2026-09-01", 2021, 765, 1256,
+  "2026-10-01", 2110, 800, 1310,
+  "2026-11-01", 2200, 836, 1364,
+  "2026-12-01", 2200, 836, 1364,
+  "2027-01-01", 2200, 836, 1364,
+  "2027-02-01", 2200, 836, 1364,
+  "2027-03-01", 2200, 836, 1364,
+  "2027-04-01", 2200, 836, 1364
+) |>
+  dplyr::mutate(
+    report_month = as.Date(report_month),
+    reporting_period = format(report_month, "%B %Y"),
+    cutoff_next_month = as.Date(lubridate::ceiling_date(report_month, unit = "month"))
+  )
+
+# ---- Recompute ACTUALS from your data (same logic as Table 3.4) -------------
+df0 <- if (exists("raw")) raw else readr::read_csv(csv_path, show_col_types = FALSE) |> janitor::clean_names()
+
+# Ensure merged_date exists
+if (!("merged_date" %in% names(df0))) {
+  df0 <- df0 |>
+    dplyr::mutate(
+      ps_date_dt         = parse_any_datetime(ps_date),
+      p_ps_date_dt       = parse_any_datetime(p_ps_date),
+      screen_doe_dt      = parse_any_datetime(screen_doe),
+      date_baseline_dt   = parse_any_datetime(date_baseline),
+      p_date_baseline_dt = parse_any_datetime(p_date_baseline),
+      merged_datetime = dplyr::coalesce(ps_date_dt, p_ps_date_dt, screen_doe_dt, date_baseline_dt, p_date_baseline_dt),
+      merged_date = as.Date(merged_datetime)
+    )
+}
+
+# person-level randomized (distinct record_id)
+rand_person <- df0 |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+    treatment_int = suppressWarnings(as.integer(readr::parse_number(as.character(treatment))))
+  ) |>
+  dplyr::filter(!is.na(treatment_int)) |>
+  dplyr::group_by(record_id) |>
+  dplyr::summarise(
+    merged_date = min(merged_date, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+actuals_total <- targets_full |>
+  dplyr::select(report_month, cutoff_next_month) |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    total_actual = dplyr::n_distinct(rand_person$record_id[
+      !is.na(rand_person$merged_date) & rand_person$merged_date < cutoff_next_month
+    ])
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(report_month, total_actual)
+
+plot_df <- targets_full |>
+  dplyr::left_join(actuals_total, by = "report_month") |>
+  dplyr::transmute(
+    report_month,
+    target = total_target,
+    actual = dplyr::if_else(report_month <= LOCK, total_actual, NA_integer_)
+  ) |>
+  dplyr::arrange(report_month)
+
+plot_long <- plot_df |>
+  tidyr::pivot_longer(cols = c(target, actual), names_to = "series", values_to = "n") |>
+  dplyr::mutate(series = dplyr::recode(series, target = "Target", actual = "Actual"))
+
+# ---- X-axis: Dec / Apr / Aug ticks from Dec 2022 to Apr 2027 ----
+x_start  <- as.Date("2022-12-01")
+x_end    <- as.Date("2027-04-01")
+x_breaks <- seq.Date(x_start, x_end, by = "4 months")  # Dec -> Apr -> Aug -> ...
+
+subtitle_txt <- "Through January 1, 2026"
+
+ggplot2::ggplot(plot_long, ggplot2::aes(x = report_month, y = n, color = series)) +
+  ggplot2::geom_line(linewidth = 1.2, na.rm = TRUE) +
+  ggplot2::geom_point(size = 2, na.rm = TRUE) +
+  ggplot2::scale_x_date(
+    limits = c(x_start, x_end),
+    breaks = x_breaks,
+    labels = function(d) format(d, "%b\n'%y")
+  ) +
+  ggplot2::labs(
+    title = "WeCare Enrollment",
+    subtitle = subtitle_txt,
+    x = "Reporting Period",
+    y = "Number of Participants",
+    color = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = ggplot2::element_text(size = 11, hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+# 3.6 Screening and Enrollment Ineligibility and Withdrawal of Consent Prior to Randomization 
+## Table 3.6 Prep
+```{r}
+# ---------------- Table 3.6 prep --------------------------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+})
+
+# --- helper: ensure a usable `site` column exists on any df ---------------
+ensure_site <- function(df, master_site_lut = NULL) {
+  # If we already have a `site` column, keep it.
+  if ("site" %in% names(df)) return(df)
+
+  # If we have a lookup table (record_id -> site), join it.
+  if (!is.null(master_site_lut) && "record_id" %in% names(df)) {
+    out <- dplyr::left_join(
+      df,
+      master_site_lut |> dplyr::distinct(record_id, site),
+      by = "record_id"
+    )
+    if ("site" %in% names(out)) return(out)
+  }
+
+  # Else try to derive from site_id if present
+  if ("site_id" %in% names(df)) {
+    return(df |>
+      dplyr::mutate(
+        site = dplyr::case_when(
+          as.character(site_id) %in% c("1","H","Harlem","Harlem Hospital") ~ "Harlem Hospital",
+          as.character(site_id) %in% c("2","K","Kings","Kings County Hospital") ~ "Kings County Hospital",
+          TRUE ~ as.character(site_id)
+        )
+      )
+    )
+  }
+
+  # Else derive from record_id prefix
+  if ("record_id" %in% names(df)) {
+    return(df |>
+      dplyr::mutate(
+        record_id = as.character(record_id),
+        site = dplyr::case_when(
+          stringr::str_starts(record_id, "H-") ~ "Harlem Hospital",
+          stringr::str_starts(record_id, "K-") ~ "Kings County Hospital",
+          TRUE ~ NA_character_
+        )
+      )
+    )
+  }
+
+  df
+}
+
+# ------------------------------ Reset Dataset -----------------------------------
+df0 <- dat_merged <- if (exists("raw")) raw else readr::read_csv(csv_path, show_col_types = FALSE) |>
+  janitor::clean_names()
+
+# site variable (use site_id if present; else infer from record_id)
+df0 <- df0 |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+    site_raw = dplyr::case_when(
+      "site_id" %in% names(df0) & !is.na(site_id) ~ as.character(site_id),
+      stringr::str_starts(record_id, "H-") ~ "Harlem Hospital",
+      stringr::str_starts(record_id, "K-") ~ "Kings County Hospital",
+      TRUE ~ NA_character_
+    ),
+    site = dplyr::case_when(
+      site_raw %in% c("1","H","Harlem","Harlem Hospital") ~ "Harlem Hospital",
+      site_raw %in% c("2","K","Kings","Kings County Hospital") ~ "Kings County Hospital",
+      TRUE ~ site_raw
+    )
+  )
+
+# Now that df0 DEFINITELY has site, build the LUT safely
+site_lut <- df0 |>
+  dplyr::filter(!is.na(record_id)) |>
+  dplyr::distinct(record_id, site)
+
+# --- robust count_by_site (single definition) ---------------------------
+count_by_site <- function(df, cond) {
+  df <- ensure_site(df, master_site_lut = site_lut)
+  d <- df |> dplyr::filter({{ cond }})
+
+  tibble::tibble(
+    Total = dplyr::n_distinct(d$record_id),
+    `Harlem Hospital` = dplyr::n_distinct(d$record_id[d$site == "Harlem Hospital"]),
+    `Kings County Hospital` = dplyr::n_distinct(d$record_id[d$site == "Kings County Hospital"])
+  )
+}
+
+# ------------------------------ Reset Dataset -----------------------------------
+
+df0 <- dat_merged <- if (exists("raw")) raw else readr::read_csv(csv_path, show_col_types = FALSE) |>
+  janitor::clean_names()
+
+# site variable (use site_id if present; else infer from record_id)
+df0 <- df0 |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+    site_raw = dplyr::case_when(
+      "site_id" %in% names(df0) & !is.na(site_id) ~ as.character(site_id),
+      stringr::str_starts(record_id, "H-") ~ "Harlem Hospital",
+      stringr::str_starts(record_id, "K-") ~ "Kings County Hospital",
+      TRUE ~ NA_character_
+    ),
+    site = dplyr::case_when(
+      site_raw %in% c("1","H","Harlem","Harlem Hospital") ~ "Harlem Hospital",
+      site_raw %in% c("2","K","Kings","Kings County Hospital") ~ "Kings County Hospital",
+      TRUE ~ site_raw
+    )
+  )
+
+# merged_date (if not already present)
+if (!("merged_date" %in% names(df0))) {
+  df0 <- df0 |>
+    dplyr::mutate(
+      ps_date_dt         = parse_any_datetime(ps_date),
+      p_ps_date_dt       = parse_any_datetime(p_ps_date),
+      screen_doe_dt      = parse_any_datetime(screen_doe),
+      date_baseline_dt   = parse_any_datetime(date_baseline),
+      p_date_baseline_dt = parse_any_datetime(p_date_baseline),
+      merged_datetime = dplyr::coalesce(ps_date_dt, p_ps_date_dt, screen_doe_dt, date_baseline_dt, p_date_baseline_dt),
+      merged_date = as.Date(merged_datetime)
+    )
+}
+
+# age_status (matches STATA)
+df0 <- df0 |>
+  dplyr::mutate(
+    age_status = dplyr::coalesce(over_18, p_over_18),
+    age_status = dplyr::if_else(record_id %in% c("K-F0006","K-F0250"), 1L, age_status),
+    age_status = as.integer(age_status)
+  )
+
+# merged_hear_more (matches STATA + your manual fixes)
+df0 <- df0 |>
+  dplyr::mutate(
+    merged_hear_more = dplyr::case_when(
+      age_status == 1 ~ ps_hear_more,
+      age_status == 0 ~ p_ps_hear_more,
+      TRUE ~ dplyr::coalesce(ps_hear_more, p_ps_hear_more)
+    ),
+    merged_hear_more = dplyr::if_else(record_id %in% c("K-F0006","H-F0115","K-F0250"), 1L, merged_hear_more),
+    merged_hear_more = tidyr::replace_na(as.integer(merged_hear_more), 0L)
+  )
+
+# Eligibility screen complete (0/2)
+df0 <- df0 |>
+  dplyr::mutate(
+    eligibility_screen_complete = tidyr::replace_na(as.integer(eligibility_screen_complete), 0L)
+  )
+
+# Language none-of-above (p_screen_language == 5), with manual fix
+if ("p_screen_language" %in% names(df0)) {
+  df0 <- df0 |>
+    dplyr::mutate(
+      p_screen_language = dplyr::if_else(record_id == "H-F0115", 1L, as.integer(p_screen_language))
+    )
+}
+
+# Composite Black (like your earlier code)
+df0 <- df0 |>
+  dplyr::mutate(
+    merge_black = dplyr::if_else(
+      rowSums(dplyr::across(c(screen_race_1, screen_race_2, screen_race_3, screen_race_4), ~ .x == 1), na.rm = TRUE) >= 1,
+      1L, 0L
+    )
+  )
+
+# Age eligibility (12–19) + override
+df0 <- df0 |>
+  dplyr::mutate(
+    elg_age = dplyr::case_when(
+      !is.na(screen_age) & screen_age >= 12 & screen_age < 20 ~ 1L,
+      !is.na(screen_age) & (screen_age < 12 | screen_age >= 20) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    elg_age = dplyr::if_else(record_id == "H-F0023", 1L, elg_age)
+  )
+
+count_by_site <- function(df, cond) {
+  d <- df |> dplyr::filter({{ cond }})
+  tibble::tibble(
+    Total = dplyr::n_distinct(d$record_id),
+    `Harlem Hospital` = dplyr::n_distinct(d$record_id[d$site == "Harlem Hospital"]),
+    `Kings County Hospital` = dplyr::n_distinct(d$record_id[d$site == "Kings County Hospital"])
+  )
+}
+```
+
+## Table 3.6: Build Each Reason 
+```{r}
+# Ensure site exists on all stage objects we might use
+if (exists("s7"))     s7     <- ensure_site(s7,     site_lut)
+if (exists("s8"))     s8     <- ensure_site(s8,     site_lut)
+if (exists("s8u"))    s8u    <- ensure_site(s8u,    site_lut)
+if (exists("s8_base")) s8_base <- ensure_site(s8_base, site_lut)
+
+# ---------------- DID NOT CONSENT reasons -----------------------------------
+
+# Reason #1: did NOT want to hear more
+r_dn1 <- count_by_site(df0, merged_hear_more == 0)
+
+# Base after initial consent to hear more
+after_hear_more <- df0 |> dplyr::filter(merged_hear_more == 1)
+
+# Reason #2: did NOT want to participate after initial consent (didn't complete elig screen)
+r_dn2 <- count_by_site(after_hear_more, eligibility_screen_complete != 2)
+
+# Base after completed eligibility screen
+after_elg_screen <- after_hear_more |> dplyr::filter(eligibility_screen_complete == 2)
+
+# ---- Ineligible screening reasons (apply on completed screen universe) ----
+# Reason #1: minor (12–17) caregiver not present
+r_in1 <- count_by_site(df0, over_18 == 0 & p_screen_legal_guardian == 0)
+
+# Reason #7 in screenshot: caregiver could not understand consent form languages (p_screen_language==5)
+r_in7_lang <- if ("p_screen_language" %in% names(df0)) {
+  count_by_site(df0, p_screen_language == 5)
+} else {
+  tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+}
+
+# Reason #2: race was NOT Black (on completed screen)
+r_in2_notblack <- count_by_site(after_elg_screen, merge_black == 0)
+
+# Reason #3: youth not able to speak/read English
+# (your dataset uses screen_speak_read_english; STATA uses screen_speak)
+speak_var <- dplyr::coalesce(
+  if ("screen_speak_read_english" %in% names(df0)) "screen_speak_read_english" else NA_character_,
+  if ("screen_speak" %in% names(df0)) "screen_speak" else NA_character_
+)
+r_in3_noenglish <- if (!is.na(speak_var)) {
+  count_by_site(after_elg_screen, .data[[speak_var]] == 0)
+} else tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+
+# Reason #4: sought therapy in past week
+r_in4_therapy <- if ("screen_seek_therapy" %in% names(df0)) {
+  count_by_site(after_elg_screen, screen_seek_therapy == 1)
+} else tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+
+# Reason #5: DID NOT have a cell phone (only disqualifying before 2025-01-01)
+r_in5_nophone <- if ("screen_has_cell_phone" %in% names(df0)) {
+  count_by_site(after_elg_screen, screen_has_cell_phone == 0 & merged_date < as.Date("2025-01-01"))
+} else tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+
+# Reason #6: did NOT meet minimal risk criteria
+# We'll use your Section 7 logic if s7 exists; otherwise compute minimal risk quickly.
+if (exists("s7")) {
+  # Ineligible minimal risk among completed eligibility survey with enough items
+  # (In your code: eligible_survey == 0 among s7 post-filter)
+  r_in6_minrisk <- count_by_site(s7, eligible_survey == 0)
+} else {
+  r_in6_minrisk <- tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+}
+
+# ---------------- DID NOT CONSENT reasons continued --------------------------
+# Reason #3: did NOT want to participate after eligibility screen
+# (eligible_screen==1 but eligibility survey incomplete)
+# Build eligible_screen like you did (same rules)
+flip0 <- function(cur, cond) dplyr::if_else(dplyr::coalesce(cond, FALSE), 0L, cur)
+
+elg_stage <- after_elg_screen |>
+  dplyr::mutate(
+    eligible_screen = 1L,
+    eligible_screen = flip0(eligible_screen, merge_black == 0),
+    eligible_screen = flip0(eligible_screen, elg_age != 1),
+    eligible_screen = flip0(eligible_screen, .data[[speak_var]] == 0),
+    eligible_screen = flip0(eligible_screen, screen_seek_therapy == 1),
+    eligible_screen = flip0(eligible_screen, screen_self_repeat == 1),
+    eligible_screen = flip0(eligible_screen, screen_sibling_repeat == 1),
+    eligible_screen = flip0(eligible_screen, p_screen_sibling_repeat == 1),
+    eligible_screen = dplyr::if_else(screen_has_cell_phone == 0 & merged_date < as.Date("2025-01-01"), 0L, eligible_screen),
+    eligible_screen = dplyr::if_else(record_id == "H-F0269", 1L, eligible_screen)
+  )
+
+# Survey completion variable options
+survey_complete_var <- dplyr::coalesce(
+  if ("eligibility_survey_complete" %in% names(df0)) "eligibility_survey_complete" else NA_character_,
+  if ("eligible_survey_count" %in% names(df0)) "eligible_survey_count" else NA_character_
+)
+
+r_dn3_after_screen <- if (!is.na(survey_complete_var) && survey_complete_var == "eligibility_survey_complete") {
+  count_by_site(elg_stage, eligible_screen == 1 & tidyr::replace_na(as.integer(eligibility_survey_complete), 0L) == 0)
+} else if (!is.na(survey_complete_var) && survey_complete_var == "eligible_survey_count") {
+  count_by_site(elg_stage, eligible_screen == 1 & tidyr::replace_na(as.integer(eligible_survey_count), 0L) <= 8)
+} else {
+  # fallback: if you have neither, we can't compute this reliably
+  tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+}
+
+# Reason #4: Families did not sign consent for study (consent == 0 among survey-eligible)
+if (exists("s8u")) {
+  # s8u is person-level consent/treatment; keep those who were survey-eligible (s8_base)
+  # We recompute consent in a person-level way based on your Section 8 logic, but count by site from df0.
+  # Build consent flag at row-level using your rule, then count consent==0 among survey-eligible.
+  s8_base <- if (exists("s8_base")) s8_base else (if (exists("s7")) s7 |> dplyr::filter(eligible_survey == 1) else df0[0,])
+
+  s8_rows <- s8_base |>
+    dplyr::mutate(
+      consent = dplyr::case_when(
+        p_informed_consent_form_parent_complete == 2 & screen_age_group == 0 ~ 1L,
+        informed_consent_form_youth_complete    == 2 & screen_age_group == 1 ~ 1L,
+        record_id %in% c("H-F0115","H-F0085","K-F0419") ~ 1L,
+        TRUE ~ 0L
+      )
+    )
+  r_dn4_no_consent_form <- count_by_site(s8_rows, consent == 0)
+} else {
+  r_dn4_no_consent_form <- tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+}
+
+# Did Not Complete Questionnaires (consented but no treatment)
+# Use your existing s8u if present; else compute quickly.
+if (exists("s8u")) {
+  tmp <- s8u |>
+    dplyr::left_join(df0 |> dplyr::distinct(record_id, site), by = "record_id")
+  r_dncq <- tibble::tibble(
+    Total = sum(tmp$consent == 1 & is.na(tmp$treatment), na.rm = TRUE),
+    `Harlem Hospital` = sum(tmp$consent == 1 & is.na(tmp$treatment) & tmp$site == "Harlem Hospital", na.rm = TRUE),
+    `Kings County Hospital` = sum(tmp$consent == 1 & is.na(tmp$treatment) & tmp$site == "Kings County Hospital", na.rm = TRUE)
+  )
+} else {
+  r_dncq <- tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+}
+
+# After Baseline (your screenshot shows 0/0/0 — keep as explicit zeros unless you have flags)
+r_after_inel <- tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+r_after_withdraw <- tibble::tibble(Total=0L, `Harlem Hospital`=0L, `Kings County Hospital`=0L)
+```
+
+
+## Table 3.6: Build Table
+```{r}
+# ---------------- Assemble Table 3.6 ----------------------------------------
+make_row <- function(label, counts_tbl) {
+  tibble::tibble(
+    Item = label,
+    Total = counts_tbl$Total,
+    `Harlem Hospital` = counts_tbl$`Harlem Hospital`,
+    `Kings County Hospital` = counts_tbl$`Kings County Hospital`
+  )
+}
+
+tbl_36 <- dplyr::bind_rows(
+  tibble::tibble(Item = "Prior to Baseline:", Total=NA_integer_, `Harlem Hospital`=NA_integer_, `Kings County Hospital`=NA_integer_),
+  tibble::tibble(Item = "» Did Not Consent", Total=NA_integer_, `Harlem Hospital`=NA_integer_, `Kings County Hospital`=NA_integer_),
+
+  make_row("Reason #1: Families did NOT want to hear more about the study", r_dn1),
+  make_row("Reason #2: Families did NOT want to participate after initial consent", r_dn2),
+  make_row("Reason #3: Families did NOT want to participate after eligibility screen", r_dn3_after_screen),
+  make_row("Reason #4: Families did not sign consent for study", r_dn4_no_consent_form),
+
+  tibble::tibble(Item = "» Ineligible", Total=NA_integer_, `Harlem Hospital`=NA_integer_, `Kings County Hospital`=NA_integer_),
+  make_row("Reason #1: Youth aged 12-17 whose caregiver was NOT present", r_in1),
+  make_row("Reason #2: Youth whose race was NOT Black", r_in2_notblack),
+  make_row("Reason #3: Youth who were NOT able to speak or read in English", r_in3_noenglish),
+  make_row("Reason #4: Youth who has sought therapy in the past week", r_in4_therapy),
+  make_row("Reason #5: Youth who DID NOT have a cell phone to receive texts", r_in5_nophone),
+  make_row("Reason #6: Youth who DID NOT meet the minimal risk criteria", r_in6_minrisk),
+  make_row("Reason #7: Caregiver could not understand consent form in English, Spanish, French (Harlem), or Creole (Kings)", r_in7_lang),
+
+  make_row("» Did Not Complete Questionnaires", r_dncq),
+
+  tibble::tibble(Item = "After Baseline", Total=NA_integer_, `Harlem Hospital`=NA_integer_, `Kings County Hospital`=NA_integer_),
+  make_row("» Ineligible", r_after_inel),
+  make_row("» Withdrew Consent", r_after_withdraw)
+)
+
+gt::gt(tbl_36) |>
+  gt::tab_header(title = "Table 3.6 Screening and Enrollment Ineligibility and Withdrawal of Consent Prior to Randomization") |>
+  gt::fmt_number(columns = c(Total, `Harlem Hospital`, `Kings County Hospital`), decimals = 0) |>
+  gt::tab_style(
+    style = gt::cell_text(weight = "bold"),
+    locations = gt::cells_body(rows = is.na(Total))
+  ) |>
+  gt::cols_label(
+    Item = "",
+    Total = "Total",
+    `Harlem Hospital` = "Harlem Hospital",
+    `Kings County Hospital` = "Kings County Hospital"
+  ) |>
+  gt::tab_footnote(
+    footnote = "Reason = “primary reason” although multiple reasons may have been provided.",
+    locations = gt::cells_title(groups = "title")
+  )
+```
+
+# Table 3.7 
+```{r}
+# ---------------- Table 3.7 Termination After Randomization ------------------
+
+stopifnot(exists("rand"))
+
+if (!requireNamespace("stringr", quietly = TRUE)) install.packages("stringr")
+if (!requireNamespace("lubridate", quietly = TRUE)) install.packages("lubridate")
+if (!requireNamespace("gt", quietly = TRUE)) install.packages("gt")
+
+# ---- Date parser fallback (uses your parse_any_datetime if it exists) ----
+parse_any_date_local <- function(x) {
+  if (exists("parse_any_datetime", mode = "function")) {
+    return(as.Date(parse_any_datetime(x)))
+  }
+  x_chr <- as.character(x)
+  out <- suppressWarnings(lubridate::parse_date_time(
+    x_chr,
+    orders = c("Ymd", "Ymd HMS", "Ymd HM", "mdY", "mdY HMS", "mdY HM", "Y-m-d", "m/d/Y"),
+    tz = "UTC",
+    truncated = 3
+  ))
+  as.Date(out)
+}
+
+# --- Base randomized table (row-level) ---------------------------------------
+rand_tbl <- rand |>
+  dplyr::mutate(
+    record_id = as.character(record_id),
+
+    # derive site robustly
+    site = dplyr::case_when(
+      stringr::str_starts(record_id, "H-") ~ "Harlem",
+      stringr::str_starts(record_id, "K-") ~ "Kings",
+      TRUE ~ NA_character_
+    ),
+
+    # match screenshot formatting
+    subject_id = paste0(record_id, "-Y-S")
+  )
+
+# ---- Manual correction: H-F0229 is No Show, not Withdrawal ------------------
+# (So they should NOT appear in termination tables)
+if ("follow_visitstatus_6m" %in% names(rand_tbl)) {
+  rand_tbl <- rand_tbl |>
+    dplyr::mutate(
+      follow_visitstatus_6m = dplyr::if_else(
+        record_id == "H-F0229",
+        5L, # No Show
+        as.integer(readr::parse_number(as.character(follow_visitstatus_6m)))
+      )
+    )
+}
+
+# --- Helper: pick first existing col name ------------------------------------
+pick_first_existing <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)][1]
+  if (length(hit) == 0 || is.na(hit)) NA_character_ else hit
+}
+get_col_or_na <- function(df, colname) {
+  if (is.na(colname)) return(rep(NA, nrow(df)))
+  df[[colname]]
+}
+
+# --- Enrollment date (for termination week) ----------------------------------
+col_enroll_date <- pick_first_existing(rand_tbl, c(
+  "merged_date",
+  "date_baseline", "p_date_baseline",
+  "ps_date", "p_ps_date",
+  "screen_doe"
+))
+enroll_date_vec <- parse_any_date_local(get_col_or_na(rand_tbl, col_enroll_date))
+
+# --- Enrollment date for DISPLAY (requested: screen_doe) ----------------------
+screen_doe_vec <- if ("screen_doe" %in% names(rand_tbl)) {
+  parse_any_date_local(rand_tbl$screen_doe)
+} else rep(as.Date(NA), nrow(rand_tbl))
+
+screen_doe_chr_vec <- dplyr::if_else(
+  is.na(screen_doe_vec),
+  NA_character_,
+  base::format(as.Date(screen_doe_vec), "%m/%d/%Y")
+)
+
+# --- Withdrawal dates ---------------------------------------------------------
+wd6_date_vec <- if ("follow_visitstatus_wddt_6m" %in% names(rand_tbl)) {
+  parse_any_date_local(rand_tbl$follow_visitstatus_wddt_6m)
+} else rep(as.Date(NA), nrow(rand_tbl))
+
+wd3_date_vec <- if ("follow_visitstatus_wddt_3m" %in% names(rand_tbl)) {
+  parse_any_date_local(rand_tbl$follow_visitstatus_wddt_3m)
+} else rep(as.Date(NA), nrow(rand_tbl))
+
+# Fallback termination date fields (baseline withdrawal etc.)
+col_term_date_fallback <- pick_first_existing(rand_tbl, c(
+  "termination_date", "term_date", "y_exit_date", "exit_date",
+  "follow_withdraw_date", "withdraw_date", "wd_date"
+))
+term_date_fallback_vec <- parse_any_date_local(get_col_or_na(rand_tbl, col_term_date_fallback))
+
+# Reasons from your specified vars
+rsn3 <- if ("follow_visitstatus_rsn_3m" %in% names(rand_tbl)) as.character(rand_tbl$follow_visitstatus_rsn_3m) else rep(NA_character_, nrow(rand_tbl))
+rsn6 <- if ("follow_visitstatus_rsn_6m" %in% names(rand_tbl)) as.character(rand_tbl$follow_visitstatus_rsn_6m) else rep(NA_character_, nrow(rand_tbl))
+
+# Exit notes sources
+exit_notes_vec <- if ("y_exit_surveys_notes" %in% names(rand_tbl)) {
+  as.character(rand_tbl$y_exit_surveys_notes)
+} else rep(NA_character_, nrow(rand_tbl))
+
+follow_notes_4_6m_vec <- if ("follow_notes_4_6m" %in% names(rand_tbl)) {
+  as.character(rand_tbl$follow_notes_4_6m)
+} else rep(NA_character_, nrow(rand_tbl))
+
+# --- Build termination rows ---------------------------------------------------
+terminated <- rand_tbl |>
+  dplyr::mutate(
+    # flags
+    term_baseline = (y_exit_wd_b == 1L),
+    term_3m       = (coerce_status_num(follow_visitstatus_3m) == 6L),
+    term_6m       = (coerce_status_num(follow_visitstatus_6m) == 6L),
+
+    term_any      = term_baseline | term_3m | term_6m,
+
+    termination_source = dplyr::case_when(
+      term_baseline ~ "Baseline",
+      term_3m       ~ "3-Month",
+      term_6m       ~ "6-Month",
+      TRUE ~ NA_character_
+    ),
+
+    # Termination Date (priority: 6m wddt, 3m wddt, baseline fallback)
+    termination_date = dplyr::case_when(
+      term_6m ~ wd6_date_vec,
+      term_3m ~ wd3_date_vec,
+      term_baseline ~ term_date_fallback_vec,
+      TRUE ~ as.Date(NA)
+    ),
+
+    # Week in study based on enrollment date (0-based)
+    termination_week = dplyr::case_when(
+      !is.na(termination_date) & !is.na(enroll_date_vec) ~
+        as.integer(floor(as.numeric(termination_date - enroll_date_vec) / 7)),
+      TRUE ~ NA_integer_
+    ),
+    termination_week = dplyr::if_else(!is.na(termination_week) & termination_week < 0L, 0L, termination_week),
+
+    reason_text = dplyr::case_when(
+      term_3m ~ rsn3,
+      term_6m ~ rsn6,
+      TRUE    ~ NA_character_
+    ),
+
+    # Exit notes:
+    # - baseline terminations: y_exit_surveys_notes
+    # - special case: H-F0190 -> use follow_notes_4_6m instead
+    exit_notes = dplyr::case_when(
+      record_id == "H-F0190" ~ follow_notes_4_6m_vec,
+      term_baseline ~ exit_notes_vec,
+      TRUE ~ NA_character_
+    ),
+
+    # Format Termination Date AS TEXT in the correct column (no extra columns)
+    termination_date_chr = dplyr::if_else(
+      is.na(termination_date),
+      NA_character_,
+      base::format(as.Date(termination_date), "%m/%d/%Y")
+    ),
+
+    # Enrollment date for display (screen_doe)
+    enroll_date_chr = screen_doe_chr_vec
+  ) |>
+  dplyr::filter(term_any) |>
+  dplyr::transmute(
+    Site = site,
+    `Subject ID` = subject_id,
+    `Treatment Arm` = dplyr::case_when(
+      is.na(treatment) ~ "Unknown",
+      as.integer(readr::parse_number(as.character(treatment))) == 1L ~ "Treatment",
+      as.integer(readr::parse_number(as.character(treatment))) == 0L ~ "Control",
+      TRUE ~ "Unknown"
+    ),
+    `Enrollment Date (screen_doe)` = enroll_date_chr,
+    `Termination Date` = termination_date_chr,
+    `Termination week in study` = termination_week,
+    `Providing data Y/N` = "Y",
+    `Reasons for termination [text]` = reason_text,
+    `Exit notes` = exit_notes,
+    treatment = as.integer(readr::parse_number(as.character(treatment))),
+    termination_source
+  ) |>
+  dplyr::arrange(treatment, Site, `Termination Date`, `Subject ID`)
+
+# ---- Quick check: all terminated participants are randomized? (treatment != NA)
+n_not_randomized <- terminated |>
+  dplyr::summarise(n = sum(is.na(treatment))) |>
+  dplyr::pull(n)
+
+if (n_not_randomized > 0) {
+  warning(sprintf(
+    "Found %s terminated participants with treatment == NA (not randomized). Review if these should be included.",
+    n_not_randomized
+  ))
+}
+
+# Split arms (keep Treatment Arm column; drop helpers)
+term_treat <- terminated |>
+  dplyr::filter(treatment == 1L) |>
+  dplyr::select(-treatment, -termination_source)
+
+term_ctrl <- terminated |>
+  dplyr::filter(treatment == 0L) |>
+  dplyr::select(-treatment, -termination_source)
+
+# Render tables
+gt_treat <- gt::gt(term_treat) |>
+  gt::tab_header(
+    title = "3.7 Termination After Randomization",
+    subtitle = "Treatment Group"
+  )
+
+gt_ctrl <- gt::gt(term_ctrl) |>
+  gt::tab_header(
+    title = "",
+    subtitle = "Control Group"
+  )
+
+gt_treat
+gt_ctrl
+
+
+```
+```{r}
+# ---- Count withdrawals after baseline/randomization --------------------------
+# Safeguard: drop invalid/unknown timing (NA) and any accidental 0s (shouldn't exist)
+terminated_postrand <- terminated |>
+  dplyr::filter(
+    !is.na(`Termination week in study`),
+    `Termination week in study` >= 1
+  )
+
+# Overall count (unique individuals)
+withdrawn_n_overall <- terminated_postrand |>
+  dplyr::summarise(N = dplyr::n_distinct(`Subject ID`)) |>
+  dplyr::pull(N)
+
+# By arm + source (what stakeholders usually want)
+withdrawn_summary <- terminated_postrand |>
+  dplyr::group_by(treatment, termination_source) |>
+  dplyr::summarise(
+    N = dplyr::n_distinct(`Subject ID`),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    Arm = dplyr::if_else(treatment == 1L, "Treatment", "Control")
+  ) |>
+  dplyr::select(Arm, termination_source, N) |>
+  dplyr::arrange(Arm, termination_source)
+
+# Optional: total by arm
+withdrawn_summary_arm_total <- terminated_postrand |>
+  dplyr::group_by(treatment) |>
+  dplyr::summarise(N = dplyr::n_distinct(`Subject ID`), .groups = "drop") |>
+  dplyr::mutate(Arm = dplyr::if_else(treatment == 1L, "Treatment", "Control")) |>
+  dplyr::select(Arm, N) |>
+  dplyr::arrange(Arm)
+
+withdrawn_n_overall
+withdrawn_summary
+withdrawn_summary_arm_total
+```
+
+```{r}
+```
+
+
+
+# 4.1 Proportion of Serious Adverse Events by Treatment Group
+```{r}
+# ---------------- Table 4.1 SAE by Treatment Group ------------------
+
+stopifnot(exists("rand"))
+
+# Helper: coerce 0/1-ish values to 0/1/NA
+coerce_01 <- function(x) {
+  if (is.null(x)) return(NULL)
+  x0 <- suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+  # keep only 0/1; everything else -> NA (safer)
+  dplyr::case_when(
+    is.na(x0) ~ NA_integer_,
+    x0 %in% c(0L, 1L) ~ x0,
+    TRUE ~ NA_integer_
+  )
+}
+
+has_col <- function(df, nm) nm %in% names(df)
+
+df <- rand |>
+  dplyr::mutate(
+    treatment = suppressWarnings(as.integer(readr::parse_number(as.character(treatment))))
+  ) |>
+  dplyr::filter(!is.na(treatment))
+
+# SAE definition (per your STATA + table note): suicide attempt reported at follow-up
+sae_3m <- if (has_col(df, "cssrs_6_3m")) coerce_01(df$cssrs_6_3m) else rep(NA_integer_, nrow(df))
+sae_6m <- if (has_col(df, "cssrs_6_6m")) coerce_01(df$cssrs_6_6m) else rep(NA_integer_, nrow(df))
+
+df_sae <- df |>
+  dplyr::mutate(
+    sae_3m = sae_3m,
+    sae_6m = sae_6m,
+    sae_any = dplyr::coalesce(sae_3m, 0L) == 1L | dplyr::coalesce(sae_6m, 0L) == 1L,
+    sae_event_count = dplyr::coalesce(sae_3m, 0L) + dplyr::coalesce(sae_6m, 0L)
+  )
+
+# Summaries by arm
+arm_summ <- df_sae |>
+  dplyr::group_by(treatment) |>
+  dplyr::summarise(
+    n_randomized = dplyr::n(),
+    n_subjects_with_sae = sum(sae_any, na.rm = TRUE),
+    total_sae_events = sum(sae_event_count, na.rm = TRUE),
+    prop_subjects_with_sae = dplyr::if_else(n_randomized > 0, n_subjects_with_sae / n_randomized, NA_real_),
+    .groups = "drop"
+  )
+
+# Pull treatment/control values (assumes 1 = treatment, 0 = control)
+get_arm <- function(tbl, trt_val, col) {
+  v <- tbl |> dplyr::filter(treatment == trt_val) |> dplyr::pull({{ col }})
+  if (length(v) == 0) NA else v[[1]]
+}
+
+t_n  <- get_arm(arm_summ, 1L, n_randomized)
+c_n  <- get_arm(arm_summ, 0L, n_randomized)
+t_ns <- get_arm(arm_summ, 1L, n_subjects_with_sae)
+c_ns <- get_arm(arm_summ, 0L, n_subjects_with_sae)
+t_ev <- get_arm(arm_summ, 1L, total_sae_events)
+c_ev <- get_arm(arm_summ, 0L, total_sae_events)
+t_pr <- get_arm(arm_summ, 1L, prop_subjects_with_sae)
+c_pr <- get_arm(arm_summ, 0L, prop_subjects_with_sae)
+
+tab_4_1 <- tibble::tibble(
+  ` ` = c(
+    "Number of randomized subjects",
+    "Number of randomized subjects with a Serious\nAdverse Event",
+    "*Total number of Serious\nAdverse Events",
+    "Proportion of randomized\nsubjects with a serious\nadverse event"
+  ),
+  Treatment = c(
+    t_n,
+    t_ns,
+    t_ev,
+    ifelse(is.na(t_pr), NA_character_, scales::percent(t_pr, accuracy = 1))
+  ),
+  Control = c(
+    c_n,
+    c_ns,
+    c_ev,
+    ifelse(is.na(c_pr), NA_character_, scales::percent(c_pr, accuracy = 1))
+  )
+)
+
+gt_4_1 <- gt::gt(tab_4_1) |>
+  gt::tab_header(title = "4.1 Proportion of Serious Adverse Events by Treatment Group") |>
+  gt::cols_align(align = "center", columns = c(Treatment, Control)) |>
+  gt::cols_align(align = "left", columns = c(` `)) |>
+  gt::tab_source_note(
+    gt::md(
+      "Note: **Bold font** indicates change since last report.<br>
+      This table reflects data from follow-up assessments only. Medical records will be reviewed for serious adverse events."
+    )
+  )
+
+gt_4_1
+```
+
+# 5.1 Demographics of Enrolled Subjects
+
+## Clean race variables 
+```{r}
+# ---------------- Build race_youth (mirrors STATA) ------------------
+
+# helper: coerce REDCap-ish 0/1 fields safely
+as01 <- function(x) {
+  x2 <- suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+  dplyr::case_when(
+    is.na(x2) ~ NA_integer_,
+    x2 %in% c(0L, 1L) ~ x2,
+    TRUE ~ NA_integer_
+  )
+}
+
+# 1) merge_black = anymatch(screen_race_1..screen_race_4) == 1
+# STATA: egen merge_black = anymatch(screen_race_1 screen_race_2 screen_race_3 screen_race_4), values(1)
+dat <- dat %>%
+  mutate(
+    screen_race_1 = as01(screen_race_1),
+    screen_race_2 = as01(screen_race_2),
+    screen_race_3 = as01(screen_race_3),
+    screen_race_4 = as01(screen_race_4),
+
+    screen_race_5  = as01(screen_race_5),   # AI/AN
+    screen_race_6  = as01(screen_race_6),   # Asian
+    screen_race_7  = as01(screen_race_7),   # NH/PI
+    screen_race_8  = as01(screen_race_8),   # White
+    screen_race_99 = as01(screen_race_99),  # Unknown / not reported
+    # some codebases have race_9 instead of race_99; include if present
+    screen_race_9  = if ("screen_race_9" %in% names(dat)) as01(screen_race_9) else NA_integer_,
+
+    merge_black = dplyr::case_when(
+      # any of the black indicators selected
+      dplyr::coalesce(screen_race_1, 0L) == 1L |
+        dplyr::coalesce(screen_race_2, 0L) == 1L |
+        dplyr::coalesce(screen_race_3, 0L) == 1L |
+        dplyr::coalesce(screen_race_4, 0L) == 1L ~ 1L,
+      # if all are NA, keep NA (matches “unknown” rather than forcing 0)
+      is.na(screen_race_1) & is.na(screen_race_2) & is.na(screen_race_3) & is.na(screen_race_4) ~ NA_integer_,
+      TRUE ~ 0L
+    )
+  )
+
+# 2) merge_race_num = rowtotal(merge_black screen_race_5 screen_race_6 screen_race_7 screen_race_8 screen_race_9)
+# (not required for Table 5.1 but useful for QA)
+dat <- dat %>%
+  mutate(
+    merge_race_num = rowSums(
+      cbind(
+        dplyr::coalesce(merge_black, 0L),
+        dplyr::coalesce(screen_race_5, 0L),
+        dplyr::coalesce(screen_race_6, 0L),
+        dplyr::coalesce(screen_race_7, 0L),
+        dplyr::coalesce(screen_race_8, 0L),
+        dplyr::coalesce(screen_race_9, 0L)  # if NA column, contributes 0
+      ),
+      na.rm = TRUE
+    )
+  )
+
+# 3) build combo flags like STATA
+dat <- dat %>%
+  mutate(
+    race_black_aian  = dplyr::case_when(merge_black == 1L & screen_race_5  == 1L ~ 1L, screen_race_5  == 0L ~ 0L, TRUE ~ 0L),
+    race_black_asian = dplyr::case_when(merge_black == 1L & screen_race_6  == 1L ~ 1L, screen_race_6  == 0L ~ 0L, TRUE ~ 0L),
+    race_black_nhpi  = dplyr::case_when(merge_black == 1L & screen_race_7  == 1L ~ 1L, screen_race_7  == 0L ~ 0L, TRUE ~ 0L),
+    race_black_white = dplyr::case_when(merge_black == 1L & screen_race_8  == 1L ~ 1L, screen_race_8  == 0L ~ 0L, TRUE ~ 0L),
+    race_black_unknown = dplyr::case_when(merge_black == 1L & screen_race_99 == 1L ~ 1L, screen_race_99 == 0L ~ 0L, TRUE ~ 0L)
+  )
+
+# 4) Create single race_youth variable (same priority/overwrite order as STATA)
+dat <- dat %>%
+  mutate(
+    race_youth = dplyr::case_when(
+      merge_black == 1L ~ 1L,
+      TRUE ~ NA_integer_
+    ),
+    race_youth = dplyr::case_when(race_black_aian == 1L  ~ 2L, TRUE ~ race_youth),
+    race_youth = dplyr::case_when(race_black_asian == 1L ~ 3L, TRUE ~ race_youth),
+    race_youth = dplyr::case_when(race_black_nhpi == 1L  ~ 4L, TRUE ~ race_youth),
+    race_youth = dplyr::case_when(race_black_white == 1L ~ 5L, TRUE ~ race_youth),
+    race_youth = dplyr::case_when(race_black_unknown == 1L ~ 6L, TRUE ~ race_youth)
+  )
+
+# Optional quick QA checks (comment out if you don’t want printing)
+# dat %>% count(race_youth, site, trt, name = "n") %>% print(n = 50)
+# dat %>% count(merge_race_num, name = "n") %>% arrange(merge_race_num) %>% print(n = 50)
+```
+
+## Create Demographiocs Table 
+```{r}
+# ---------------- Table 5.1 Demographics of Enrolled Subjects ------------------
+
+stopifnot(exists("df") || exists("rand"))
+dat0 <- if (exists("df")) df else rand
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(gt)
+})
+
+# --- helpers ---
+coerce_int <- function(x) suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+as_num <- function(x) suppressWarnings(as.numeric(readr::parse_number(as.character(x))))
+
+# normalize 0/1 race checkbox fields (accepts 0/1, TRUE/FALSE, "0"/"1")
+as01 <- function(x) {
+  if (is.logical(x)) return(if_else(is.na(x), NA_integer_, if_else(x, 1L, 0L)))
+  xi <- suppressWarnings(as.integer(readr::parse_number(as.character(x))))
+  dplyr::case_when(
+    is.na(xi) ~ NA_integer_,
+    xi %in% c(0L, 1L) ~ xi,
+    TRUE ~ NA_integer_
+  )
+}
+
+derive_site <- function(df) {
+  if ("site_id" %in% names(df)) {
+    out <- as.character(df$site_id)
+    return(dplyr::case_when(
+      out %in% c("H", "Harlem", "Harlem Hospital") ~ "Harlem Hospital",
+      out %in% c("K", "Kings", "Kings County", "Kings County Hospital") ~ "Kings County Hospital",
+      TRUE ~ NA_character_
+    ))
+  }
+  if ("record_id" %in% names(df)) {
+    rid <- as.character(df$record_id)
+    return(dplyr::case_when(
+      str_starts(rid, "H-") ~ "Harlem Hospital",
+      str_starts(rid, "K-") ~ "Kings County Hospital",
+      TRUE ~ NA_character_
+    ))
+  }
+  rep(NA_character_, nrow(df))
+}
+
+fmt_mean_sd <- function(x) {
+  x <- as_num(x)
+  if (all(is.na(x))) return(NA_character_)
+  sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), stats::sd(x, na.rm = TRUE))
+}
+
+# Force every non-row column to character (prevents bind_rows type errors)
+force_char_cells <- function(df, row_col = "row") {
+  cols <- setdiff(names(df), row_col)
+  df %>% mutate(across(all_of(cols), ~ as.character(.x)))
+}
+
+# --- start: clean + standardize core columns ---
+dat <- dat0 %>%
+  mutate(
+    treatment = coerce_int(treatment),
+    site = derive_site(dat0),
+    site = factor(site, levels = c("Harlem Hospital", "Kings County Hospital"))
+  ) %>%
+  filter(!is.na(treatment)) %>%                # STATA: drop if treatment == .
+  mutate(
+    trt = if_else(treatment == 1L, "Treatment", "Control"),
+    group = paste(site, trt, sep = " | ")
+  )
+
+# --- age + age groups ---
+dat <- dat %>%
+  mutate(
+    age_num = as_num(screen_age),
+    age_group = case_when(
+      !is.na(screen_age_group) ~ case_when(
+        as.character(screen_age_group) %in% c("0", "12-17", "12–17") ~ "12-17",
+        as.character(screen_age_group) %in% c("1", "18-19", "18–19") ~ "18-19",
+        TRUE ~ NA_character_
+      ),
+      !is.na(age_num) & age_num >= 12 & age_num <= 17 ~ "12-17",
+      !is.na(age_num) & age_num >= 18 & age_num <= 19 ~ "18-19",
+      TRUE ~ NA_character_
+    ),
+    age_group = factor(age_group, levels = c("12-17", "18-19"))
+  )
+
+# ----------------- Build race_youth if missing (mirrors STATA) -----------------
+if (!("race_youth" %in% names(dat))) {
+
+  race_cols <- c(
+    "screen_race_1","screen_race_2","screen_race_3","screen_race_4",
+    "screen_race_5","screen_race_6","screen_race_7","screen_race_8","screen_race_99"
+  )
+  for (nm in race_cols) {
+    if (!(nm %in% names(dat))) dat[[nm]] <- NA_integer_
+    dat[[nm]] <- as01(dat[[nm]])
+  }
+
+  dat <- dat %>%
+    mutate(
+      merge_black = case_when(
+        coalesce(screen_race_1, 0L) == 1L |
+          coalesce(screen_race_2, 0L) == 1L |
+          coalesce(screen_race_3, 0L) == 1L |
+          coalesce(screen_race_4, 0L) == 1L ~ 1L,
+        is.na(screen_race_1) & is.na(screen_race_2) & is.na(screen_race_3) & is.na(screen_race_4) ~ NA_integer_,
+        TRUE ~ 0L
+      ),
+      race_black_aian    = if_else(merge_black == 1L & coalesce(screen_race_5, 0L)  == 1L, 1L, 0L),
+      race_black_asian   = if_else(merge_black == 1L & coalesce(screen_race_6, 0L)  == 1L, 1L, 0L),
+      race_black_nhpi    = if_else(merge_black == 1L & coalesce(screen_race_7, 0L)  == 1L, 1L, 0L),
+      race_black_white   = if_else(merge_black == 1L & coalesce(screen_race_8, 0L)  == 1L, 1L, 0L),
+      race_black_unknown = if_else(merge_black == 1L & coalesce(screen_race_99, 0L) == 1L, 1L, 0L),
+
+      race_youth = case_when(merge_black == 1L ~ 1L, TRUE ~ NA_integer_),
+      race_youth = case_when(race_black_aian    == 1L ~ 2L, TRUE ~ race_youth),
+      race_youth = case_when(race_black_asian   == 1L ~ 3L, TRUE ~ race_youth),
+      race_youth = case_when(race_black_nhpi    == 1L ~ 4L, TRUE ~ race_youth),
+      race_youth = case_when(race_black_white   == 1L ~ 5L, TRUE ~ race_youth),
+      race_youth = case_when(race_black_unknown == 1L ~ 6L, TRUE ~ race_youth)
+    )
+}
+
+# --- recodes matching STATA labels/screenshots ---
+dat <- dat %>%
+  mutate(
+    sex_lbl = case_when(
+      as.character(screen_sex) %in% c("1", "male", "Male") ~ "Male",
+      as.character(screen_sex) %in% c("2", "female", "Female") ~ "Female",
+      TRUE ~ NA_character_
+    ),
+    gender_lbl = case_when(
+      as.character(giso_gender_identity_b) %in% c("1")  ~ "Girl or woman",
+      as.character(giso_gender_identity_b) %in% c("2")  ~ "Boy or man",
+      as.character(giso_gender_identity_b) %in% c("3")  ~ "Nonbinary",
+      as.character(giso_gender_identity_b) %in% c("4")  ~ "Genderfluid",
+      as.character(giso_gender_identity_b) %in% c("5")  ~ "Genderqueer",
+      as.character(giso_gender_identity_b) %in% c("66") ~ "I am not sure or questioning",
+      as.character(giso_gender_identity_b) %in% c("77") ~ "I don't know what this question means",
+      as.character(giso_gender_identity_b) %in% c("88") ~ "I do not identify as any of these options",
+      as.character(giso_gender_identity_b) %in% c("99") ~ "I do not want to answer",
+      TRUE ~ NA_character_
+    ),
+    race_lbl = case_when(
+      as.character(race_youth) %in% c("1") ~ "Black",
+      as.character(race_youth) %in% c("2") ~ "Black & American Indian/Alaskan Native",
+      as.character(race_youth) %in% c("3") ~ "Black & Asian",
+      as.character(race_youth) %in% c("4") ~ "Black & Native Hawaiian Or Other Pacific Islander",
+      as.character(race_youth) %in% c("5") ~ "Black & White",
+      as.character(race_youth) %in% c("6") ~ "Black & Unknown or not reported",
+      TRUE ~ NA_character_
+    ),
+    eth_lbl = case_when(
+      as.character(screen_ethnicity) %in% c("1")  ~ "Hispanic origin",
+      as.character(screen_ethnicity) %in% c("2")  ~ "Non-Hispanic origin",
+      as.character(screen_ethnicity) %in% c("99") ~ "Unknown",
+      TRUE ~ NA_character_
+    )
+  )
+
+# --- builder: counts by label for each group (returns character cells) ---
+count_wide_chr <- function(df, col, labels) {
+  out <- df %>%
+    mutate(.val = .data[[col]]) %>%
+    filter(!is.na(.val)) %>%
+    count(row = .val, group, name = "n") %>%
+    mutate(row = as.character(row))
+
+  grid <- tidyr::crossing(row = labels, group = unique(df$group))
+  out <- grid %>%
+    left_join(out, by = c("row", "group")) %>%
+    mutate(n = coalesce(n, 0L)) %>%
+    pivot_wider(names_from = group, values_from = n) %>%
+    arrange(factor(row, levels = labels)) %>%
+    mutate(across(-row, as.character))   # <- critical
+  out
+}
+
+totalN_wide_chr <- function(df, label = "Total N") {
+  df %>%
+    count(group, name = "n") %>%
+    mutate(row = label) %>%
+    select(row, group, n) %>%
+    pivot_wider(names_from = group, values_from = n) %>%
+    mutate(across(-row, as.character))
+}
+
+# ------------------------------- AGE block -----------------------------------
+age_mean <- dat %>%
+  group_by(group) %>%
+  summarise(val = fmt_mean_sd(age_num), .groups = "drop") %>%
+  mutate(row = "Mean (SD)") %>%
+  select(row, group, val) %>%
+  pivot_wider(names_from = group, values_from = val) %>%
+  mutate(across(-row, as.character))
+
+age_groups <- count_wide_chr(dat, "age_group", labels = c("12-17", "18-19"))
+age_tot <- totalN_wide_chr(dat, "Total N")
+
+age_block <- bind_rows(
+  tibble(row = "Age"),
+  age_mean,
+  age_groups,
+  age_tot
+) %>% force_char_cells()
+
+# ------------------------ Sex assigned at birth block -------------------------
+sex_counts <- count_wide_chr(dat, "sex_lbl", labels = c("Male", "Female"))
+sex_tot <- totalN_wide_chr(dat, "Total N")
+
+sex_block <- bind_rows(
+  tibble(row = "Sex assigned at birth"),
+  sex_counts,
+  sex_tot
+) %>% force_char_cells()
+
+# -------------------------------- GENDER block --------------------------------
+gender_levels <- c(
+  "Boy or man",
+  "Girl or woman",
+  "Nonbinary",
+  "Genderfluid",
+  "Genderqueer",
+  "I am not sure or questioning",
+  "I don't know what this question means",
+  "I do not identify as any of these options",
+  "I do not want to answer"
+)
+gender_counts <- count_wide_chr(dat, "gender_lbl", labels = gender_levels)
+gender_tot <- totalN_wide_chr(dat, "Total N")
+
+gender_block <- bind_rows(
+  tibble(row = "Gender"),
+  gender_counts,
+  gender_tot
+) %>% force_char_cells()
+
+# --------------------------------- RACE block ---------------------------------
+race_levels <- c(
+  "Black",
+  "Black & American Indian/Alaskan Native",
+  "Black & Native Hawaiian Or Other Pacific Islander",
+  "Black & Asian",
+  "Black & White",
+  "Black & Unknown or not reported"
+)
+race_counts <- count_wide_chr(dat, "race_lbl", labels = race_levels)
+race_tot <- totalN_wide_chr(dat, "Total N")
+
+# Insert "Black &" subheader and indent the combined categories
+race_counts2 <- race_counts %>%
+  mutate(
+    row = case_when(
+      row == "Black" ~ "Black",
+      TRUE ~ paste0("\u00A0\u00A0", sub("^Black &\\s*", "", row))
+    )
+  )
+
+race_block <- bind_rows(
+  tibble(row = "Race"),
+  race_counts2 %>% filter(row == "Black"),
+  tibble(row = "Black &"),
+  race_counts2 %>% filter(row != "Black"),
+  race_tot
+) %>% force_char_cells()
+
+# ------------------------------- ETHNICITY block ------------------------------
+eth_levels <- c("Hispanic origin", "Non-Hispanic origin", "Unknown")
+eth_counts <- count_wide_chr(dat, "eth_lbl", labels = eth_levels)
+eth_tot <- totalN_wide_chr(dat, "Total N")
+
+eth_block <- bind_rows(
+  tibble(row = "Ethnicity"),
+  eth_counts,
+  eth_tot
+) %>% force_char_cells()
+
+# --- assemble full table ---
+tab5_1 <- bind_rows(
+  age_block,
+  sex_block,
+  gender_block,
+  race_block,
+  eth_block
+) %>% force_char_cells()
+
+# Desired column order + headers
+desired_cols <- c(
+  "Harlem Hospital | Control",
+  "Harlem Hospital | Treatment",
+  "Kings County Hospital | Control",
+  "Kings County Hospital | Treatment"
+)
+for (cc in desired_cols) if (!cc %in% names(tab5_1)) tab5_1[[cc]] <- NA_character_
+
+tab5_1 <- tab5_1 %>%
+  select(row, all_of(desired_cols)) %>%
+  rename(
+    ` ` = row,
+    Harlem_Control = `Harlem Hospital | Control`,
+    Harlem_Treatment = `Harlem Hospital | Treatment`,
+    Kings_Control = `Kings County Hospital | Control`,
+    Kings_Treatment = `Kings County Hospital | Treatment`
+  )
+
+gt_tab5_1 <- gt(tab5_1) %>%
+  tab_header(title = "5.1 Demographics of Enrolled Subjects") %>%
+  tab_spanner(label = "Harlem Hospital", columns = c(Harlem_Control, Harlem_Treatment)) %>%
+  tab_spanner(label = "Kings County Hospital", columns = c(Kings_Control, Kings_Treatment)) %>%
+  cols_label(
+    Harlem_Control = "Control",
+    Harlem_Treatment = "Treatment",
+    Kings_Control = "Control",
+    Kings_Treatment = "Treatment"
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = "bold")),
+    locations = cells_body(
+      columns = ` `,
+      rows = ` ` %in% c("Age", "Sex assigned at birth", "Gender", "Race", "Ethnicity", "Black &")
+    )
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = "bold")),
+    locations = cells_body(rows = ` ` == "Total N")
+  )
+
+gt_tab5_1
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

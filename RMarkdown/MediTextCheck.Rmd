@@ -1,0 +1,716 @@
+---
+title: "MediTextCheck"
+output: html_document
+---
+# 1) Run Packages
+```{r message=FALSE, warning=FALSE}
+# ========================= PACKAGES =========================
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(gt)
+```
+
+# 2) User Inputs
+```{r message=FALSE, warning=FALSE}
+# ========================= USER INPUTS ======================
+# File
+OUT_DIR   <- OUT_DIR %||% "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New ETL Output"   # if OUT_DIR not set
+csv_path  <- file.path(OUT_DIR, "dat_merged.csv") # => replace entire line with location of .csv file for analysis within quotation (e.g.: "desktop/dat_merged.csv")
+
+# Which datasets to run?
+RUN_CURRENT <- TRUE
+RUN_LOCKED  <- FALSE
+
+# Which tables to render?
+SHOW_ENROLL          <- TRUE
+SHOW_ENROLL_WEEKLY   <- TRUE
+SHOW_FOLLOWUP        <- TRUE     # outreach summary (3m/6m)
+SHOW_OUTREACH_WEEKLY <- TRUE
+SHOW_OUTREACH_DAILY  <- TRUE
+
+# Labels / dates / targets
+DATA_LOCK  <- as.Date("2026-01-01")
+AS_OF_DATE <- as.Date("2026-02-04")
+
+# Weeks to include (any day inside the week is fine)
+WEEKS_INPUT <- as.Date(c("2026-01-05", "2026-01-12", "2026-01-20", "2026-01-29", "2026-02-04"))
+
+# 3m/6m “active if unscheduled but sched_min < cutoff” (Stata td(30sep2025))
+CUTOFF_3M <- as.Date("2026-01-01")
+CUTOFF_6M <- as.Date("2026-01-01")
+```
+
+# 3) Helper Functions
+```{r warning=FALSE, message=FALSE}
+# ========================= HELPERS ==========================
+`%||%` <- function(a,b) if (is.null(a)) b else a
+
+# Parse mixed date representations to Date (drops time).
+# Adds: SAS/Stata daily serials (origin = 1960-01-01).
+to_date_smart <- function(x,
+                          tz_epoch = "UTC",
+                          tz_local = "America/New_York",
+                          min_year = 2010,
+                          max_year = 2100) {
+
+  x_chr <- as.character(x)
+  n <- length(x_chr)
+  out <- rep(as.Date(NA), n)
+
+  is_digits <- grepl("^\\d+$", x_chr)
+  idx_num   <- which(is_digits)
+
+  clip_years <- function(d) {
+    bad <- !is.na(d) & (as.integer(format(d, "%Y")) < min_year |
+                        as.integer(format(d, "%Y")) > max_year)
+    d[bad] <- as.Date(NA)
+    d
+  }
+
+    if (length(idx_num)) {
+    num <- suppressWarnings(as.numeric(x_chr[idx_num]))
+    nchar_num <- nchar(x_chr[idx_num])
+
+    # 8-digit YYYYMMDD
+    is_yyyymmdd <- nchar_num == 8 & grepl("^(19|20)\\d{6}$", x_chr[idx_num])
+
+    # Excel serials (modern)
+    is_excel <- !is_yyyymmdd & !is.na(num) & num >= 25569 & num <= 60000
+
+    # Epoch seconds/milliseconds
+    is_epoch_ms <- !is.na(num) & num > 1e12
+    is_epoch_s  <- !is.na(num) & num > 1e8 & num <= 1e12
+
+    # >>> NEW: UNIX *days* since 1970-01-01 (typical range covers 2011–~2060+)
+    is_unix_days <- !is_yyyymmdd & !is_excel & !is_epoch_ms & !is_epoch_s &
+                    !is.na(num) & num >= 15000 & num <= 40000
+
+    # SAS/Stata daily serials (days since 1960-01-01)
+    # Exclude other classes incl. unix-days
+    is_sas_stata <- !is_yyyymmdd & !is_excel & !is_epoch_ms & !is_epoch_s &
+                    !is_unix_days & !is.na(num) & num >= -3650 & num <= 32000
+
+    # YYYYMMDD
+    if (any(is_yyyymmdd)) {
+      y <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 1, 4))
+      m <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 5, 6))
+      d <- as.integer(substr(x_chr[idx_num][is_yyyymmdd], 7, 8))
+      d_ymd <- suppressWarnings(as.Date(sprintf("%04d-%02d-%02d", y, m, d)))
+      out[idx_num[is_yyyymmdd]] <- clip_years(d_ymd)
+    }
+
+    # Excel
+    if (any(is_excel)) {
+      d_xl <- as.Date(num[is_excel], origin = "1899-12-30")
+      out[idx_num[is_excel]] <- clip_years(d_xl)
+    }
+
+    # >>> NEW: UNIX days
+    if (any(is_unix_days)) {
+      d_ud <- as.Date(num[is_unix_days], origin = "1970-01-01")
+      out[idx_num[is_unix_days]] <- clip_years(d_ud)
+    }
+
+    # SAS/Stata
+    if (any(is_sas_stata)) {
+      d_ss <- as.Date(num[is_sas_stata], origin = "1960-01-01")
+      out[idx_num[is_sas_stata]] <- clip_years(d_ss)
+    }
+
+    # Epoch ms
+    if (any(is_epoch_ms)) {
+      s <- num[is_epoch_ms] / 1000
+      posix <- as.POSIXct(s, origin = "1970-01-01", tz = tz_epoch)
+      out[idx_num[is_epoch_ms]] <- clip_years(as.Date(as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)))
+    }
+
+    # Epoch s
+    if (any(is_epoch_s)) {
+      s <- num[is_epoch_s]
+      posix <- as.POSIXct(s, origin = "1970-01-01", tz = tz_epoch)
+      out[idx_num[is_epoch_s]] <- clip_years(as.Date(as.POSIXct(format(posix, tz = tz_local, usetz = TRUE), tz = tz_local)))
+    }
+  }
+
+  # Non-numeric strings
+  idx_str <- which(!is_digits)
+  if (length(idx_str)) {
+    x_s <- x_chr[idx_str]
+
+    d1 <- suppressWarnings(lubridate::ymd(x_s, quiet = TRUE))
+    miss <- is.na(d1)
+    if (any(miss)) { d2 <- suppressWarnings(lubridate::ymd_hm (x_s[miss], quiet = TRUE)); d1[miss] <- d2; miss <- is.na(d1) }
+    if (any(miss)) { d3 <- suppressWarnings(lubridate::ymd_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d3; miss <- is.na(d1) }
+    if (any(miss)) { d4 <- suppressWarnings(lubridate::mdy    (x_s[miss], quiet = TRUE)); d1[miss] <- d4; miss <- is.na(d1) }
+    if (any(miss)) { d5 <- suppressWarnings(lubridate::mdy_hm (x_s[miss], quiet = TRUE)); d1[miss] <- d5; miss <- is.na(d1) }
+    if (any(miss)) { d6 <- suppressWarnings(lubridate::mdy_hms(x_s[miss], quiet = TRUE)); d1[miss] <- d6 }
+
+    out[idx_str] <- clip_years(as.Date(d1))
+  }
+
+  out
+}
+
+# Stata-style left-to-right coalesce for strings (treat "" as missing)
+coalesce_chr <- function(...) {
+  args <- list(...)
+  args <- lapply(args, \(v) replace(v, is.na(v) | v == "", NA))
+  out <- args[[1]]
+  for (i in seq_along(args)[-1]) out <- ifelse(is.na(out), args[[i]], out)
+  out
+}
+
+# Canonical site code (H/K) from site_id or ID prefix
+site_id_from <- function(site_id, id_like) {
+  sid <- toupper(trimws(as.character(site_id)))
+  idl <- as.character(id_like)
+  dplyr::case_when(
+    sid %in% c("H","K") ~ sid,
+    str_starts(idl, "H-") ~ "H",
+    str_starts(idl, "K-") ~ "K",
+    TRUE ~ NA_character_
+  )
+}
+
+# Count H/K + Total under a logical filter
+count_by_site <- function(df, filter_expr = TRUE) {
+  tmp <- dplyr::filter(df, {{ filter_expr }})
+  tibble(
+    Harlem = sum(tmp$site_id == "H", na.rm = TRUE),
+    Kings  = sum(tmp$site_id == "K", na.rm = TRUE)
+  ) |> mutate(Total = Harlem + Kings)
+}
+
+# Robust parser for outreach dates (strings + numeric serials)
+as_date_guess <- function(x,
+                          unix_origin  = as.Date("1970-01-01"),
+                          excel_origin = as.Date("1899-12-30")) {
+  if (inherits(x, "Date"))   return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  s <- as.character(x)
+  d <- as.Date(
+    s,
+    tryFormats = c(
+      "%Y-%m-%d",
+      "%Y-%m-%d %H:%M:%S",
+      "%m/%d/%Y",
+      "%m/%d/%y",
+      "%m/%d/%Y %H:%M",
+      "%m/%d/%y %H:%M",
+      "%m/%d/%Y %I:%M %p",
+      "%m/%d/%y %I:%M %p"
+    ),
+    optional = TRUE
+  )
+  need_num <- is.na(d) & grepl("^\\s*\\d+\\s*$", s)
+  if (any(need_num)) {
+    v <- as.numeric(s[need_num])
+    is_unix  <- v >= 15000 & v < 30000
+    is_excel <- v >= 40000 & v < 80000
+    d_sub <- rep(as.Date(NA), length(v))
+    d_sub[is_unix]  <- as.Date(v[is_unix],  origin = unix_origin)
+    d_sub[is_excel] <- as.Date(v[is_excel], origin = excel_origin)
+    d[need_num] <- d_sub
+  }
+  d
+}
+
+parse_date_any_safe <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  x[tolower(x) %in% c("na","n/a","null",".","missing")] <- NA_character_
+
+  # keep date/time portion if timestamps exist
+  x <- ifelse(!is.na(x), substr(x, 1, 19), NA_character_)
+
+  # lubridate never throws here; it returns NA when it can’t parse
+  dt <- suppressWarnings(
+    lubridate::parse_date_time(
+      x,
+      orders = c(
+        "Ymd HMS", "Ymd HM", "Ymd",
+        "mdY HMS", "mdY HM", "mdY",
+        "mdy",
+        "Y/m/d", "m/d/Y", "m/d/y",
+        "m-d-Y", "m-d-y"
+      ),
+      tz = "UTC",
+      quiet = TRUE
+    )
+  )
+
+  lubridate::as_date(dt)
+}
+```
+
+# 4) Load & Clean the Dataset 
+```{r message=FALSE, warning=FALSE}
+# ========================= LOAD + CLEAN =====================
+raw <- readr::read_csv(csv_path, show_col_types = FALSE)
+
+# Replace literal "NA" strings with blanks (Stata foreach)
+raw <- raw |> mutate(across(everything(), ~ ifelse(.x %in% c("NA"), "", .x)))
+
+# Coerce numeric-like fields (Stata: destring, ignore("NA"))
+raw <- raw |>
+  mutate(
+    treatment    = suppressWarnings(as.integer(as.character(treatment))),
+    cassy_result = suppressWarnings(as.integer(as.character(cassy_result)))
+  )
+
+# Build participant id from youth then caregiver
+# ppid_y  <- str_sub(as.character(raw$participant_id), 1, 7)
+# ppid_cg <- str_sub(as.character(raw$p_participant_id), 1, 7)
+
+# Merge date (youth→caregiver→screen→baseline→p_baseline), then drop blanks
+# base_df <- raw |>
+#  mutate(
+#    record_id = if_else(is.na(ppid_y) | ppid_y == "", ppid_cg, ppid_y),
+#   merged_date_chr  = coalesce_chr(
+#      as.character(ps_date),
+#      as.character(p_ps_date),
+#      as.character(screen_doe),
+#      as.character(date_baseline),
+#      as.character(p_date_baseline)
+#    )
+#  ) |>
+#  filter(!is.na(merged_date_chr) & merged_date_chr != "") |>
+#  mutate(
+#    merged_date = to_date_smart(merged_date_chr),
+#    site_code   = site_code_from(site_id, coalesce_chr(record_id, participant_id, p_participant_id))
+#  )
+
+# Locked snapshot (same cleaning; just filter by merged_date)
+locked_df <- raw |> filter(merged_date <= DATA_LOCK)
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Raw variable name -> stakeholder-friendly column name
+name_map <- c(
+  record_id               = "Record ID",
+  merged_date             = "Merged date",
+  first_name              = "First name",
+  last_name               = "Last name",
+  screen_age              = "Screen age",
+  treatment               = "Treatment",
+  cassy_result            = "CASSY result",
+  swdf_received_cfs       = "Did this participant receive CFS?",
+  swdf_received_cfs_texts = "Upload to Meditext for supportive texts?",
+  screen_has_cell_phone   = "Has a cell phone that receives texts?",
+  swdf_phone_primary      = "Youth phone (primary)",
+  swdf_phone_alternate    = "Youth phone (alternate)",
+  swdf_phone_reenter      = "Youth phone (re-enter)",
+  swdf_p_phone_primary    = "Parent phone (primary)",
+  swdf_p_understand_eng   = "Parent understands English?"
+)
+
+jan_enrolled_cfs_check <- raw %>%
+  mutate(
+    merged_date = to_date_smart(merged_date),
+    jan_2026 = merged_date >= as.Date("2026-01-01") & merged_date <= as.Date("2026-01-31"),
+    enrolled = !is.na(treatment),
+    swdf_received_cfs = as.character(swdf_received_cfs)  # normalize
+  ) %>%
+  filter(jan_2026, enrolled) %>%
+  mutate(
+    swdf_received_cfs_clean = case_when(
+      swdf_received_cfs %in% c("1", 1) ~ "1",
+      swdf_received_cfs %in% c("0", 0) ~ "0",
+      is.na(swdf_received_cfs) | swdf_received_cfs == "" ~ "NA",
+      TRUE ~ paste0("OTHER:", swdf_received_cfs)
+    )
+  ) %>%
+  select(
+    record_id, 
+    merged_date, 
+    # first_name, 
+    # last_name, 
+    screen_age,
+    treatment,
+    cassy_result,
+    swdf_received_cfs,         # keep raw for sorting + mapping
+    swdf_received_cfs_texts,
+    screen_has_cell_phone,
+    swdf_phone_primary,
+    swdf_phone_alternate,
+    # swdf_phone_reenter,
+    swdf_p_phone_primary,
+    swdf_p_understand_eng
+  ) %>%
+  # Sort by swdf_received_cfs (0 first, then 1, then NA/other), then cassy_result, then treatment, then date/id
+  mutate(
+    swdf_received_cfs_sort = case_when(
+      swdf_received_cfs %in% c("0", 0) ~ 0L,
+      swdf_received_cfs %in% c("1", 1) ~ 1L,
+      TRUE ~ 2L
+    )
+  ) %>%
+  arrange(swdf_received_cfs_sort, cassy_result, treatment, merged_date, record_id) %>%
+  select(-swdf_received_cfs_sort) %>%
+  rename(any_of(name_map))
+
+jan_enrolled_cfs_check
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(readr)
+library(janitor)
+
+# 1) Read the SMS export (Sent At is epoch seconds)
+sms <- readr::read_csv(
+  "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New ETL Output/MediText/MediText_02042026.csv",
+  show_col_types = FALSE
+) %>%
+  janitor::clean_names() %>%
+  rename(
+    record_id   = participant_id,
+    sms_status  = sms_status,
+    sent_at_raw = sent_at
+  ) %>%
+  mutate(
+    record_id = as.character(record_id),
+    sent_at_raw = suppressWarnings(as.numeric(sent_at_raw)),
+    sms_sent_at_utc = as.POSIXct(sent_at_raw, origin = "1970-01-01", tz = "UTC"),
+    sms_sent_at_et  = lubridate::with_tz(sms_sent_at_utc, tzone = "America/New_York")
+  )
+
+# 2) Per-participant summary WITHOUT ifelse() (keeps datetime class)
+sms_summary <- sms %>%
+  arrange(record_id, sms_sent_at_et) %>%
+  group_by(record_id) %>%
+  summarise(
+    sms_status_latest = dplyr::last(na.omit(sms_status)),
+    sms_sent_at_first = if (all(is.na(sms_sent_at_et))) as.POSIXct(NA, tz = "America/New_York")
+                      else min(sms_sent_at_et, na.rm = TRUE),
+    sms_sent_at_last  = if (all(is.na(sms_sent_at_et))) as.POSIXct(NA, tz = "America/New_York")
+                      else max(sms_sent_at_et, na.rm = TRUE),
+    sms_n_rows = n(),
+    .groups = "drop"
+  )
+
+# 3) Join onto your REDCap check table
+jan_enrolled_cfs_check_with_sms <- raw %>%
+  mutate(
+    merged_date = to_date_smart(merged_date),
+    jan_2026 = merged_date >= as.Date("2026-01-01") & merged_date <= as.Date("2026-01-31"),
+    enrolled = !is.na(treatment),
+    swdf_received_cfs = as.character(swdf_received_cfs)
+  ) %>%
+  filter(jan_2026, enrolled) %>%
+  select(
+    record_id,
+    merged_date,
+    screen_age,
+    treatment,
+    cassy_result,
+    wecare_sw_data_form_complete,
+    swdf_received_cfs,
+    swdf_received_cfs_texts,
+    screen_has_cell_phone,
+    swdf_phone_primary,
+    swdf_phone_alternate,
+    swdf_p_phone_primary,
+    swdf_p_understand_eng,
+    discharge,
+    wecare_discharge_status_form_complete,
+    wecare_fidelity_checklist_complete
+  ) %>%
+  left_join(sms_summary, by = "record_id") %>%
+  mutate(
+    swdf_received_cfs_sort = case_when(
+      swdf_received_cfs %in% c("0", 0) ~ 0L,
+      swdf_received_cfs %in% c("1", 1) ~ 1L,
+      TRUE ~ 2L
+    )
+  ) %>%
+  arrange(swdf_received_cfs_sort, cassy_result, treatment, merged_date, record_id) %>%
+  select(-swdf_received_cfs_sort) %>%
+  rename(any_of(name_map)) %>%
+  rename(
+    `SMS status (latest)` = sms_status_latest,
+    `SMS sent (first)`    = sms_sent_at_first,
+    `SMS sent (last)`     = sms_sent_at_last,
+    `SMS rows`            = sms_n_rows
+  )
+
+jan_enrolled_cfs_check_with_sms
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(readr)
+library(janitor)
+
+# ---- IDs from Cheryl's email (ONLY these) -----------------------------------
+ids_focus <- c(
+  "K-F0686","K-F0664","K-F0654","K-F0653","K-F0623","K-F0636",
+  "K-F0601","K-F0613","K-F0610","K-F0596","K-F0587"
+)
+
+# 1) Read the MediText export (Sent At is epoch seconds) + keep only these IDs
+sms <- readr::read_csv(
+  "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New ETL Output/MediText/MediText_02042026.csv",
+  show_col_types = FALSE
+) %>%
+  janitor::clean_names() %>%
+  rename(
+    record_id   = participant_id,   # adjust if CSV uses different name
+    sms_status  = sms_status,       # adjust if CSV uses different name
+    sent_at_raw = sent_at           # adjust if CSV uses different name
+  ) %>%
+  mutate(
+    record_id = as.character(record_id),
+    sent_at_raw = suppressWarnings(as.numeric(sent_at_raw)),
+    sms_sent_at_utc = as.POSIXct(sent_at_raw, origin = "1970-01-01", tz = "UTC"),
+    sms_sent_at_et  = lubridate::with_tz(sms_sent_at_utc, tzone = "America/New_York")
+  ) %>%
+  filter(record_id %in% ids_focus)
+
+# 2) Per-participant summary (keeps POSIXct class; no ifelse())
+sms_summary <- sms %>%
+  arrange(record_id, sms_sent_at_et) %>%
+  group_by(record_id) %>%
+  summarise(
+    sms_status_latest = dplyr::last(na.omit(sms_status)),
+    sms_sent_at_first = if (all(is.na(sms_sent_at_et))) as.POSIXct(NA, tz = "America/New_York")
+                       else min(sms_sent_at_et, na.rm = TRUE),
+    sms_sent_at_last  = if (all(is.na(sms_sent_at_et))) as.POSIXct(NA, tz = "America/New_York")
+                       else max(sms_sent_at_et, na.rm = TRUE),
+    sms_n_rows = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Optional: format like Excel for stakeholder readability
+    sms_sent_at_first_chr = if_else(is.na(sms_sent_at_first), NA_character_, format(sms_sent_at_first, "%m/%d/%Y %I:%M %p")),
+    sms_sent_at_last_chr  = if_else(is.na(sms_sent_at_last),  NA_character_, format(sms_sent_at_last,  "%m/%d/%Y %I:%M %p"))
+  )
+
+# 3) Pull REDCap fields for ONLY these IDs and join SMS summary
+cfs_check_ids_with_sms <- raw %>%
+  mutate(
+    merged_date = to_date_smart(merged_date),
+    swdf_received_cfs = as.character(swdf_received_cfs)
+  ) %>%
+  filter(record_id %in% ids_focus) %>%
+  select(
+    record_id,
+    merged_date,
+    screen_age,
+    treatment,
+    cassy_result,
+    wecare_sw_data_form_complete,
+    swdf_received_cfs,
+    swdf_received_cfs_texts,
+    screen_has_cell_phone,
+    swdf_phone_primary,
+    swdf_phone_alternate,
+    swdf_p_phone_primary,
+    swdf_p_understand_eng,
+    discharge,
+    wecare_discharge_status_form_complete,
+    wecare_fidelity_checklist_complete,
+  ) %>%
+  left_join(sms_summary %>% select(record_id, sms_status_latest, sms_sent_at_first_chr, sms_sent_at_last_chr, sms_n_rows),
+            by = "record_id") %>%
+  mutate(
+    swdf_received_cfs_sort = case_when(
+      swdf_received_cfs %in% c("0", 0) ~ 0L,
+      swdf_received_cfs %in% c("1", 1) ~ 1L,
+      TRUE ~ 2L
+    )
+  ) %>%
+  arrange(swdf_received_cfs_sort, cassy_result, treatment, merged_date, record_id) %>%
+  select(-swdf_received_cfs_sort) %>%
+  rename(any_of(name_map)) %>%
+  rename(
+    `SMS status (latest)` = sms_status_latest,
+    `SMS sent (first)`    = sms_sent_at_first_chr,
+    `SMS sent (last)`     = sms_sent_at_last_chr,
+    `SMS rows`            = sms_n_rows
+  )
+
+cfs_check_ids_with_sms
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# ---------- helpers ----------
+pick_first_existing <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)][1]
+  if (length(hit) == 0 || is.na(hit)) NA_character_ else hit
+}
+get_col_or_na <- function(df, colname) {
+  if (is.na(colname)) return(rep(NA, nrow(df)))
+  df[[colname]]
+}
+
+# REDCap instrument complete fields are often: 0=Incomplete, 1=Unverified, 2=Complete
+is_complete_flag <- function(x) {
+  x_num <- suppressWarnings(as.integer(x))
+  dplyr::case_when(
+    is.na(x_num) ~ FALSE,
+    x_num == 2L  ~ TRUE,
+    TRUE         ~ FALSE
+  )
+}
+
+is_yes_flag <- function(x) {
+  x_chr <- as.character(x)
+  dplyr::case_when(
+    is.na(x_chr) ~ FALSE,
+    x_chr %in% c("1", "Yes", "YES", "Y", "True", "TRUE") ~ TRUE,
+    TRUE ~ FALSE
+  )
+}
+
+# ---------- choose your CASSY+ definition ----------
+# Prefer a numeric score field if present; otherwise use cassy_result as a binary positive indicator.
+col_cassy_score <- pick_first_existing(raw, c("cassy_score", "cassy_total", "cassy_prob", "cassy_risk_score"))
+col_cassy_result <- pick_first_existing(raw, c("cassy_result"))
+
+# If your CASSY+ variable is different, add it above.
+# Threshold fixed per protocol text: > 0.05
+CASSY_THRESHOLD <- 0.05
+
+# ---------- expected instrument complete fields (edit candidates if your project uses different names) ----------
+col_sw_complete <- pick_first_existing(raw, c(
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_complete",
+  "sw_data_form_complete",
+  "wecare_sw_data_form_complete___complete", # if stored oddly
+  "wecare_sw_data_form_complete_status",
+  "wecare_sw_data_form_complete_flag",
+  "wecare_sw_data_form_complete_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  # common REDCap pattern: instrumentname_complete
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete",
+  "wecare_sw_data_form_complete"
+))
+
+# If you *already* know the exact variable names, replace these with your exact fields:
+# col_sw_complete <- "wecare_sw_data_form_complete"
+
+col_discharge_complete <- pick_first_existing(raw, c(
+  "wecare_discharge_status_form_complete",
+  "wecare_discharge_status_complete",
+  "discharge_status_form_complete",
+  "wecare_discharge_status_form_complete"
+))
+
+col_fidelity_complete <- pick_first_existing(raw, c(
+  "wecare_fidelity_checklist_complete",
+  "wecare_fidelity_complete",
+  "fidelity_checklist_complete",
+  "wecare_fidelity_checklist_complete"
+))
+
+# Discharge field itself (not the *_complete) — optional but you requested "discharge"
+col_discharged <- pick_first_existing(raw, c(
+  "discharged",
+  "swdf_discharged",
+  "wecare_discharged",
+  "y_discharged"
+))
+
+# ---------- build table ----------
+texts_eligibility_table <- raw %>%
+  mutate(
+    record_id = as.character(record_id),
+    merged_date = to_date_smart(merged_date),
+
+    # Treatment (assumes 1=treatment, 0=control)
+    treatment_num = suppressWarnings(as.integer(readr::parse_number(as.character(treatment)))),
+    is_treatment = treatment_num == 1L,
+
+    # CASSY+ (score > 0.05 if score exists; else cassy_result == 1)
+    cassy_score_val = suppressWarnings(as.numeric(get_col_or_na(., col_cassy_score))),
+    cassy_result_val = suppressWarnings(as.numeric(get_col_or_na(., col_cassy_result))),
+    is_cassy_pos = dplyr::case_when(
+      !is.na(cassy_score_val) ~ cassy_score_val > CASSY_THRESHOLD,
+      !is.na(cassy_result_val) ~ cassy_result_val == 1,
+      TRUE ~ FALSE
+    ),
+
+    # Form completion flags
+    wecare_sw_data_form_complete = is_complete_flag(get_col_or_na(., col_sw_complete)),
+    wecare_discharge_status_form_complete = is_complete_flag(get_col_or_na(., col_discharge_complete)),
+    wecare_fidelity_checklist_complete = is_complete_flag(get_col_or_na(., col_fidelity_complete)),
+
+    # Required yes/no flags
+    swdf_received_cfs_texts = get_col_or_na(., "swdf_received_cfs_texts"),
+    screen_has_cell_phone = get_col_or_na(., "screen_has_cell_phone"),
+
+    has_texts_flag = is_yes_flag(swdf_received_cfs_texts),
+    has_cell_phone = is_yes_flag(screen_has_cell_phone),
+
+    # Discharge value (optional)
+    discharge = get_col_or_na(., col_discharged),
+
+    # Final eligibility rule (exactly as you described)
+    should_receive_texts =
+      is_treatment &
+      is_cassy_pos &
+      wecare_sw_data_form_complete &
+      has_texts_flag &
+      has_cell_phone &
+      wecare_discharge_status_form_complete &
+      wecare_fidelity_checklist_complete
+  ) %>%
+  mutate(
+    missing_reqs = paste(
+      c(
+        ifelse(is_treatment, NA, "Not treatment"),
+        ifelse(is_cassy_pos, NA, "Not CASSY+"),
+        ifelse(wecare_sw_data_form_complete, NA, "SW form not complete"),
+        ifelse(has_texts_flag, NA, "swdf_received_cfs_texts != 1"),
+        ifelse(has_cell_phone, NA, "No texting-capable phone"),
+        ifelse(wecare_discharge_status_form_complete, NA, "Discharge form not complete"),
+        ifelse(wecare_fidelity_checklist_complete, NA, "Fidelity checklist not complete")
+      ),
+      collapse = " | "
+    ),
+    missing_reqs = gsub("(NA \\| )|( \\| NA)|(NA)", "", missing_reqs),
+    missing_reqs = trimws(gsub("\\|\\s*\\|", "\\|", missing_reqs)),
+    missing_reqs = ifelse(missing_reqs == "", NA_character_, missing_reqs)
+  ) %>%
+  # Keep only those who should receive texts (roster)
+  filter(should_receive_texts) %>%
+  select(
+    record_id,
+    merged_date,
+    treatment = treatment_num,
+    cassy_result = cassy_result_val,
+    wecare_sw_data_form_complete,
+    swdf_received_cfs_texts,
+    screen_has_cell_phone,
+    discharge,
+    wecare_discharge_status_form_complete,
+    wecare_fidelity_checklist_complete,
+    should_receive_texts,
+    missing_reqs
+  ) %>%
+  arrange(merged_date, record_id)
+
+texts_eligibility_table
+```

@@ -226,7 +226,7 @@ tryCatch(
     write_cass_sogi = FALSE,
     cass_sogi_fname = "cass_sogi_with_lgbtq_20251124.csv"
   ),
-  error = function(e) warning("Post-process failed; original dat_merged.csv left as-is. Reason: ", conditionMessage(e))
+  error = function(e) warning("Post-process failed; original dat_merged.csv left as-is. sourcReason: ", conditionMessage(e))
 )
 
 # --- 9) Create NIMH GUID dataset ---------------------------------------
@@ -240,7 +240,7 @@ message("📑 Creating NDA CDE datasets ...")
 
 nda_build_cde_exports(
   out_dir       = OUT_DIR,
-  guid_filename = "GUIDS_11272025.csv"
+  guid_filename = "GUIDs_12052025.csv"
 )
 
 message("✅ Done.\n  Raw:   data/raw\n  Clean: data/out\n  Checks:data/checks")

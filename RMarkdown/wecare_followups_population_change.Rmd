@@ -1,0 +1,1237 @@
+---
+title: "WeCare: Full Sample vs Follow-ups + Baseline Risk Follow-up Change"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    toc: true
+    toc_depth: 3
+params:
+  OUT_DIR: "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New
+    ETL Output"
+  in_file: dat_merged.csv
+  out_dir: "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New
+    ETL Output/qa_outputs"
+  followup_requires_completed_only: false
+  cssr_pos_threshold: 1
+  restrict_treatment: null
+---
+
+# Setup
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(gt)
+library(lubridate)
+
+# ---------- helpers ----------
+is_blank_chr <- function(x) {
+  x <- as.character(x)
+  is.na(x) | trimws(x) == ""
+}
+
+parse_num <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
+
+pick_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit)) hit[[1]] else NA_character_
+}
+
+pick_by_regex <- function(df, regex_vec) {
+  nms <- names(df)
+  for (rx in regex_vec) {
+    hit <- nms[str_detect(nms, regex(rx, ignore_case = TRUE))]
+    if (length(hit)) return(hit[[1]])
+  }
+  NA_character_
+}
+
+to_bin01 <- function(x) {
+  # robust 0/1 for common REDCap encodings
+  if (is.logical(x)) return(ifelse(is.na(x), NA_integer_, ifelse(x, 1L, 0L)))
+  if (is.numeric(x)) return(ifelse(is.na(x), NA_integer_, ifelse(x == 1, 1L, ifelse(x == 0, 0L, NA_integer_))))
+  xc <- str_trim(str_to_lower(as.character(x)))
+  xc[xc == ""] <- NA_character_
+  dplyr::case_when(
+    xc %in% c("1","yes","y","true","t","positive","pos","completed") ~ 1L,
+    xc %in% c("0","no","n","false","f","negative","neg")            ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+# --- numeric coalesce helper (handles "", NA, and character numerics) ---
+coalesce_num <- function(...) {
+  xs <- list(...)
+  xs <- lapply(xs, function(x) {
+    x <- suppressWarnings(readr::parse_number(as.character(x)))
+    x
+  })
+  out <- xs[[1]]
+  if (length(xs) > 1) {
+    for (i in 2:length(xs)) out <- dplyr::coalesce(out, xs[[i]])
+  }
+  out
+}
+
+as_int <- function(x) suppressWarnings(as.integer(as.character(x)))
+
+cssr_any1 <- function(df, vars) {
+  vars <- vars[vars %in% names(df)]
+  if (length(vars) == 0) return(rep(NA_integer_, nrow(df)))
+  mat <- sapply(vars, function(v) to_bin01(df[[v]]))
+  if (is.null(dim(mat))) mat <- matrix(mat, ncol = 1)
+  out <- apply(mat, 1, function(r) {
+    if (all(is.na(r))) NA_integer_ else if (any(r == 1L, na.rm = TRUE)) 1L else 0L
+  })
+  as.integer(out)
+}
+
+cssr_tier <- function(med, high) {
+  dplyr::case_when(
+    high == 1L ~ "High",
+    high == 0L & med == 1L ~ "Medium",
+    (high == 0L & med == 0L) ~ "None",
+    TRUE ~ NA_character_
+  )
+}
+
+# ========================= LGBTQ+ FLAG (UPDATED FOR ADAM) ======================
+is_lgbtq_sogi <- function(gender_code, trans_code, orient_code) {
+  gender_code <- as.integer(gender_code)
+  trans_code  <- as.integer(trans_code)
+  orient_code <- as.integer(orient_code)
+
+  noninfo_codes <- c(77L, 99L)
+
+  orient_minority <- orient_code %in% c(2L, 3L, 4L, 5L, 6L, 7L, 66L, 88L)
+  gender_minority <- gender_code %in% c(3L, 4L, 5L, 66L, 88L)
+  trans_minority  <- trans_code  %in% c(1L, 66L)
+
+  lgbtq <- orient_minority | gender_minority | trans_minority
+
+  all_noninfo <- (is.na(gender_code) | gender_code %in% noninfo_codes) &
+                 (is.na(trans_code)  | trans_code  %in% noninfo_codes) &
+                 (is.na(orient_code) | orient_code %in% noninfo_codes)
+
+  lgbtq[all_noninfo] <- NA
+  lgbtq
+}
+
+derive_age_years <- function(df) {
+  # Prefer an explicit age column if present
+  age_col <- pick_by_regex(df, c("^age$", "age_years", "youth_age", "p_age"))
+  if (!is.na(age_col)) return(parse_num(df[[age_col]]))
+
+  # Otherwise compute from DOB + a reference date
+  dob_col <- pick_col(df, c("icf_nih_dob", "dob", "p_dob", "date_of_birth"))
+  ref_col <- pick_col(df, c("enroll_date", "visit_date", "baseline_date", "icf_date"))
+
+  if (is.na(dob_col) || is.na(ref_col)) return(rep(NA_real_, nrow(df)))
+
+  dob <- suppressWarnings(as.Date(df[[dob_col]]))
+  ref <- suppressWarnings(as.Date(df[[ref_col]]))
+  # fallback parse if needed
+  if (all(is.na(dob))) dob <- suppressWarnings(as.Date(df[[dob_col]], format = "%m/%d/%Y"))
+  if (all(is.na(ref))) ref <- suppressWarnings(as.Date(df[[ref_col]], format = "%m/%d/%Y"))
+
+  as.numeric(ref - dob) / 365.25
+}
+```
+
+# 1) Load Youth Baseline+Followups (the "full dataset)
+```{r load}
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+OUT_DIR  <- params$OUT_DIR %||% "/Users/jaimiechin/Library/CloudStorage/Box-Box/WeCare (Michael Wu)/Data/cleaned/New ETL Output"
+csv_path <- file.path(OUT_DIR, params$in_file %||% "dat_merged.csv")
+
+df <- readr::read_csv(csv_path, show_col_types = FALSE)
+
+# Baseline sample = anyone with treatment 0/1 (i.e., not missing)
+df <- df %>%
+  mutate(treatment = suppressWarnings(as.integer(as.character(treatment)))) %>%
+  filter(!is.na(treatment))
+
+if (!is.null(params$restrict_treatment) && "treatment" %in% names(df)) {
+  df <- df %>% dplyr::filter(parse_num(treatment) == params$restrict_treatment)
+}
+
+dir.create(params$out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- Follow-up completion: Adam fields ---
+if (!"follow_visitstatus_3m" %in% names(df)) df$follow_visitstatus_3m <- NA
+if (!"follow_visitstatus_6m" %in% names(df)) df$follow_visitstatus_6m <- NA
+
+# --- Follow-up age fields (some may not exist; we guard) ---
+if (!"screen_age" %in% names(df)) df$screen_age <- NA
+if (!"age_3m" %in% names(df)) df$age_3m <- NA
+if (!"screen_age_3m" %in% names(df)) df$screen_age_3m <- NA
+if (!"followup_age_6m" %in% names(df)) df$followup_age_6m <- NA
+if (!"screen_age_6m" %in% names(df)) df$screen_age_6m <- NA
+
+df <- df %>%
+  dplyr::mutate(
+    # completion flags
+    follow_visitstatus_3m = parse_num(follow_visitstatus_3m),
+    follow_visitstatus_6m = parse_num(follow_visitstatus_6m),
+    fu3m_completed = dplyr::if_else(follow_visitstatus_3m == 1, TRUE, FALSE, missing = FALSE),
+    fu6m_completed = dplyr::if_else(follow_visitstatus_6m == 1, TRUE, FALSE, missing = FALSE),
+    fu_any_evidence   = !is.na(follow_visitstatus_3m) | !is.na(follow_visitstatus_6m),
+    fu_any_completed  = fu3m_completed | fu6m_completed,
+
+    # ages
+    age_b  = coalesce_num(screen_age),
+    age_3m = coalesce_num(age_3m, screen_age_3m),
+    age_6m = coalesce_num(followup_age_6m, screen_age_6m),
+
+    # for "followups-only" sample: prefer 3m age, else 6m age
+    age_fu = dplyr::coalesce(age_3m, age_6m)
+  )
+```
+
+# 2) Derive CSSE, CASSY+, LGBTQ+ (robust column-picking)
+```{r derive-key-vars}
+df <- df %>%
+  mutate(
+    # ---- CASSY+ (baseline) ----
+    cassy_plus_b = to_bin01(cassy_result),  # cassy_result == 1 => 1
+
+    # ---- LGBTQ+ (baseline; Adam function expects ints) ----
+    treatment              = as_int(treatment),
+    giso_gender_identity_b = as_int(giso_gender_identity_b),
+    giso_trans_b           = as_int(giso_trans_b),
+    giso_sex_orient_b      = as_int(giso_sex_orient_b),
+
+    lgbtq = is_lgbtq_sogi(giso_gender_identity_b, giso_trans_b, giso_sex_orient_b)
+  )
+
+# ---- CSSR RISK FLAGS (Adam) ----
+high_b  <- c("cssrs_4a_b","cssrs_5a_b","cssrs_7b_b")
+high_3m <- c("cssrs_4_3m","cssrs_5_3m","cssrs_7_3m")
+high_6m <- c("cssrs_4_6m","cssrs_5_6m","cssrs_7_6m")
+
+med_b   <- c("cssrs_3a_b","cssrs_7a_b")
+med_3m  <- c("cssrs_3_3m")
+med_6m  <- c("cssrs_3_6m")
+
+df <- df %>%
+  mutate(
+    cssr_high_b_raw  = cssr_any1(cur_data(), high_b),
+    cssr_high_3m_raw = cssr_any1(cur_data(), high_3m),
+    cssr_high_6m_raw = cssr_any1(cur_data(), high_6m),
+
+    cssr_med_b_raw   = cssr_any1(cur_data(), med_b),
+    cssr_med_3m_raw  = cssr_any1(cur_data(), med_3m),
+    cssr_med_6m_raw  = cssr_any1(cur_data(), med_6m),
+
+    # ---- mutually exclusive: medium only if NOT high ----
+    cssr_high_b  = cssr_high_b_raw,
+    cssr_high_3m = cssr_high_3m_raw,
+    cssr_high_6m = cssr_high_6m_raw,
+
+    cssr_med_b   = dplyr::case_when(
+      cssr_high_b_raw == 1L ~ 0L,
+      cssr_high_b_raw == 0L & cssr_med_b_raw == 1L ~ 1L,
+      cssr_high_b_raw == 0L & cssr_med_b_raw == 0L ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    cssr_med_3m  = dplyr::case_when(
+      cssr_high_3m_raw == 1L ~ 0L,
+      cssr_high_3m_raw == 0L & cssr_med_3m_raw == 1L ~ 1L,
+      cssr_high_3m_raw == 0L & cssr_med_3m_raw == 0L ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    cssr_med_6m  = dplyr::case_when(
+      cssr_high_6m_raw == 1L ~ 0L,
+      cssr_high_6m_raw == 0L & cssr_med_6m_raw == 1L ~ 1L,
+      cssr_high_6m_raw == 0L & cssr_med_6m_raw == 0L ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+
+    cssr_tier_b  = cssr_tier(cssr_med_b,  cssr_high_b),
+    cssr_tier_3m = cssr_tier(cssr_med_3m, cssr_high_3m),
+    cssr_tier_6m = cssr_tier(cssr_med_6m, cssr_high_6m)
+  )
+```
+
+# 3) Build the "follow-ups only" dataset + write both datasets
+```{r build-followup-only}
+has_any_fu_evidence   <- df$fu_any_evidence
+has_completed_fu_only <- df$fu_any_completed
+
+df_followups <- if (isTRUE(params$followup_requires_completed_only)) {
+  df %>% filter(has_completed_fu_only)
+} else {
+  df %>% filter(has_any_fu_evidence)
+}
+
+readr::write_csv(df,           file.path(params$out_dir, "youth_full_sample.csv"))
+readr::write_csv(df_followups, file.path(params$out_dir, "youth_followups_only.csv"))
+```
+
+# 4) Table: Full sample vs Followups only (population differences)
+```{r table-pop-diff}
+fmt_n_pct <- function(n, denom) {
+  if (is.na(denom) || denom == 0) return(NA_character_)
+  pct <- 100 * n / denom
+  sprintf("%d (%.1f%%)", n, pct)
+}
+
+summ_one <- function(dat, label, age_col) {
+  N <- nrow(dat)
+
+  n_med   <- sum(dat$cssr_med_b  == 1L, na.rm = TRUE)
+  n_high  <- sum(dat$cssr_high_b == 1L, na.rm = TRUE)
+  n_cassy <- sum(dat$cassy_plus_b == 1L, na.rm = TRUE)
+  n_lgbtq <- sum(dat$lgbtq == TRUE, na.rm = TRUE)
+
+  tibble::tibble(
+    Sample = label,
+    N = N,
+    `Avg age` = mean(dat[[age_col]], na.rm = TRUE),
+
+    `CSSR Medium (at Baseline)` = fmt_n_pct(n_med, N),
+    `CSSR High risk (at Baseline)` = fmt_n_pct(n_high, N),
+    `CASSY+ (at Baseline)` = fmt_n_pct(n_cassy, N),
+    `LGBTQ+ (at Baseline)` = fmt_n_pct(n_lgbtq, N)
+  )
+}
+
+# --- Define follow-up subsets (COMPLETED based on follow_visitstatus_*) ---
+df_fu_3m <- df %>% dplyr::filter(fu3m_completed == TRUE)           # includes people who also did 6m
+df_fu_6m <- df %>% dplyr::filter(fu6m_completed == TRUE)           # includes people who also did 3m
+df_fu_any <- df %>% dplyr::filter(fu3m_completed == TRUE | fu6m_completed == TRUE)
+
+pop_tbl <- dplyr::bind_rows(
+  summ_one(df,        "Full sample (baseline)",        age_col = "age_b"),
+  summ_one(df_fu_3m,  "Follow-ups: 3m (completed)",    age_col = "age_3m"),
+  summ_one(df_fu_6m,  "Follow-ups: 6m (completed)",    age_col = "age_6m"),
+  # summ_one(df_fu_any, "Follow-ups: any (3m and/or 6m)",age_col = "age_fu")
+)
+
+pop_tbl %>%
+  gt::gt() %>%
+  gt::fmt_number(columns = "Avg age", decimals = 2) %>%
+  gt::tab_header(title = "Population comparison: Full sample vs Follow-ups (3m only / 6m only / any)")
+```
+# 4.5) Comparison of CASSY+ and CSSR+ between Baseline and Followups
+```{r table-pop-diff-followup-risk}
+fmt_n_pct <- function(n, denom) {
+  if (is.na(denom) || denom == 0) return(NA_character_)
+  pct <- 100 * n / denom
+  sprintf("%d (%.1f%%)", n, pct)
+}
+
+summ_one_risk <- function(dat, label, age_col, med_col, high_col) {
+  N <- nrow(dat)
+
+  n_med   <- sum(dat[[med_col]]  == 1L, na.rm = TRUE)
+  n_high  <- sum(dat[[high_col]] == 1L, na.rm = TRUE)
+  n_cassy <- sum(dat$cassy_plus_b == 1L, na.rm = TRUE)
+  n_lgbtq <- sum(dat$lgbtq == TRUE, na.rm = TRUE)
+
+  tibble::tibble(
+    Sample = label,
+    N = N,
+    `Avg age` = mean(dat[[age_col]], na.rm = TRUE),
+
+    `CSSR Medium` = fmt_n_pct(n_med, N),
+    `CSSR High risk` = fmt_n_pct(n_high, N),
+    `CASSY+ (baseline)` = fmt_n_pct(n_cassy, N),
+    `LGBTQ+ (baseline)` = fmt_n_pct(n_lgbtq, N)
+  )
+}
+
+# subsets
+df_fu_3m_only <- df %>% dplyr::filter(fu3m_completed == TRUE, fu6m_completed == FALSE)
+df_fu_6m_only <- df %>% dplyr::filter(fu6m_completed == TRUE, fu3m_completed == FALSE)
+df_fu_any     <- df %>% dplyr::filter(fu3m_completed == TRUE | fu6m_completed == TRUE)
+
+# For "any follow-up", use latest completed wave for CSSR risk
+df_fu_any_latest <- df_fu_any %>%
+  mutate(
+    cssr_med_latest  = dplyr::case_when(
+      fu6m_completed ~ cssr_med_6m,
+      fu3m_completed ~ cssr_med_3m,
+      TRUE ~ NA_integer_
+    ),
+    cssr_high_latest = dplyr::case_when(
+      fu6m_completed ~ cssr_high_6m,
+      fu3m_completed ~ cssr_high_3m,
+      TRUE ~ NA_integer_
+    )
+  )
+
+pop_tbl_fu_risk <- dplyr::bind_rows(
+  summ_one_risk(df,              "Full sample (baseline risk)",          "age_b",  "cssr_med_b",       "cssr_high_b"),
+  summ_one_risk(df_fu_3m,   "Follow-ups: 3m only (3m risk)",        "age_3m", "cssr_med_3m",      "cssr_high_3m"),
+  summ_one_risk(df_fu_6m,   "Follow-ups: 6m only (6m risk)",        "age_6m", "cssr_med_6m",      "cssr_high_6m"),
+  # summ_one_risk(df_fu_any_latest,"Follow-ups: any (latest FU risk)",     "age_fu", "cssr_med_latest",  "cssr_high_latest")
+)
+
+pop_tbl_fu_risk %>%
+  gt::gt() %>%
+  gt::fmt_number(columns = "Avg age", decimals = 2) %>%
+  gt::tab_header(title = "Population comparison: CSSR risk at baseline vs CSSR risk at follow-up (by FU subset)")
+
+```
+# 5)  CSSR tier persistence from baseline to follow-ups
+```{r cssr-tier-persistence}
+# Only those who were Medium/High at baseline
+base_risk <- df %>% filter(cssr_tier_b %in% c("Medium", "High"))
+
+# ---------- Baseline -> 3m (among completed 3m) ----------
+trans_3m <- base_risk %>%
+  filter(fu3m_completed) %>%
+  mutate(
+    follow_tier = dplyr::coalesce(cssr_tier_3m, "Missing/Unknown")
+  ) %>%
+  count(`Baseline tier` = cssr_tier_b, `3m tier` = follow_tier, name = "n") %>%
+  group_by(`Baseline tier`) %>%
+  mutate(`% within baseline tier` = 100 * n / sum(n)) %>%
+  ungroup()
+
+gt::gt(trans_3m) %>%
+  gt::fmt_number(columns = `% within baseline tier`, decimals = 1) %>%
+  gt::tab_header(title = "CSSR tier persistence: Baseline → 3m (baseline Medium/High only; completed 3m)")
+
+# ---------- Baseline -> 6m (among completed 6m) ----------
+trans_6m <- base_risk %>%
+  filter(fu6m_completed) %>%
+  mutate(
+    follow_tier = dplyr::coalesce(cssr_tier_6m, "Missing/Unknown")
+  ) %>%
+  count(`Baseline tier` = cssr_tier_b, `6m tier` = follow_tier, name = "n") %>%
+  group_by(`Baseline tier`) %>%
+  mutate(`% within baseline tier` = 100 * n / sum(n)) %>%
+  ungroup()
+
+gt::gt(trans_6m) %>%
+  gt::fmt_number(columns = `% within baseline tier`, decimals = 1) %>%
+  gt::tab_header(title = "CSSR tier persistence: Baseline → 6m (baseline Medium/High only; completed 6m)")
+```
+
+# 6) Are we lising high-risk participants
+```{r cssr-baseline-risk-followup-coverage}
+base_risk <- df %>% filter(cssr_tier_b %in% c("Medium", "High"))
+
+coverage <- base_risk %>%
+  summarise(
+    N_baseline_MH = n(),
+    `3m completed (n)` = sum(fu3m_completed),
+    `3m completed (%)` = 100 * mean(fu3m_completed),
+    `6m completed (n)` = sum(fu6m_completed),
+    `6m completed (%)` = 100 * mean(fu6m_completed)
+  )
+
+gt::gt(coverage) %>%
+  gt::fmt_number(columns = ends_with("(%)"), decimals = 1) %>%
+  gt::tab_header(title = "Follow-up coverage among baseline Medium/High CSSR")
+```
+
+
+```{r print-6m-participants}
+# Pick an ID column
+id_col <- dplyr::case_when(
+  "participant_id" %in% names(df) ~ "participant_id",
+  "study_id" %in% names(df)       ~ "study_id",
+  TRUE ~ NA_character_
+)
+stopifnot(!is.na(id_col))
+
+# Pull the 6m-completed participants
+fu6_list <- df %>%
+  dplyr::filter(fu6m_completed == TRUE) %>%
+  dplyr::mutate(
+    # include some helpful columns if they exist
+    follow_visitstatus_6m = if ("follow_visitstatus_6m" %in% names(df)) follow_visitstatus_6m else NA,
+    follow_visitstatus_3m = if ("follow_visitstatus_3m" %in% names(df)) follow_visitstatus_3m else NA
+  ) %>%
+  dplyr::select(
+    dplyr::all_of(id_col),
+    dplyr::any_of(c(
+      "treatment",
+      "follow_visitstatus_6m",
+      "follow_visitstatus_3m",
+      "fu6m_completed",
+      "fu3m_completed",
+      "age_6m", "followup_age_6m", "screen_age_6m",
+      "age_b", "screen_age"
+    ))
+  ) %>%
+  dplyr::arrange(.data[[id_col]])
+
+cat("6m completed participants:", nrow(fu6_list), "\n")
+
+# Print as a table in the knitted output
+fu6_list %>%
+  gt::gt() %>%
+  gt::tab_header(title = "Participants counted as 6m completed (follow_visitstatus_6m == 1)")
+
+# Save to CSV for easy review
+out_path <- file.path(params$out_dir, "debug_6m_completed_participants.csv")
+readr::write_csv(fu6_list, out_path)
+cat("Wrote:", out_path, "\n")
+```
+
+```{r crossref-6m-recordid}
+stopifnot("record_id" %in% names(df))
+
+expected_6m <- c(
+  "K-F0241","K-F0225","H-F0284","H-F0281","H-F0278","H-F0267","H-F0270","H-F0251",
+  "H-F0228","H-F0220","H-F0208","H-F0194","H-F0192","H-F0173","H-F0060","H-F0038",
+  "H-F0006","K-F0205","K-F0179","K-F0010","K-F0001","K-F0002"
+)
+
+fu6_ids <- df %>%
+  dplyr::filter(fu6m_completed == TRUE) %>%
+  dplyr::transmute(record_id = as.character(record_id)) %>%
+  dplyr::distinct() %>%
+  dplyr::arrange(record_id) %>%
+  dplyr::pull(record_id)
+
+xref <- tibble::tibble(record_id = sort(unique(c(expected_6m, fu6_ids)))) %>%
+  dplyr::mutate(
+    in_expected = record_id %in% expected_6m,
+    in_fu6      = record_id %in% fu6_ids,
+    status = dplyr::case_when(
+      in_expected & in_fu6  ~ "✅ in both",
+      in_expected & !in_fu6 ~ "❌ expected but NOT counted as 6m complete",
+      !in_expected & in_fu6 ~ "⚠️ counted as 6m complete but NOT in expected list",
+      TRUE ~ "—"
+    )
+  ) %>%
+  dplyr::arrange(dplyr::desc(in_expected), dplyr::desc(in_fu6), record_id)
+
+# Table view
+gt::gt(xref) %>%
+  gt::tab_header(title = "Cross-reference: expected 6m IDs vs counted 6m-completed (record_id)")
+
+# Print lists
+missing_from_fu6 <- setdiff(expected_6m, fu6_ids)
+extra_in_fu6     <- setdiff(fu6_ids, expected_6m)
+
+cat("\n\nCounts:\n")
+cat("Expected list size:", length(expected_6m), "\n")
+cat("Counted as 6m complete (unique):", length(fu6_ids), "\n")
+cat("Missing from counted list:", length(missing_from_fu6), "\n")
+cat("Extra in counted list:", length(extra_in_fu6), "\n\n")
+
+if (length(missing_from_fu6) > 0) {
+  cat("Expected but NOT counted as 6m complete:\n")
+  print(sort(missing_from_fu6))
+  cat("\n")
+}
+
+if (length(extra_in_fu6) > 0) {
+  cat("Counted as 6m complete but NOT in expected list:\n")
+  print(sort(extra_in_fu6))
+  cat("\n")
+}
+```
+
+```{r crossref-baseline-id-name}
+stopifnot(all(c("record_id","treatment","first_name","last_name") %in% names(df)))
+
+# ---- Baseline definition: treatment 0/1 (not NA) ----
+df_base <- df %>%
+  dplyr::mutate(treatment_int = suppressWarnings(as.integer(as.character(treatment)))) %>%
+  dplyr::filter(!is.na(treatment_int)) %>%
+  dplyr::mutate(
+    record_id  = as.character(record_id),
+    first_name = as.character(first_name),
+    last_name  = as.character(last_name)
+  )
+
+baseline_ids <- df_base %>%
+  dplyr::distinct(record_id) %>%
+  dplyr::arrange(record_id) %>%
+  dplyr::pull(record_id)
+
+cat("Baseline unique participants (record_id):", length(baseline_ids), "\n\n")
+
+# ---- Roster text: record_id <tab> first_name <tab> last_name ----
+roster_txt <- "
+K-F0626	Yanie	Lebrun
+K-F0625	maranatha 	joseph
+K-F0624	Azaria	Hinds 
+K-F0623	akella	richards 
+K-F0622	Tiffany 	Dike
+K-F0619	Breianna	Lionel
+K-F0618	shanika	cunnison
+K-F0616	Justin	Edwards
+K-F0614	Grover	Reed
+K-F0613	jazmin	sanders frankson
+K-F0612	Hope 	Wilson 
+K-F0610	michaela	holliman
+K-F0609	Mekiel	Dwyer
+K-F0608	anthony	smith
+K-F0606	superior 	Augustus 
+K-F0605	akera	McIntosh 
+K-F0601	april 	cheese
+K-F0600	joel	richards
+K-F0596	jaquan	bain
+K-F0595	Charlise	Peloquin
+K-F0594	Keira	Daniels
+K-F0592	Murtland	Murray
+K-F0590	samadhi	wilson
+K-F0587	Tyjah 	Thomas
+K-F0583	naomi	duffie
+K-F0582	tiffanie	Cummings 
+K-F0580	Kattie	Powell 
+K-F0578	liam	callender
+K-F0577	Isarela 	Simpson
+K-F0576	Rondelle 	McPherson 
+K-F0575	Judah	Alexander 
+K-F0573	Kevann	Reid
+K-F0572	Neveah	Gittens
+K-F0571	Annin	Fletcher
+K-F0570	Jadiann	Knight
+K-F0566	Brittney	Malcolm
+K-F0565	kezeann	coryat
+K-F0560	Dionne	Phillip
+K-F0557	Laniy	Harris
+K-F0553	Kevaughnn 	Thomas
+K-F0551	jzara	smith
+K-F0549	alani	slaughter
+K-F0546	madison 	billips 
+K-F0545	Allison 	Franklin 
+K-F0543	Dwight	Winkley
+K-F0541	Aaliyah	Poe
+K-F0539	Adell 	Anderson
+K-F0538	Aramy	Mcdonald
+K-F0537	Troy 	Drayton 
+K-F0536	kristacia	scott
+K-F0535	Jason Kaiden	St. Jour
+K-F0534	Jamiyah	Holman
+K-F0533	Kyle	Langford
+K-F0532	Shem	Similien
+K-F0529	josiah 	charles
+K-F0527	Jada	Freeman
+K-F0524	Zechariah	Daly
+K-F0522	Shawn	Chase
+K-F0520	clayton	powell
+K-F0517	kaziah	francis
+K-F0516	kaelyn	john
+K-F0515	Nacarla	brown 
+K-F0514	Marquese	Charles 
+K-F0512	Nicholas	Woods
+K-F0511	Kevin 	Prass Jr.
+K-F0510	faith	jones
+K-F0509	Julianna	Jack
+K-F0508	Tamia 	Rowe
+K-F0507	qiyana 	graham 
+K-F0506	Kylie	Glasgow 
+K-F0504	cody	virgo
+K-F0503	Javon	Vieira
+K-F0500	Abigail 	Meek
+K-F0498	Andre 	Beaton 
+K-F0497	khamiyah	ray
+K-F0496	Jehsean	Williams
+K-F0495	Gem	Senior
+K-F0494	Tarik	Primus
+K-F0493	Taylor	Charles
+K-F0491	Nadia	bernard
+K-F0486	merline	joseph
+K-F0485	damir	phillips
+K-F0483	surraya 	king 
+K-F0482	Raeshonna	Richardson
+K-F0481	Janay	Barnes
+K-F0480	Nichelle 	Jones
+K-F0478	jace	mansary
+K-F0477	Candit 	Wilkinson 
+K-F0475	michael 	Edmund
+K-F0474	karlee	carter
+K-F0471	Shanoi	Blake
+K-F0469	xavier	merzlak
+K-F0468	rezina	lamarre
+K-F0465	Hope	Phillips
+K-F0464	Carter	Marcus Banks
+K-F0463	Safiyyah	Arrieta
+K-F0462	Terrieka	Nelson
+K-F0461	Chloe 	Julien
+K-F0459	Brystol	Walker
+K-F0458	Kiya	Gutzmore
+K-F0455	janiqua 	wayne
+K-F0454	roy	kestoe
+K-F0449	jakeem	Rodney
+K-F0447	Nackayla	Forbes
+K-F0444	Jahvonte 	Powell-Edwards
+K-F0441	Sabiano	Joseph
+K-F0440	Ashley 	Vaudroque
+K-F0439	chad	brown
+K-F0438	Elijah	hall
+K-F0435	Ezra	Griffith
+K-F0432	Leeana 	Moodie
+K-F0431	Jaden	Richard 
+K-F0430	Aryana	marin
+K-F0428	omari 	branch
+K-F0426	kyell	Frazier-Thompson
+K-F0425	Uriel	virgo
+K-F0423	kimora	Roberts-Ravello
+K-F0422	Azia	Fraser
+K-F0421	liyanna	max
+K-F0420	Adley	Aboutou
+K-F0419	jenyce	sermon
+K-F0418	melvin	benton
+K-F0414	annilah	williams
+K-F0413	Akeela 	lindo
+K-F0412	Sasha	Benoit
+K-F0409	Ava	Scarborough 
+K-F0407	Laniya	Saunders 
+K-F0406	Tamel	Calloway
+K-F0404	kermya	david
+K-F0403	mordachai	pierre
+K-F0400	cassieann	Bel
+K-F0399	Gabrielle 	Gocul
+K-F0397	kymoni	deabreu
+K-F0396	kahlil	edwards
+K-F0394	Deon	Archer
+K-F0393	Tashawna 	Gregory 
+K-F0391	gabran	edwards
+K-F0389	Nicole	Jackson 
+K-F0388	SHAKIM 	FAISAL
+K-F0387	Skyla	Edmund
+K-F0385	shanice 	cruz
+K-F0384	Jaydanae 	Smith
+K-F0383	Maleyah	Wright
+K-F0378	Elijah	Ackie
+K-F0377	Ja-Naya	Jackson
+K-F0376	Mackayla	cadore
+K-F0375	Briana	Magloire
+K-F0373	zavien 	wint
+K-F0371	Anaya	Guthrie-Wright
+K-F0370	crystal 	lowe 
+K-F0369	Ayden	Alleyne
+K-F0366	Nazareth	Granby
+K-F0364	Cameron 	Franklin 
+K-F0363	sarah	smalls
+K-F0362	Matthew 	Woolcock
+K-F0361	Genesis	Alexander
+K-F0360	Darnell	Paul
+K-F0359	jada	deacon
+K-F0357	Alexander	brown
+K-F0356	curdisha	Joseph 
+K-F0352	ryel	barbour
+K-F0351	Kassidy	Thomas
+K-F0350	jamaira	Herring
+K-F0348	jace	harvey
+K-F0344	kahleigha 	plunkett
+K-F0343	breanne	Cummings 
+K-F0341	alysha	merritt
+K-F0340	Jasmine	Duncan
+K-F0339	anaviya	walker
+K-F0338	amya	pope
+K-F0336	Brook	Robinson 
+K-F0334	Elizabeth 	Desir
+H-F0356	issiaka	fofana
+K-F0332	Elijah	Saunders
+K-F0331	smith	massenot
+K-F0330	kayson	goddard
+K-F0329	Ramel	Jenkins 
+H-F0354	Noah	Camara-Dansira
+K-F0327	Brianna 	mohammed
+K-F0326	Neya	Goodall
+K-F0325	Daysha 	Aris
+K-F0324	kanesha 	howard
+H-F0352	Deangelo	Dacus
+K-F0323	ciara	hall
+K-F0320	kenisha	Bennett 
+K-F0319	Tianna	Williams 
+K-F0317	Briel	Anaya-Speller
+H-F0351	giovanna 	mandry bailey
+H-F0350	Alpha 	Barry
+K-F0314	Carissa	Figueroa
+K-F0311	Jania	Williams
+K-F0309	Jeremiah 	Noel
+K-F0308	Walton	Lewis
+K-F0305	Jellisha	Joseph 
+H-F0349	Dakota	Williams
+K-F0304	Rashawn 	Richards 
+H-F0348	adesola	little
+H-F0346	safeyatou	talla
+K-F0301	kaderick	floyd
+K-F0298	Shanelle	Gowdie 
+K-F0297	Isaiah 	graham
+H-F0345	oumar	diallo
+H-F0344	binta	deh
+H-F0343	terrance	walker
+K-F0296	janiah	hughes
+K-F0294	Jayden	Soto-China
+K-F0293	christian	london
+K-F0292	malcolm	kearse jr
+K-F0289	Alex	Agostini
+H-F0341	Seven	White
+K-F0288	Rockeisha 	gibson
+K-F0286	Mikayla 	Whitaker 
+H-F0339	coby	mcdonald
+K-F0283	Leaisha	Payne 
+K-F0281	iana	noel
+K-F0280	Marla	Bowman
+H-F0338	ariyanna	munford
+H-F0336	fitema	jones
+K-F0277	jaliyah	smith
+K-F0276	Aiden	Svendsen
+K-F0275	Isabella 	Suazo
+K-F0274	Brinae	Sutton
+K-F0273	BIANCA	McCarthy
+K-F0269	Dylan	Karimbocas
+H-F0334	jahmir	reid
+H-F0332	Mason	Scott
+K-F0267	Ashley 	Belfone
+K-F0266	Lamar	Tillman
+K-F0265	Kaden	Rougier
+K-F0264	aniyah 	brown 
+H-F0330	iyaana	johnson
+H-F0329	Aleisha	Taylor
+K-F0263	Natalia	Velazquez 
+K-F0260	Janai	Franklin
+K-F0258	Ezekiel 	Hinds 
+K-F0257	Jayvon 	Costas 
+K-F0256	jazell 	ferguson
+K-F0255	Francine	Dutary
+K-F0254	William 	Thomas
+K-F0253	ronata	lawrence
+K-F0251	Ayanna	Scarborough
+H-F0325	Harmony 	Hinton 
+K-F0250	shakyrah 	green
+K-F0249	Quavon	hall
+K-F0248	Tessanne 	Cowan
+K-F0247	isaiah 	munroe
+H-F0324	Tayvone 	Jordan
+H-F0323	Alana	McClain 
+H-F0322	Vi'Nyah 	Robinson
+K-F0244	isaiah	McKenzie 
+H-F0319	Leroy	Spence
+K-F0241	chadrick 	harris
+K-F0239	maiya	glover
+H-F0318	Nathan	Grange 
+K-F0238	keon	massey
+K-F0235	Evan	Fields
+K-F0234	Seriah	Joseph
+K-F0233	Zenobia	Mayer
+H-F0314	ORyan Elizah	Hills
+H-F0313	Amayah	Pigott
+H-F0312	ivanis	bacchus
+K-F0232	Ashley 	Joseph 
+K-F0230	Alesha	Decamp
+K-F0228	kevin	neverson-foster
+H-F0311	sariyah	jones
+K-F0227	arianna	renwick
+K-F0226	valinska	cadet
+K-F0225	tashauna	prince
+H-F0307	Janay	Barnett
+H-F0306	Shaliyah	Robinson
+H-F0304	Aliyah	Thompson
+K-F0222	Chanel 	Moodie 
+K-F0221	shaniya	anderson
+K-F0219	kymiera 	Thompson 
+K-F0216	Amoya	Ellis
+H-F0300	Souadou	Barry
+K-F0214	sameerah	woodson
+K-F0213	Tyrese 	Moore 
+H-F0299	alisha	patterson
+H-F0298	Willie 	Lidge
+K-F0212	aydriel	small
+K-F0210	skye	smith
+H-F0296	reine-helene	oulatta
+H-F0295	Hawa	Jaiteh
+H-F0294	sarahmiah	russell
+H-F0292	london	DeWalt 
+H-F0289	tianna	lockett
+H-F0287	brianna	bowles
+H-F0286	kayla	preddie
+H-F0285	saire	hudson
+H-F0284	anthony	jones
+H-F0283	Danasia	Hall
+H-F0281	Janjummeh	Dukuray
+H-F0279	jahmira	tucker
+H-F0278	journeylynn	fuseni
+H-F0274	quadir	logan
+H-F0273	Bryce	Pugh
+H-F0272	joelle	harris
+H-F0271	Nikholas	summerville
+H-F0270	Xavier 	brooks
+H-F0269	samir	aboubacar
+H-F0268	Jahmallo	Robinson 
+H-F0267	fatou	doukoure
+H-F0266	lele	scott
+H-F0253	Azaria	Douglas Easy
+H-F0252	Jayla	Middleton 
+H-F0251	Trent	Bonner
+H-F0250	Mawa	konate
+H-F0248	Heavyn	Livingston 
+H-F0246	Sa'rhie	Fabian
+H-F0245	Kamiya	Ramos
+H-F0244	Marcus	Flowers
+H-F0241	alisha	Matthews 
+H-F0238	Massaran	Cisse
+H-F0235	anicia	jackson
+H-F0233	xamari	valentin
+H-F0232	quanya 	graham
+H-F0230	zaniyah	Williams 
+H-F0229	cheyenne	blake
+H-F0228	jordan	dove
+H-F0227	Kadijatu 	Bah
+H-F0225	William 	Crosby 
+H-F0221	anthony	campbell
+H-F0220	Dakota	Smith
+H-F0217	Isaiah 	Sonson
+H-F0215	zahyiere	snyder
+H-F0214	Tyrei 	Bishop-Pope
+H-F0213	shamar	horton
+H-F0212	Adrina	martin
+H-F0210	Christopher 	theodore
+H-F0208	Jaquavius 	Conyers
+H-F0207	Ciarra	Durant
+H-F0206	jaylen 	king
+H-F0205	manze	karamoko
+H-F0204	presice 	debose
+H-F0202	jayden	clarke
+H-F0200	Jacob	Grant
+H-F0199	ocean	reed
+H-F0198	Aissata	Jalloh
+H-F0197	musa	sillah
+H-F0194	Amya	Amari
+H-F0192	laila	Washington 
+H-F0190	Juan 	Washington 
+H-F0187	Mychayla	Davis
+H-F0181	Younouss	Matouk
+H-F0178	Justine	lucas
+H-F0173	diamond 	scott
+H-F0171	Mouhamadou	Diallo
+H-F0167	kiajah	Williams 
+H-F0166	aisha	howard
+H-F0164	Dariyona	Wilkerson
+H-F0163	Jazlyn 	Williams 
+H-F0162	shaquan	Cunningham 
+H-F0161	wend kuuni	diarra
+H-F0160	kellynn	carter
+H-F0158	soren	charles
+H-F0157	kyla	palmer
+H-F0154	mahamadoo	diabate
+H-F0151	Bonginkosi	Forde
+H-F0150	Joshua 	jordan
+H-F0149	Xavier 	smith
+H-F0148	jamare 	Kirk 
+H-F0147	JANAYA	russell
+H-F0146	Michael 	flora
+H-F0145	hajara	bashiru
+H-F0139	raijon	fuller
+H-F0138	Tristan 	vanderhirst
+H-F0131	Mariam	Kone
+H-F0129	Sa'nya	Patterson-holder
+H-F0124	Mohamed 	Traore 
+H-F0123	Gervais	Nikiema
+H-F0121	Aaliyah 	Harris
+H-F0120	Nchantis 	McClain 
+H-F0118	Anthony	Hatchett
+H-F0117	Erick 	mcneill Benjamin 
+H-F0116	essence 	gonsalves
+H-F0115	Sokhna	Samb
+H-F0113	EDOUARD 	DOLLON 
+H-F0112	Alanah	Grant
+H-F0091	Batduly	Diallo
+H-F0085	rahinatou	dabre
+H-F0084	youssouf	ballo
+H-F0083	maimouna	drame
+H-F0079	farima	berete
+H-F0077	Nevaeh	Folks
+H-F0075	Janelle 	Jarrell
+H-F0072	kayvonnah 	Jones 
+H-F0068	terrell	cloud
+H-F0062	moet	alston
+H-F0060	rayvon	lawson
+H-F0058	Victoria 	Felix
+H-F0052	kania	moses
+H-F0043	Jabari	Jones
+H-F0038	Anda	Diallo
+H-F0033	Lamont	battle 
+H-F0031	Sharhonda	hunter
+H-F0029	Zanayah	jones 
+H-F0020	McKayla 	bonner
+H-F0006	Kimiah	Wright
+H-F0005	Jadalynn	Frazier
+K-F0205	Marvin 	Jean Baptiste 
+K-F0195	Jazayrah	Moultrie
+K-F0192	Alanna	Bruno
+K-F0179	Serenity	Gittens
+K-F0162	Carmelitta 	Lezama
+K-F0153	Troy	Grant
+K-F0123	Imani	Bethea
+K-F0112	Saphir	Renaud
+K-F0106	Hopeton 	Ebanks
+K-F0099	Khristin 	Thomas
+K-F0095	Noah	Pervil
+K-F0082	Kaylin	Brown
+K-F0081	Astar	Hyde
+K-F0080	Shamar	Stewart
+K-F0079	Brittney	Charles
+K-F0077	Danielle	Outen
+K-F0076	Mareena	Ahmad
+K-F0071	Volencia	La Rose
+K-F0064	Yokeily	Rodriguez
+K-F0061	Tia	Robinson
+K-F0055	Aaliyah	Baldwin
+K-F0053	Fiona	Campbell
+K-F0052	Kaliel	Stewart
+K-F0043	Jenna Alexa 	Hospedales
+K-F0041	Kiiah	Holder
+K-F0036	Anaya	Cuffy
+K-F0035	Jai	Gaston
+K-F0021	Zenobia	Green
+K-F0015	Tashauna	Stanley
+K-F0014	Trivana	Joyce
+K-F0013	Caldwin	Knights
+K-F0011	Alana	Powell
+K-F0010	Johnoy	Henry 
+K-F0006	Tamia	Stokes
+K-F0004	Jaziyah	Baptiste 
+K-F0003	Ryan	Peters
+K-F0002	Tilika	Rene
+K-F0001	Ezekiel	Wellington
+"
+
+# Parse as TSV (works well with your pasted format)
+roster <- readr::read_tsv(
+  I(roster_txt),
+  col_names = c("record_id","roster_first","roster_last"),
+  show_col_types = FALSE,
+  progress = FALSE,
+  trim_ws = TRUE
+) %>%
+  dplyr::mutate(
+    record_id    = as.character(record_id),
+    roster_first = as.character(roster_first),
+    roster_last  = as.character(roster_last)
+  ) %>%
+  dplyr::filter(!is.na(record_id), stringr::str_trim(record_id) != "")
+
+cat("Roster rows (raw):", nrow(roster), "\n")
+cat("Roster unique IDs:", dplyr::n_distinct(roster$record_id), "\n\n")
+
+# Show duplicate IDs in roster (if any)
+dup_roster <- roster %>%
+  dplyr::count(record_id, name = "n_in_roster") %>%
+  dplyr::filter(n_in_roster > 1) %>%
+  dplyr::arrange(dplyr::desc(n_in_roster), record_id)
+
+if (nrow(dup_roster) > 0) {
+  gt::gt(dup_roster) %>% gt::tab_header(title = "Duplicate record_id found in ROSTER")
+} else {
+  cat("No duplicate record_id found in roster.\n\n")
+}
+
+# Keep one row per roster ID (first occurrence) for joining
+roster_uniq <- roster %>%
+  dplyr::group_by(record_id) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+# One row per baseline ID with names
+base_names <- df_base %>%
+  dplyr::select(record_id, first_name, last_name) %>%
+  dplyr::distinct()
+
+# ---- Name normalization helper ----
+norm_name <- function(x) {
+  x <- tolower(trimws(as.character(x)))
+  x <- stringr::str_replace_all(x, "[[:punct:]]", " ")   # drop punctuation (e.g., St. Jour, Jr.)
+  x <- stringr::str_replace_all(x, "\\s+", " ")          # collapse whitespace
+  x <- trimws(x)
+  dplyr::na_if(x, "")
+}
+
+# Join roster ↔ baseline by record_id
+joined <- roster_uniq %>%
+  dplyr::left_join(base_names, by = "record_id") %>%
+  dplyr::mutate(
+    roster_first_n = norm_name(roster_first),
+    roster_last_n  = norm_name(roster_last),
+    data_first_n   = norm_name(first_name),
+    data_last_n    = norm_name(last_name),
+    id_in_baseline = !is.na(first_name) | !is.na(last_name),
+    first_match    = !is.na(roster_first_n) & !is.na(data_first_n) & roster_first_n == data_first_n,
+    last_match     = !is.na(roster_last_n)  & !is.na(data_last_n)  & roster_last_n  == data_last_n,
+    name_match     = first_match & last_match
+  )
+
+# ---- Missing IDs (in roster but not in baseline) ----
+missing_from_baseline <- joined %>%
+  dplyr::filter(!id_in_baseline) %>%
+  dplyr::select(record_id, roster_first, roster_last) %>%
+  dplyr::arrange(record_id)
+
+cat("In roster but NOT in baseline dataset:", nrow(missing_from_baseline), "\n")
+
+if (nrow(missing_from_baseline) > 0) {
+  gt::gt(missing_from_baseline) %>%
+    gt::tab_header(title = "Roster IDs NOT found in baseline (treatment not-NA) dataset")
+}
+
+# ---- Extra IDs (in baseline but not in roster) ----
+extra_in_baseline <- setdiff(baseline_ids, roster_uniq$record_id)
+cat("In baseline dataset but NOT in roster:", length(extra_in_baseline), "\n\n")
+
+if (length(extra_in_baseline) > 0) {
+  gt::gt(tibble::tibble(record_id = sort(extra_in_baseline))) %>%
+    gt::tab_header(title = "Baseline IDs NOT found in roster")
+}
+
+# ---- Name mismatches (IDs present in both, but names differ) ----
+name_mismatches <- joined %>%
+  dplyr::filter(id_in_baseline) %>%
+  dplyr::filter(!name_match) %>%
+  dplyr::transmute(
+    record_id,
+    roster_first, roster_last,
+    data_first = first_name, data_last = last_name,
+    roster_first_n, roster_last_n,
+    data_first_n, data_last_n,
+    first_match, last_match
+  ) %>%
+  dplyr::arrange(record_id)
+
+cat("Name mismatches among IDs present in both:", nrow(name_mismatches), "\n\n")
+
+if (nrow(name_mismatches) > 0) {
+  gt::gt(name_mismatches) %>%
+    gt::tab_header(title = "Name mismatches (roster vs dataset) after normalization")
+} else {
+  cat("No name mismatches found after normalization.\n")
+}
+```
+
+```{r crossref-two-tables}
+# --- Table 1: Roster IDs NOT found in baseline dataset ---
+missing_from_baseline <- roster_uniq %>%
+  dplyr::select(record_id, roster_first, roster_last) %>%
+  dplyr::left_join(
+    df_base %>% dplyr::distinct(record_id) %>% dplyr::mutate(in_baseline = TRUE),
+    by = "record_id"
+  ) %>%
+  dplyr::filter(is.na(in_baseline)) %>%
+  dplyr::select(record_id, roster_first, roster_last) %>%
+  dplyr::arrange(record_id)
+
+gt::gt(missing_from_baseline) %>%
+  gt::tab_header(title = "Roster IDs NOT found in baseline dataset")
+
+# --- Table 2: Baseline IDs NOT found in roster ---
+baseline_not_in_roster <- df_base %>%
+  dplyr::select(record_id, first_name, last_name) %>%
+  dplyr::distinct() %>%
+  dplyr::anti_join(
+    roster_uniq %>% dplyr::select(record_id) %>% dplyr::distinct(),
+    by = "record_id"
+  ) %>%
+  dplyr::arrange(record_id)
+
+gt::gt(baseline_not_in_roster) %>%
+  gt::tab_header(title = "Baseline IDs NOT found in roster")
+```
+
+```{r cssr_crosstab_3m_stata}
+# ----- baseline group flags -----
+LOCK_DATE <- as.Date("2026-01-01")
+
+df_x <- df %>%
+  # ---- DATA LOCK: keep only participants merged before Jan 1, 2026 ----
+  dplyr::mutate(
+    merged_date_parsed = suppressWarnings(as.Date(merged_date)),
+    merged_date_parsed = dplyr::if_else(
+      is.na(merged_date_parsed),
+      suppressWarnings(as.Date(merged_date, format = "%m/%d/%Y")),
+      merged_date_parsed
+    )
+  ) %>%
+  dplyr::filter(!is.na(merged_date_parsed), merged_date_parsed < LOCK_DATE) %>%
+  # ---- original logic continues ----
+  dplyr::mutate(
+    baseline_cssr_grp = dplyr::case_when(
+      cssr_high_b == 1L ~ "Baseline CSSR+",
+      cssr_high_b == 0L & cssr_med_b == 1L ~ "Baseline CSSR+",
+      cssr_high_b == 0L & cssr_med_b == 0L ~ "Baseline CSSR-",
+      TRUE ~ NA_character_
+    ),
+    baseline_cassy_grp = dplyr::case_when(
+      cassy_plus_b == 1L ~ "Baseline CASSY+",
+      cassy_plus_b == 0L ~ "Baseline CASSY-",
+      TRUE ~ NA_character_
+    ),
+    cssr_pos_3m = dplyr::case_when(
+      cssr_high_3m == 1L ~ 1L,
+      cssr_high_3m == 0L & cssr_med_3m == 1L ~ 1L,
+      cssr_high_3m == 0L & cssr_med_3m == 0L ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    fu_cssr_cat_3m = dplyr::case_when(
+      fu3m_completed == FALSE ~ "Not interviewed",
+      fu3m_completed == TRUE  & cssr_pos_3m == 1L ~ "Interviewed & CSSR+",
+      fu3m_completed == TRUE  & cssr_pos_3m == 0L ~ "Interviewed & CSSR-",
+      fu3m_completed == TRUE  & is.na(cssr_pos_3m) ~ "Interviewed & CSSR-",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::filter(!is.na(fu_cssr_cat_3m))
+# --- 1) Relative to baseline CSSR group ---
+df_cssr <- df_x %>% filter(!is.na(baseline_cssr_grp))
+stata_crosstab(df_cssr, "baseline_cssr_grp",
+               "3m Crosstab: Follow-up CSSR interview category (3m) by Baseline CSSR status")
+
+# --- 2) Relative to baseline CASSY group ---
+df_cassy <- df_x %>% filter(!is.na(baseline_cassy_grp))
+stata_crosstab(df_cassy, "baseline_cassy_grp",
+               "3m Crosstab: Follow-up CSSR interview category (3m) by Baseline CASSY status")
+
+stata_crosstab <- function(dat, row_var, title) {
+  cols <- c("Not interviewed", "Interviewed & CSSR+", "Interviewed & CSSR-")
+
+  tab_n <- dat %>%
+    count(.data[[row_var]], fu_cssr_cat_3m, name = "n") %>%
+    tidyr::pivot_wider(names_from = fu_cssr_cat_3m, values_from = n, values_fill = 0)
+
+  # ensure all columns exist + order them
+  for (cc in cols) if (!cc %in% names(tab_n)) tab_n[[cc]] <- 0L
+
+  rowname <- names(tab_n)[1]
+  tab_n <- tab_n %>% dplyr::select(dplyr::all_of(rowname), dplyr::all_of(cols))
+
+  # Row totals (Baseline group N)
+  tab_n <- tab_n %>%
+    dplyr::mutate(`Baseline group N` = rowSums(dplyr::across(dplyr::all_of(cols))))
+
+  tab_pct <- dat %>%
+    count(.data[[row_var]], fu_cssr_cat_3m, name = "n") %>%
+    group_by(.data[[row_var]]) %>%
+    mutate(pct = 100 * n / sum(n)) %>%
+    ungroup() %>%
+    select(-n) %>%
+    tidyr::pivot_wider(names_from = fu_cssr_cat_3m, values_from = pct, values_fill = 0)
+
+  for (cc in cols) if (!cc %in% names(tab_pct)) tab_pct[[cc]] <- 0
+
+  tab_pct <- tab_pct %>% dplyr::select(dplyr::all_of(rowname), dplyr::all_of(cols))
+
+  # Combine into "n (row %)"
+  out <- tab_n
+  for (cc in cols) {
+    out[[cc]] <- sprintf("%d (%.1f%%)", tab_n[[cc]], tab_pct[[cc]])
+  }
+
+  # Reorder to: group, Baseline N, then categories
+  out <- out %>% dplyr::select(dplyr::all_of(rowname), `Baseline group N`, dplyr::all_of(cols))
+
+  gt::gt(out) %>%
+    gt::tab_header(title = title) %>%
+    gt::tab_source_note("Cells are n (row %). Follow-up interview status uses follow_visitstatus_3m == 1.")
+}
+
+stata_crosstab(df_cssr,  "baseline_cssr_grp",  "3m Crosstab: Follow-up CSSR interview category (3m) by Baseline CSSR status")
+stata_crosstab(df_cassy, "baseline_cassy_grp", "3m Crosstab: Follow-up CSSR interview category (3m) by Baseline CASSY status")
+
+```
