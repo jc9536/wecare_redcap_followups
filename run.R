@@ -89,6 +89,9 @@ source("R/70_postprocess_dat_merged.R")
 source("R/72_nda_guid_prep.R")
 source("R/73_nda_cde_exports.R")
 
+# Medical Lookup CSV Export 
+source("R/74_medical_lookup_export.R")
+
 
 # --- 2) Configure follow-up events -------------------------------------------
 # If your REDCap event names change, update here.
@@ -240,7 +243,24 @@ message("📑 Creating NDA CDE datasets ...")
 
 nda_build_cde_exports(
   out_dir       = OUT_DIR,
-  guid_filename = "GUIDs_12052025.csv"
+  guid_filename = "GUIDs_03192026.csv"
+)
+
+# --- 10) Create medical lookup exports ---------------------------------------
+message("🏥 Creating medical lookup exports ...")
+
+medical_lookup_exports <- build_medical_lookup_exports(
+  dat_merged_path = file.path(OUT_DIR, "dat_merged.csv"),
+  old_lookup_path = file.path(
+    OUT_DIR, "/MRN Lookup/WeCareYouth-MRNLookup_DATA_LABELS_2025-09-05.csv"),
+  new_out_path = file.path(
+    OUT_DIR,
+    paste0("/MRN Lookup/WeCareYouth-MRNLookup_NEW_", format(Sys.Date(), "%Y-%m-%d"), ".csv")
+  ),
+  master_out_path = file.path(
+    OUT_DIR,
+    paste0("/MRN Lookup/MASTER Lists/WeCareYouth-MRNLookup_MASTER_", format(Sys.Date(), "%Y-%m-%d"), ".csv")
+  )
 )
 
 message("✅ Done.\n  Raw:   data/raw\n  Clean: data/out\n  Checks:data/checks")

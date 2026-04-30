@@ -102,6 +102,77 @@ if (!exists("to_date_smart")) {
   }
 }
 
+# Additional Date Parser for NIMH Requirements
+parse_study_date <- function(x, min_year = 1900, max_year = 2200) {
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "N/A", "NULL")] <- NA_character_
+  
+  out <- rep(as.Date(NA), length(x_chr))
+  
+  clip_years <- function(d) {
+    bad <- !is.na(d) & (
+      as.integer(format(d, "%Y")) < min_year |
+        as.integer(format(d, "%Y")) > max_year
+    )
+    d[bad] <- as.Date(NA)
+    d
+  }
+  
+  # First: explicit character formats, no timezone conversion
+  formats <- c(
+    "%m/%d/%Y",
+    "%m/%d/%y",
+    "%Y-%m-%d",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%y %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%y %H:%M:%S"
+  )
+  
+  for (fmt in formats) {
+    miss <- is.na(out) & !is.na(x_chr)
+    if (!any(miss)) break
+    parsed <- suppressWarnings(as.Date(x_chr[miss], format = fmt))
+    out[miss] <- parsed
+  }
+  
+  # Then: numeric serial dates if still missing
+  miss_num <- is.na(out) & !is.na(x_chr) & grepl("^-?\\d+(\\.\\d+)?$", x_chr)
+  if (any(miss_num)) {
+    num <- suppressWarnings(as.numeric(x_chr[miss_num]))
+    
+    parsed_num <- rep(as.Date(NA), length(num))
+    
+    # YYYYMMDD
+    ymd_like <- !is.na(num) & nchar(gsub("\\.0+$", "", x_chr[miss_num])) == 8 &
+      grepl("^(19|20)\\d{6}$", x_chr[miss_num])
+    
+    if (any(ymd_like)) {
+      parsed_num[ymd_like] <- suppressWarnings(
+        as.Date(as.character(num[ymd_like]), format = "%Y%m%d")
+      )
+    }
+    
+    # Excel serials
+    excel_like <- !ymd_like & !is.na(num) & num >= 25569 & num <= 60000
+    if (any(excel_like)) {
+      parsed_num[excel_like] <- as.Date(floor(num[excel_like]), origin = "1899-12-30")
+    }
+    
+    # SAS/Stata daily serials
+    sas_like <- !ymd_like & !excel_like & !is.na(num) & num >= -3650 & num <= 100000
+    if (any(sas_like)) {
+      parsed_num[sas_like] <- as.Date(floor(num[sas_like]), origin = "1960-01-01")
+    }
+    
+    out[miss_num] <- parsed_num
+  }
+  
+  clip_years(out)
+}
+
 # ---------- Age helper (months, 0-1260, rounding rule) ----------
 age_in_months <- function(dob, visit_date) {
   # dob may already be a Date (from build_dob_from_components)
@@ -140,19 +211,68 @@ age_in_months <- function(dob, visit_date) {
 
 # Build DOB date from MOB/DOB/YOB if present
 build_dob_from_components <- function(df) {
-  if (!all(c("MOB","DOB","YOB") %in% names(df))) {
-    return(rep(NA, nrow(df)))
+  nm <- names(df)
+  
+  mob_col <- dplyr::case_when(
+    "MOB" %in% nm ~ "MOB",
+    "mob" %in% nm ~ "mob",
+    TRUE ~ NA_character_
+  )
+  dob_col <- dplyr::case_when(
+    "DOB" %in% nm ~ "DOB",
+    "dob" %in% nm ~ "dob",
+    TRUE ~ NA_character_
+  )
+  yob_col <- dplyr::case_when(
+    "YOB" %in% nm ~ "YOB",
+    "yob" %in% nm ~ "yob",
+    TRUE ~ NA_character_
+  )
+  
+  out <- rep(as.Date(NA), nrow(df))
+  
+  if (!is.na(mob_col) && !is.na(dob_col) && !is.na(yob_col)) {
+    y <- suppressWarnings(as.integer(df[[yob_col]]))
+    m <- suppressWarnings(as.integer(df[[mob_col]]))
+    d <- suppressWarnings(as.integer(df[[dob_col]]))
+    
+    ok <- !is.na(y) & !is.na(m) & !is.na(d) &
+      y >= 1900 & y <= 2025 &
+      m >= 1 & m <= 12 &
+      d >= 1 & d <= 31
+    
+    dob_str <- rep(NA_character_, length(y))
+    dob_str[ok] <- sprintf("%04d-%02d-%02d", y[ok], m[ok], d[ok])
+    out <- as.Date(dob_str)
   }
-  y <- suppressWarnings(as.integer(df$YOB))
-  m <- suppressWarnings(as.integer(df$MOB))
-  d <- suppressWarnings(as.integer(df$DOB))
-  ok <- !is.na(y) & !is.na(m) & !is.na(d) &
-    y >= 1900 & y <= 2025 &
-    m >= 1 & m <= 12 &
-    d >= 1 & d <= 31
-  dob_str <- rep(NA_character_, length(y))
-  dob_str[ok] <- sprintf("%04d-%02d-%02d", y[ok], m[ok], d[ok])
-  as.Date(dob_str)
+  
+  if ("screen_dob" %in% nm) {
+    fallback <- to_date_smart(df$screen_dob, min_year = 1900, max_year = 2100)
+    out[is.na(out)] <- fallback[is.na(out)]
+  }
+  
+  out
+}
+
+# Create fallbacks for follow up data
+pick_first_existing <- function(df, candidates) {
+  candidates <- candidates[!is.na(candidates) & candidates != ""]
+  candidates <- candidates[candidates %in% names(df)]
+  
+  if (!length(candidates)) {
+    return(rep(NA_character_, nrow(df)))
+  }
+  
+  out <- as.character(df[[candidates[1]]])
+  
+  if (length(candidates) > 1) {
+    for (nm in candidates[-1]) {
+      this <- as.character(df[[nm]])
+      out[is.na(out) | trimws(out) == ""] <- this[is.na(out) | trimws(out) == ""]
+    }
+  }
+  
+  out
 }
 
 # -----------------------------
@@ -603,15 +723,18 @@ build_nda_structure_wave <- function(df_guid,
   out_df <- tibble::as_tibble(stats::setNames(out_list, required_elems))
   
   # ---------- 3) Parse interview_date FIRST (per wave) ----------
-  internal_date <- unname(map_vec["interview_date"])
-  visit_raw <- if (!is.na(internal_date) && internal_date %in% names(df_wave)) {
-    df_wave[[internal_date]]
-  } else {
-    out_df$interview_date
-  }
+  date_candidates <- switch(
+    wave,
+    "baseline" = c(unname(map_vec["interview_date"])),
+    "3m"       = c("follow_visitdate_3m", "visit_date_3m"),
+    "6m"       = c("follow_visitdate_6m", "visit_date_6m"),
+    c(unname(map_vec["interview_date"]))
+  )
   
-  # Use to_date_smart to handle datetime, numeric serials, etc.
-  visit_date <- to_date_smart(visit_raw)
+  visit_raw <- pick_first_existing(df_wave, date_candidates)
+  
+  # NDA-safe date parser: strips time and avoids timezone shifts
+  visit_date <- parse_study_date(visit_raw, min_year = 2010, max_year = 2200)
   
   if ("interview_date" %in% names(out_df)) {
     out_df$interview_date <- ifelse(
@@ -628,7 +751,22 @@ build_nda_structure_wave <- function(df_guid,
   if ("interview_age" %in% names(out_df)) {
     age_vec <- age_in_months(dob_date, visit_date)
     
-    # Where DOB or interview_date are invalid, age_in_months returns NA.
+    # Fallback source columns when computed age is missing
+    age_fallback_raw <- switch(
+      wave,
+      "baseline" = pick_first_existing(df_wave, c("screen_age")),
+      "3m"       = pick_first_existing(df_wave, c("follow_age_3m", "age_3m")),
+      "6m"       = pick_first_existing(df_wave, c("followup_age_6m")),
+      rep(NA_character_, nrow(df_wave))
+    )
+    
+    age_fallback <- suppressWarnings(as.integer(age_fallback_raw))
+    
+    # Use fallback where DOB/date-based age failed
+    use_fallback <- is.na(age_vec) & !is.na(age_fallback)
+    age_vec[use_fallback] <- age_fallback[use_fallback]
+    
+    # Still missing -> -9
     age_vec[is.na(age_vec)] <- -9L
     
     # Clamp to 0–1260 but keep -9 as missing
